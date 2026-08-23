@@ -65,7 +65,7 @@ Confirm the **Platform** dropdown includes **Deliveroo** and **Uber Eats**.
 | Dispute Amount | **Chargeback Amount** (absolute value) |
 | Platform | Uber Eats |
 
-Issue/refund reason is filled when it appears on the page (wrong order, food quality, food safety, **customization missing**, etc.). Customization missing maps to **Missing Item**. On a normal completed order with no issue section, reason fields may be empty — fill those manually if needed.
+Issue/refund reason is filled when it appears on the page (wrong order, food quality, food safety, **item reported missing**, **customization missing**, etc.). **Other reason** lists only affected items — e.g. missing items like `WHOPPER® with Cheese`, and customization issues like `BBQ Rodeo Regular Value Meal` (not the parent item). On a normal completed order with no issue section, reason fields may be empty — fill those manually if needed.
 
 ---
 

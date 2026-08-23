@@ -80,6 +80,8 @@
       "food quality": "Prepared incorrectly",
       "customization missing": "Missing Item",
       "customization reported missing": "Missing Item",
+      "item reported missing": "Missing Item",
+      "reported missing": "Missing Item",
     },
     reasonForDisputeOtherOption: "Other",
     foodSafetyComplaintLabel: "Food safety complaint",
@@ -232,7 +234,45 @@
   }
 
   const HEADER_WORDS = /^(quantity|qty|price|item|items|name|category|total|refund reason|refund details)$/i;
-  const UI_NOISE = /^(refund details|refund reason|partner refund value|order total|date ordered|order submitted|order timeline|dispute this refund|prepared incorrectly|missing|missing item|missing items|incorrect|incorrect item|incorrect items|food safety complaint|category|quantity|qty|price|item|items|name|total|deliveroo|uber eats|partner hub|marketplace fee|net payout|sales \(incl\. gst\)|chargeback amount|customization reported missing|\d+\s+customization(?:s)?\s+missing)$/i;
+  const UI_NOISE = /^(refund details|refund reason|partner refund value|order total|date ordered|order submitted|order timeline|dispute this refund|prepared incorrectly|missing|missing item|missing items|incorrect|incorrect item|incorrect items|food safety complaint|category|quantity|qty|price|item|items|name|total|deliveroo|uber eats|partner hub|marketplace fee|net payout|sales \(incl\. gst\)|chargeback amount|customization reported missing|item reported missing|\d+\s+customization(?:s)?\s+missing)$/i;
+
+  const ISSUE_ITEM_MISSING_RE = /^item\s+reported\s+missing$/i;
+  const ISSUE_CUSTOMIZATION_MISSING_RE = /^customization\s+reported\s+missing$/i;
+  const ISSUE_N_CUSTOMIZATIONS_RE = /^\d+\s+customization(?:s)?\s+missing$/i;
+  const ITEM_COMPONENT_RE = /^(burger|regular sides|regular drinks|toppings|side|drink|choose your)/i;
+  const INVALID_ORDER_CODES = new Set([
+    "DETAILS", "ORDER", "SALES", "TOTAL", "PAYOUT", "CUSTOM", "ITEMS", "REFUND",
+    "DISPUTE", "CHARGE", "AMOUNT", "DELIVERY", "BURGER", "STATUS", "REVIEW",
+    "SUBMIT", "CANCEL", "CLOSED", "ACTIVE", "SEARCH", "FILTER", "REPORT",
+  ]);
+
+  const MONTH_ABBR = /(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)$/i;
+
+  function normalizeOrderCodeToken(token) {
+    let code = String(token || "").toUpperCase().replace(/[,.]$/, "");
+    if (MONTH_ABBR.test(code)) code = code.replace(MONTH_ABBR, "");
+    if (isLikelyOrderCode(code)) return code;
+    const compact = code.match(/^([A-Z]{1,3}\d{2,5}|\d[A-Z0-9]{2,5})/);
+    if (compact && isLikelyOrderCode(compact[1])) return compact[1].toUpperCase();
+    return "";
+  }
+
+  function isLikelyOrderCode(code) {
+    const text = String(code || "").toUpperCase();
+    if (!/^[A-Z0-9]{4,6}$/.test(text)) return false;
+    if (!/[A-Z]/.test(text) || !/\d/.test(text)) return false;
+    if (/^(19|20)\d{2}$/.test(text)) return false;
+    if (MONTH_ABBR.test(text)) return false;
+    if (INVALID_ORDER_CODES.has(text)) return false;
+    return true;
+  }
+
+  function pageLinesAll() {
+    return ((document.body && document.body.innerText) || "")
+      .split(/\n+/)
+      .map(normalizeSpace)
+      .filter(Boolean);
+  }
 
   function isValidItemName(name) {
     const text = normalizeSpace(name);
@@ -248,7 +288,15 @@
   function canonicalizeReason(reason) {
     const key = normalizeKey(reason);
     if (!key || HEADER_WORDS.test(key)) return "";
-    if (key === "missing" || key.includes("missing item") || (key.includes("customization") && key.includes("missing"))) return "missing items";
+    if (
+      key === "missing" ||
+      key.includes("missing item") ||
+      key.includes("item reported missing") ||
+      key.includes("reported missing") ||
+      (key.includes("customization") && key.includes("missing"))
+    ) {
+      return "missing items";
+    }
     if (key.includes("prepared incorrectly") || key.includes("poor food quality") || key.includes("quality issue")) return "prepared incorrectly";
     if (key.includes("food safety")) return "food safety complaint";
     if (key.includes("wrong order") || key.includes("wrong item") || key.includes("incorrect")) return "incorrect item";
@@ -261,7 +309,8 @@
 
   function pageLines() {
     if (pageLinesCache) return pageLinesCache;
-    pageLinesCache = ((document.body && document.body.innerText) || "")
+    const root = getExtractionRoot();
+    pageLinesCache = ((root && root.innerText) || "")
       .split(/\n+/)
       .map(normalizeSpace)
       .filter(Boolean);
@@ -402,22 +451,206 @@
     return { customer: line, location: "" };
   }
 
-  function extractOrderNumber() {
-    const bodyText = document.body ? document.body.innerText : "";
-    const shortCode = bodyText.match(/\b([A-F0-9]{4,8})\b/);
+  function parseOrderHeadingText(text) {
+    const normalized = normalizeSpace(text);
+    if (normalized.length > 32) return "";
+    const exact = normalized.match(/^Order\s+#?\s*([A-Z0-9]{4,6})$/i);
+    if (exact) return normalizeOrderCodeToken(exact[1]);
+    const prefix = normalized.match(/^Order\s+#?\s*(\S+)/i);
+    if (prefix) return normalizeOrderCodeToken(prefix[1]);
+    return "";
+  }
+
+  function panelFromHeadingEl(headingEl) {
+    let node = headingEl;
+    let best = headingEl;
+    for (let depth = 0; depth < 14 && node; depth++) {
+      if (node === document.body || node === document.documentElement) break;
+      const block = normalizeSpace(node.innerText || "");
+      if (/order placed by customer/i.test(block) && /order details|delivery details|sales \(incl/i.test(block)) {
+        best = node;
+      }
+      node = node.parentElement;
+    }
+    return best;
+  }
+
+  function findActiveOrderHeading() {
     const nodes = document.querySelectorAll("h1, h2, h3, h4, p, span, div, strong, button");
+    let best = null;
+    let bestScore = -1;
+
     for (let i = 0; i < nodes.length; i++) {
       const el = nodes[i];
       if (!visible(el)) continue;
-      const text = normalizeSpace(el.textContent);
-      if (/^[A-F0-9]{4,8}$/.test(text)) {
-        hits.push({ label: "Order Number", el, valueEl: el, value: text });
-        return text;
+
+      let code = parseOrderHeadingText(normalizeSpace(el.textContent));
+      if (!code) {
+        const own = ownText(el);
+        if (own) code = normalizeOrderCodeToken(own);
+        if (code) {
+          const prev = el.previousElementSibling;
+          const parentText = el.parentElement ? normalizeSpace(el.parentElement.textContent) : "";
+          const nearOrderLabel =
+            (prev && /^order$/i.test(normalizeSpace(prev.textContent))) ||
+            /^order\s+#?\s*$/i.test(parentText.replace(own, "").trim());
+          if (!nearOrderLabel) code = "";
+        }
+      }
+      if (!code) continue;
+
+      const headingText = normalizeSpace(el.textContent);
+      const rect = el.getBoundingClientRect();
+      let score = rect.left + rect.top + Math.max(0, 120 - headingText.length);
+      let panel = el;
+      let node = el.parentElement;
+      for (let depth = 0; depth < 14 && node; depth++) {
+        const block = node.innerText || "";
+        if (/order placed by customer/i.test(block)) score += 200;
+        if (/order details|delivery details/i.test(block)) score += 80;
+        if (/item reported missing|customization reported missing/i.test(block)) score += 40;
+        if (/sales \(incl|chargeback amount/i.test(block)) score += 30;
+        if (/order placed by customer/i.test(block) && /order details|sales \(incl/i.test(block)) {
+          panel = node;
+        }
+        node = node.parentElement;
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = { code, el, panel: panelFromHeadingEl(el) || panel };
       }
     }
-    if (shortCode) return shortCode[1];
+    return best;
+  }
+
+  function getActiveOrderRoot() {
+    const heading = findActiveOrderHeading();
+    if (heading && heading.panel) {
+      let best = heading.panel;
+      const text = normalizeSpace(best.innerText || "").toLowerCase();
+      if (!/sales \(incl/i.test(text) && !/chargeback amount/i.test(text)) {
+        let node = best.parentElement;
+        for (let depth = 0; depth < 6 && node; depth++) {
+          if (node === document.body || node === document.documentElement) break;
+          const parentText = normalizeSpace(node.innerText || "").toLowerCase();
+          if (/sales \(incl/i.test(parentText) || /chargeback amount/i.test(parentText)) {
+            best = node;
+            break;
+          }
+          node = node.parentElement;
+        }
+      }
+      return best;
+    }
+
+    const markers = [
+      "order placed by customer",
+      "order details",
+      "delivery details",
+      "sales (incl. gst)",
+      "chargeback amount",
+    ];
+    const candidates = [];
+
+    const addCandidate = (el) => {
+      if (!el || el === document.body || el === document.documentElement) return;
+      if (!visible(el)) return;
+      candidates.push(el);
+    };
+
+    const nodes = document.querySelectorAll("h1, h2, h3, h4, p, span, div, section, aside, [role='dialog']");
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      if (!visible(el)) continue;
+      const text = normalizeSpace(el.textContent).toLowerCase();
+      if (!markers.some((marker) => text.includes(marker))) continue;
+      let node = el;
+      let bestNode = el;
+      for (let depth = 0; depth < 12 && node; depth++) {
+        const block = normalizeSpace(node.innerText || "").toLowerCase();
+        if (block.includes("order placed") && (block.includes("sales") || block.includes("order details"))) {
+          bestNode = node;
+        }
+        node = node.parentElement;
+      }
+      addCandidate(bestNode);
+    }
+
+    let best = null;
+    let bestScore = -1;
+    for (let i = 0; i < candidates.length; i++) {
+      const el = candidates[i];
+      const rect = el.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      const text = normalizeSpace(el.innerText || "").toLowerCase();
+      const orderCodes = text.match(/\border\s+#?\s*[a-z0-9]{4,8}\b/gi) || [];
+      if (orderCodes.length > 2) continue;
+
+      let score = 0;
+      if (/order placed by customer/i.test(text)) score += 50;
+      if (/order details/i.test(text)) score += 30;
+      if (/sales \(incl/i.test(text)) score += 20;
+      if (/chargeback amount/i.test(text)) score += 15;
+      if (/\border\s+#?\s*[a-z0-9]{4,8}\b/i.test(text)) score += 40;
+      if (area > 10000 && area < window.innerWidth * window.innerHeight * 0.95) score += 10;
+      if (rect.left > window.innerWidth * 0.25) score += 15;
+      if (score > bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    }
+
+    if (best) {
+      const text = normalizeSpace(best.innerText || "").toLowerCase();
+      if (!/sales \(incl/i.test(text) && !/chargeback amount/i.test(text)) {
+        let node = best.parentElement;
+        for (let depth = 0; depth < 6 && node; depth++) {
+          if (node === document.body || node === document.documentElement) break;
+          const parentText = normalizeSpace(node.innerText || "").toLowerCase();
+          if (/sales \(incl/i.test(parentText) || /chargeback amount/i.test(parentText)) {
+            best = node;
+            break;
+          }
+          node = node.parentElement;
+        }
+      }
+    }
+    return best;
+  }
+
+  function getExtractionRoot() {
+    const heading = findActiveOrderHeading();
+    if (heading && heading.panel) return heading.panel;
+    return getActiveOrderRoot() || document.body;
+  }
+
+  function extractOrderNumber() {
+    const heading = findActiveOrderHeading();
+    if (heading && heading.code) {
+      hits.push({ label: "Order Number", el: heading.el, valueEl: heading.el, value: heading.code });
+      return heading.code;
+    }
+
+    const root = getActiveOrderRoot();
+    if (root) {
+      const nodes = root.querySelectorAll("h1, h2, h3, h4, p, span, div, strong, button");
+      for (let i = 0; i < nodes.length; i++) {
+        const el = nodes[i];
+        if (!visible(el)) continue;
+        const code = parseOrderHeadingText(normalizeSpace(el.textContent));
+        if (code) {
+          hits.push({ label: "Order Number", el, valueEl: el, value: code });
+          return code;
+        }
+      }
+    }
+
     const uuid = location.pathname.match(/\/orders\/([a-f0-9-]+)/i);
-    if (uuid) return uuid[1].slice(-6).toUpperCase();
+    if (uuid) {
+      const tail = uuid[1].replace(/-/g, "").slice(-5).toUpperCase();
+      if (isLikelyOrderCode(tail)) return tail;
+    }
     return "";
   }
 
@@ -468,8 +701,7 @@
     return extractTime(document.body.innerText);
   }
 
-  function readLabeledMoney(labels) {
-    const lines = pageLines();
+  function readLabeledMoneyFromLines(lines, labels) {
     const lineKey = (line) =>
       normalizeKey(line)
         .replace(/\s*dispute\s*$/i, "")
@@ -496,13 +728,31 @@
     return null;
   }
 
+  function readLabeledMoney(labels) {
+    const fromPanel = readLabeledMoneyFromLines(pageLines(), labels);
+    if (fromPanel != null) return fromPanel;
+    return readLabeledMoneyFromLines(pageLinesAll(), labels);
+  }
+
   function extractDisputeAmount() {
-    const lines = pageLines();
-    for (let i = 0; i < lines.length; i++) {
-      if (!/chargeback\s*amount/i.test(lines[i])) continue;
-      const amount = parseMoney(lines[i + 1]) ?? parseMoney(lines[i]);
-      if (amount != null) return Math.abs(amount);
-    }
+    const scanLines = (lines) => {
+      for (let i = 0; i < lines.length; i++) {
+        if (!/chargeback\s*amount/i.test(lines[i])) continue;
+        const amount = parseMoney(lines[i + 1]) ?? parseMoney(lines[i]);
+        if (amount != null) return Math.abs(amount);
+      }
+      for (const line of lines) {
+        if (!/chargeback\s*amount|refund|adjustment|issue payout/i.test(line)) continue;
+        const amount = parseMoney(line);
+        if (amount != null) return Math.abs(amount);
+      }
+      return null;
+    };
+
+    const fromPanel = scanLines(pageLines());
+    if (fromPanel != null) return fromPanel;
+    const fromBody = scanLines(pageLinesAll());
+    if (fromBody != null) return fromBody;
 
     const chargeback = readLabeledMoney([
       "Chargeback Amount (incl. GST) Dispute",
@@ -523,19 +773,114 @@
       "Refund issued",
     ]);
     if (refund != null) return Math.abs(refund);
-
-    for (const line of lines) {
-      if (!/chargeback\s*amount|refund|adjustment|issue payout/i.test(line)) continue;
-      const amount = parseMoney(line);
-      if (amount != null) return Math.abs(amount);
-    }
     return null;
   }
 
+  function isIssueMarkerLine(line) {
+    return (
+      ISSUE_ITEM_MISSING_RE.test(line) ||
+      ISSUE_CUSTOMIZATION_MISSING_RE.test(line) ||
+      ISSUE_N_CUSTOMIZATIONS_RE.test(line)
+    );
+  }
+
+  function isComponentLine(line) {
+    const text = normalizeSpace(line);
+    if (!text) return true;
+    if (ITEM_COMPONENT_RE.test(text)) return true;
+    if (/^\d+\s+\S/.test(text) && !/(?:NZ\$|\$|£|€)\s*\d/.test(text)) return true;
+    return false;
+  }
+
+  function parsePricedItemName(line) {
+    const priceMatch = line.match(/^(.+?)\s+(?:NZ\$|\$|£|€)\s*(\d+(?:\.\d{2})?)$/);
+    if (!priceMatch) return "";
+    const name = normalizeSpace(priceMatch[1]);
+    return isValidItemName(name) ? name : "";
+  }
+
+  function findIssueItemNameBefore(lines, fromIndex, kind) {
+    for (let i = fromIndex - 1; i >= Math.max(0, fromIndex - 20); i--) {
+      const line = lines[i];
+      if (isIssueMarkerLine(line)) break;
+      if (isComponentLine(line)) continue;
+
+      const pricedName = parsePricedItemName(line);
+      if (pricedName) {
+        if (kind === "item") return pricedName;
+        if (kind === "customization" && /value meal|meal|combo|regular/i.test(pricedName)) return pricedName;
+      }
+
+      if (/(?:NZ\$|\$|£|€)\s*\d/.test(line) && i > 0) {
+        const prev = normalizeSpace(lines[i - 1]);
+        if (isValidItemName(prev)) {
+          if (kind === "item") return prev;
+          if (kind === "customization" && /value meal|meal|combo|regular/i.test(prev)) return prev;
+        }
+      }
+
+      const name = normalizeSpace(line);
+      if (!isValidItemName(name)) continue;
+
+      if (kind === "customization") {
+        if (/value meal|meal|combo|regular/i.test(name)) return name;
+        const next = lines[i + 1] || "";
+        if (!/(?:NZ\$|\$|£|€)\s*\d/.test(next) && !ISSUE_CUSTOMIZATION_MISSING_RE.test(next)) return name;
+        continue;
+      }
+
+      const hasPriceNearby = [lines[i + 1], lines[i + 2]].some((near) => near && /(?:NZ\$|\$|£|€)\s*\d/.test(near));
+      if (hasPriceNearby || pricedName) return name;
+    }
+    return "";
+  }
+
+  function scanIssueItems(lines, reasonFromPage) {
+    const issueItems = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (ISSUE_ITEM_MISSING_RE.test(line)) {
+        const name = findIssueItemNameBefore(lines, i, "item");
+        if (name) {
+          issueItems.push({
+            name,
+            issue: "item reported missing",
+            reason: canonicalizeReason("item reported missing"),
+          });
+        }
+        continue;
+      }
+      if (ISSUE_CUSTOMIZATION_MISSING_RE.test(line)) {
+        const name = findIssueItemNameBefore(lines, i, "customization");
+        if (name) {
+          issueItems.push({
+            name,
+            issue: "customization reported missing",
+            reason: canonicalizeReason("customization reported missing"),
+          });
+        }
+      }
+    }
+    return uniqueBy(issueItems, (item) => normalizeKey(item.name)).map((item) => ({
+      ...item,
+      reason: item.reason || (reasonFromPage ? canonicalizeReason(reasonFromPage) : ""),
+    }));
+  }
+
+  function extractIssueItems() {
+    const reasonFromPage = extractRefundReasonRaw();
+    const fromPanel = scanIssueItems(pageLines(), reasonFromPage);
+    if (fromPanel.length) return fromPanel;
+    return scanIssueItems(pageLinesAll(), reasonFromPage);
+  }
+
   function extractOrderItems() {
-    const items = [];
+    const issueItems = extractIssueItems();
+    if (issueItems.length) return issueItems;
+
     const lines = pageLines();
     const reasonFromPage = extractRefundReasonRaw();
+    const items = [];
 
     for (let i = 0; i < lines.length; i++) {
       const priceMatch = lines[i].match(/^(.+?)\s+(?:NZ\$|\$|£|€)\s*(\d+(?:\.\d{2})?)$/);
@@ -549,30 +894,18 @@
       });
     }
 
-    if (!items.length) {
-      for (let i = 0; i < lines.length; i++) {
-        if (!/^\d+$/.test(lines[i])) continue;
-        const name = lines[i + 1];
-        const priceLine = lines[i + 2] || "";
-        if (!name || !/(NZ\$|\$|£|€)\s*\d/.test(priceLine)) continue;
-        if (!isValidItemName(name)) continue;
-        items.push({
-          name: normalizeSpace(name),
-          reason: reasonFromPage ? canonicalizeReason(reasonFromPage) : "",
-        });
-      }
-    }
-
     return uniqueBy(items, (item) => normalizeKey(item.name));
   }
 
   function extractRefundReasonRaw() {
     const lines = pageLines();
-    const body = document.body ? document.body.innerText : "";
+    const body = getExtractionRoot().innerText || "";
+    if (/item\s+reported\s+missing/i.test(body)) return "Item reported missing";
     if (/customization(?:s)?\s+(?:reported\s+)?missing/i.test(body)) {
       return "Customization reported missing";
     }
     const issuePatterns = [
+      /^item\s+reported\s+missing$/i,
       /customization(?:s)?\s+(?:reported\s+)?missing/i,
       /^\d+\s+customization/i,
       /^missing item/i,
@@ -606,9 +939,9 @@
   }
 
   function buildDisputeFieldValues(items, refundReason) {
+    const issueItems = (items || []).filter((item) => item && item.name && isValidItemName(item.name));
+    const itemNames = [...new Set(issueItems.map((item) => item.name))];
     const reason = canonicalizeReason(refundReason);
-    const matchedItems = itemsMatchingReason(items, refundReason);
-    const itemNames = [...new Set(matchedItems.map((item) => item.name))];
 
     if (reason === "prepared incorrectly") {
       return {

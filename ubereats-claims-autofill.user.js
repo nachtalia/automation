@@ -1,16 +1,11 @@
 // ==UserScript==
-// @name         Deliveroo Refund → OpSpot Claims Auto-Fill
+// @name         Uber Eats Order → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      1.6.0
-// @description  Read Deliveroo Partner Hub refunds and fill OpSpot Claims.
+// @version      1.0.0
+// @description  Read Uber Eats Manager orders/issues and fill OpSpot Claims.
 // @author       Claims Ops
-// @match        https://partner-hub.deliveroo.com/*
-// @match        https://partner-hub.deliveroo.com/orders/refunds/*
-// @match        *://partner-hub.deliveroo.com/*
-// @match        *://*.partner-hub.deliveroo.com/*
-// @match        *://restaurant-hub.deliveroo.com/*
-// @match        *://*.deliveroo.com/*
-// @match        *://*.deliveroo.co.uk/*
+// @match        https://merchants.ubereats.com/*
+// @match        *://merchants.ubereats.com/*
 // @match        https://opspot.workhorselive.com/*
 // @match        https://opspot.workhorselive.com/sysTable.php*
 // @match        *://opspot.workhorselive.com/*
@@ -29,10 +24,8 @@
 
 /**
  * Pages
- *   Deliveroo: https://partner-hub.deliveroo.com/orders/refunds/...
+ *   Uber Eats: https://merchants.ubereats.com/manager/orders/...
  *   OpSpot:    https://opspot.workhorselive.com/sysTable.php?sys_module_id=10000&sys_data_entity_id=10000#
- *
- * You must be logged in on both. The login screens have no order data.
  */
 
 (function () {
@@ -51,11 +44,11 @@
   const hits = [];
 
   const CONFIG = {
-    DELIVEROO_HOST: "partner-hub.deliveroo.com",
+    UBER_HOST: "merchants.ubereats.com",
     CLAIMS_FORM_URL: "https://opspot.workhorselive.com/sysTable.php?sys_module_id=10000&sys_data_entity_id=10000",
-    STORAGE_KEY: "deliveroo_claim_payload_v1",
-    CLIP_PREFIX: "DCF1:",
-    PLATFORM: "Deliveroo",
+    STORAGE_KEY: "ubereats_claim_payload_v1",
+    CLIP_PREFIX: "UCF1:",
+    PLATFORM: "Uber Eats",
     VIDEO_SUBMITTED: "No",
     DISPUTE_THRESHOLD_GBP: 2,
     DEBUG: false,
@@ -81,6 +74,10 @@
       "incorrect item": "Incorrect Item",
       "incorrect items": "Incorrect Item",
       "food safety complaint": "Other",
+      "wrong order": "Incorrect Item",
+      "wrong item": "Incorrect Item",
+      "poor food quality": "Prepared incorrectly",
+      "food quality": "Prepared incorrectly",
     },
     reasonForDisputeOtherOption: "Other",
     foodSafetyComplaintLabel: "Food safety complaint",
@@ -114,13 +111,13 @@
   ];
 
   const REASON_ROW_RE = /^(missing|missing item|missing items|prepared incorrectly|incorrect item|incorrect items|incorrect|food safety complaint)$/i;
-  const CONTESTED_BODY_RE = /refund\s+contested|refund\s+dispute\s+was\s+successfully\s+submitted|dispute\s+sent\b|partner refund value[\s\S]{0,80}\bdisputed\b/i;
+  const CONTESTED_BODY_RE = /refund\s+contested|appeal submitted|dispute\s+submitted|dispute\s+sent\b|refund\s+appeal/i;
 
   const pageJQuery = () =>
     (typeof unsafeWindow !== "undefined" && (unsafeWindow.jQuery || unsafeWindow.$)) || window.jQuery || window.$;
 
   const log = (...args) => {
-    if (CONFIG.DEBUG) console.log("[Claims Auto-Fill]", ...args);
+    if (CONFIG.DEBUG) console.log("[Uber Claims Auto-Fill]", ...args);
   };
 
   function wait(ms) {
@@ -188,6 +185,14 @@
   }
 
   function extractTime(text) {
+    const ampm = String(text || "").match(/\b(\d{1,2}):(\d{2})\s*(AM|PM)\b/i);
+    if (ampm) {
+      let h = Number.parseInt(ampm[1], 10);
+      const m = ampm[2];
+      if (/pm/i.test(ampm[3]) && h < 12) h += 12;
+      if (/am/i.test(ampm[3]) && h === 12) h = 0;
+      return `${String(h).padStart(2, "0")}:${m}`;
+    }
     const m = String(text || "").match(/\b([01]?\d|2[0-3]):([0-5]\d)/);
     return m ? `${m[1].padStart(2, "0")}:${m[2]}` : "";
   }
@@ -198,7 +203,20 @@
       jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
       jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
     };
-    const named = text.match(/(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})/);
+    let named = text.match(/([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})/);
+    if (named) {
+      const day = named[2].padStart(2, "0");
+      const month = months[named[1].slice(0, 3).toLowerCase()];
+      const year = named[3];
+      if (!month) return { raw: text, iso: "", dmy: "", dash: "" };
+      return {
+        raw: `${named[2]} ${named[1].slice(0, 3)} ${year}`,
+        iso: `${year}-${month}-${day}`,
+        dmy: `${day}/${month}/${year}`,
+        dash: `${day}-${month}-${year}`,
+      };
+    }
+    named = text.match(/(\d{1,2}),?\s+([A-Za-z]{3,9}),?\s+(\d{4})/);
     if (!named) return { raw: text, iso: "", dmy: "", dash: "" };
     const day = named[1].padStart(2, "0");
     const month = months[named[2].slice(0, 3).toLowerCase()];
@@ -212,7 +230,7 @@
   }
 
   const HEADER_WORDS = /^(quantity|qty|price|item|items|name|category|total|refund reason|refund details)$/i;
-  const UI_NOISE = /^(refund details|refund reason|partner refund value|order total|date ordered|order submitted|order timeline|dispute this refund|prepared incorrectly|missing|missing item|missing items|incorrect|incorrect item|incorrect items|food safety complaint|category|quantity|qty|price|item|items|name|total|deliveroo|partner hub)$/i;
+  const UI_NOISE = /^(refund details|refund reason|partner refund value|order total|date ordered|order submitted|order timeline|dispute this refund|prepared incorrectly|missing|missing item|missing items|incorrect|incorrect item|incorrect items|food safety complaint|category|quantity|qty|price|item|items|name|total|deliveroo|uber eats|partner hub|marketplace fee|net payout|sales \(incl\. gst\))$/i;
 
   function isValidItemName(name) {
     const text = normalizeSpace(name);
@@ -229,9 +247,9 @@
     const key = normalizeKey(reason);
     if (!key || HEADER_WORDS.test(key)) return "";
     if (key === "missing" || key.includes("missing item")) return "missing items";
-    if (key.includes("prepared incorrectly")) return "prepared incorrectly";
+    if (key.includes("prepared incorrectly") || key.includes("poor food quality") || key.includes("quality issue")) return "prepared incorrectly";
     if (key.includes("food safety")) return "food safety complaint";
-    if (key.includes("incorrect")) return "incorrect item";
+    if (key.includes("wrong order") || key.includes("wrong item") || key.includes("incorrect")) return "incorrect item";
     return key;
   }
 
@@ -272,8 +290,13 @@
     return /opspot\.workhorselive\.com/i.test(location.host);
   }
 
-  function isDeliverooHub() {
-    return /partner-hub\.deliveroo\.com|restaurant-hub\.deliveroo\.com|deliveroo\.(com|co\.uk)/i.test(location.host);
+  function isUberEatsPage() {
+    return /merchants\.ubereats\.com/i.test(location.host);
+  }
+
+  function isUberOrderPage() {
+    if (!isUberEatsPage()) return false;
+    return /\/manager\/orders\//i.test(location.pathname);
   }
 
   function invalidateModalCache() {
@@ -282,11 +305,7 @@
   }
 
   function isRefundDetailsPage() {
-    if (isOpSpotPage()) return false;
-    if (!isDeliverooHub()) return false;
-    if (/\/orders\/refunds\//i.test(location.pathname)) return true;
-    const text = document.body ? document.body.innerText : "";
-    return /date ordered/i.test(text) && /partner refund value/i.test(text);
+    return isUberOrderPage();
   }
 
   /* -------------------------------------------------------------------------- */
@@ -352,187 +371,203 @@
   }
 
   function highlightHits() {
-    document.querySelectorAll(".dcf-hit").forEach((el) => el.classList.remove("dcf-hit"));
+    document.querySelectorAll(".ucf-hit").forEach((el) => el.classList.remove("ucf-hit"));
     for (const hit of hits) {
-      if (hit.el) hit.el.classList.add("dcf-hit");
-      if (hit.valueEl) hit.valueEl.classList.add("dcf-hit");
+      if (hit.el) hit.el.classList.add("ucf-hit");
+      if (hit.valueEl) hit.valueEl.classList.add("ucf-hit");
     }
   }
 
   function clearHits() {
     hits.length = 0;
-    document.querySelectorAll(".dcf-hit").forEach((el) => el.classList.remove("dcf-hit"));
+    document.querySelectorAll(".ucf-hit").forEach((el) => el.classList.remove("ucf-hit"));
   }
 
   /* -------------------------------------------------------------------------- */
-  /* Deliveroo — header / refund card / timeline / order table                  */
+  /* Uber Eats Manager — order drawer / timeline / items / adjustments          */
   /* -------------------------------------------------------------------------- */
 
-  function findOrderHeading(orderNumber) {
-    const nodes = [...document.querySelectorAll("h1, h2, h3, h4, p, span, div, strong")];
-    let best = null;
-    let bestLen = Infinity;
-    for (const el of nodes) {
-      if (!visible(el)) continue;
-      const text = normalizeSpace(el.textContent);
-      if (text.length < 8 || text.length > 36) continue;
-      if (!/^order\s*#\s*\d+$/i.test(text)) continue;
-      if (orderNumber && !text.includes(orderNumber)) continue;
-      if (text.length < bestLen) {
-        best = el;
-        bestLen = text.length;
-      }
+  function parseBrandLocation(text) {
+    const line = normalizeSpace(text);
+    const paren = line.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
+    if (paren) {
+      return { customer: normalizeSpace(paren[1]), location: normalizeSpace(paren[2]) };
     }
-    return best;
+    if (line.includes(" - ")) {
+      const parts = line.split(" - ").map(normalizeSpace);
+      return { customer: parts[0] || "", location: parts.slice(1).join(" - ") || "" };
+    }
+    return { customer: line, location: "" };
   }
 
   function extractOrderNumber() {
-    const heading = findOrderHeading();
-    const text = heading ? heading.textContent : document.body.innerText;
-    const match = String(text).match(/order\s*#\s*(\d+)/i);
-    if (heading) hits.push({ label: "Order Number", el: heading, valueEl: heading, value: match && match[1] });
-    return match ? match[1] : "";
-  }
-
-  function splitBrandLocation(line) {
-    const parts = normalizeSpace(line).split(" - ").map(normalizeSpace);
-    return {
-      customer: parts[0] || "",
-      location: parts.slice(1).join(" - ") || "",
-    };
-  }
-
-  function extractBrandAndLocation(orderNumber) {
-    const heading = findOrderHeading(orderNumber);
-
-    const tryLine = (el) => {
-      if (!el || !visible(el)) return null;
-      const text = ownText(el) || (el.childElementCount === 0 ? normalizeSpace(el.textContent) : "");
-      if (!text || text.length > 80 || /order\s*#/i.test(text)) return null;
-      if (!text.includes(" - ")) return null;
-      const parsed = splitBrandLocation(text);
-      if (!parsed.customer || !parsed.location) return null;
-      hits.push({ label: "Customer / Location", el, valueEl: el, value: text });
-      return parsed;
-    };
-
-    if (heading) {
-      const nearby = [];
-      let sib = heading.nextElementSibling;
-      while (sib && nearby.length < 8) {
-        nearby.push(sib);
-        sib = sib.nextElementSibling;
-      }
-      if (heading.parentElement) {
-        let uncle = heading.parentElement.nextElementSibling;
-        let n = 0;
-        while (uncle && n < 5) {
-          nearby.push(uncle);
-          uncle = uncle.nextElementSibling;
-          n += 1;
-        }
-      }
-
-      for (const block of nearby) {
-        const direct = tryLine(block);
-        if (direct) return direct;
-        for (const kid of block.querySelectorAll("h1, h2, h3, h4, p, span, div, strong")) {
-          const parsed = tryLine(kid);
-          if (parsed) return parsed;
-        }
+    const bodyText = document.body ? document.body.innerText : "";
+    const shortCode = bodyText.match(/\b([A-F0-9]{4,8})\b/);
+    const nodes = document.querySelectorAll("h1, h2, h3, h4, p, span, div, strong, button");
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      if (!visible(el)) continue;
+      const text = normalizeSpace(el.textContent);
+      if (/^[A-F0-9]{4,8}$/.test(text)) {
+        hits.push({ label: "Order Number", el, valueEl: el, value: text });
+        return text;
       }
     }
-
-    const lines = pageLines();
-    const idx = lines.findIndex(
-      (line) => orderNumber && /^order\s*#\s*\d+$/i.test(line) && line.includes(orderNumber)
-    );
-    if (idx >= 0 && lines[idx + 1] && lines[idx + 1].includes(" - ")) {
-      return splitBrandLocation(lines[idx + 1]);
-    }
-    return { customer: "", location: "" };
+    if (shortCode) return shortCode[1];
+    const uuid = location.pathname.match(/\/orders\/([a-f0-9-]+)/i);
+    if (uuid) return uuid[1].slice(-6).toUpperCase();
+    return "";
   }
 
-  function extractOrderSubmittedTime() {
-    const stage = findVisibleLabel(document.body, "Order submitted");
-    if (!stage) return "";
-    hits.push({ label: "Order submitted", el: stage, valueEl: null, value: "" });
-
-    const prev = stage.previousElementSibling;
-    if (prev && extractTime(prev.innerText)) {
-      const time = extractTime(prev.innerText);
-      hits.push({ label: "Order Time", el: prev, valueEl: prev, value: time });
-      return time;
-    }
-
-    const row = stage.closest("li, tr, article, section, div") || stage.parentElement;
-    const time = extractTime(row && row.innerText);
-    if (time) hits.push({ label: "Order Time", el: row, valueEl: row, value: time });
-    return time;
-  }
-
-  function extractRefundedItems() {
-    const items = [];
-
-    for (const table of document.querySelectorAll("table")) {
-      const rows = table.rows;
-      if (!rows || !rows.length) continue;
-      const headerCells = rows[0].cells;
-      if (!headerCells || !headerCells.length) continue;
-      const headers = [];
-      for (let i = 0; i < headerCells.length; i++) headers.push(normalizeKey(headerCells[i].innerText));
-      const reasonIdx = headers.findIndex((h) => /refund reason/.test(h));
-      if (reasonIdx < 0) continue;
-      const nameIdx = headers.findIndex((h) => /^(item|item name|name|product|description)$/.test(h));
-      const catIdx = headers.findIndex((h) => /category/.test(h));
-
-      for (let r = 1; r < rows.length; r++) {
-        const cells = rows[r].cells;
-        if (!cells || !cells.length) continue;
-        const reasonText = normalizeSpace((cells[reasonIdx] && cells[reasonIdx].innerText) || "");
-        if (!REASON_ROW_RE.test(reasonText)) continue;
-        const itemName = nameIdx >= 0 ? normalizeSpace((cells[nameIdx] && cells[nameIdx].innerText) || "") : "";
-        const catName = catIdx >= 0 ? normalizeSpace((cells[catIdx] && cells[catIdx].innerText) || "") : "";
-        const name = itemName || catName;
-        if (!isValidItemName(name)) continue;
-        items.push({ name, reason: canonicalizeReason(reasonText) });
-        hits.push({ label: "Refunded item", el: rows[r], valueEl: cells[reasonIdx], value: name });
+  function extractBrandAndLocation() {
+    const nodes = document.querySelectorAll("h1, h2, h3, h4, p, span, div, strong");
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      if (!visible(el)) continue;
+      const text = ownText(el) || normalizeSpace(el.textContent);
+      if (!text || text.length > 90) continue;
+      if (!/\(.+\)/.test(text)) continue;
+      if (/order placed|delivery details|order details|sales \(incl/i.test(text)) continue;
+      const parsed = parseBrandLocation(text);
+      if (parsed.customer && parsed.location) {
+        hits.push({ label: "Customer / Location", el, valueEl: el, value: text });
+        return parsed;
       }
-      if (items.length) break;
-    }
-
-    if (items.length) {
-      return uniqueBy(items, (item) => `${normalizeKey(item.name)}|${item.reason}`);
     }
 
     const lines = pageLines();
     for (let i = 0; i < lines.length; i++) {
-      if (!REASON_ROW_RE.test(lines[i])) continue;
-      if (/^missing items$/i.test(lines[i]) && /^refund reason$/i.test(lines[i - 1] || "")) continue;
-      let hasMoney = false;
-      for (let k = Math.max(0, i - 6); k < Math.min(lines.length, i + 5); k++) {
-        if (/£\d|\d+\.\d{2}/.test(lines[k])) {
-          hasMoney = true;
-          break;
-        }
-      }
-      if (!hasMoney) continue;
+      if (!/\(.+\)/.test(lines[i])) continue;
+      const parsed = parseBrandLocation(lines[i]);
+      if (parsed.customer && parsed.location) return parsed;
+    }
+    return { customer: "", location: "" };
+  }
 
-      let name = "";
-      for (let j = i - 1; j >= Math.max(0, i - 8); j--) {
-        if (/^£/.test(lines[j]) || /£\d/.test(lines[j]) || /^\d+$/.test(lines[j])) continue;
-        if (/^(quantity|qty|price|refund reason|refund details|item|item name|category)$/i.test(lines[j])) continue;
-        if (UI_NOISE.test(normalizeKey(lines[j]))) continue;
-        if (REASON_ROW_RE.test(lines[j])) continue;
-        if (lines[j].length > 1 && lines[j].length < 70 && isValidItemName(lines[j])) {
-          name = lines[j];
-          break;
-        }
+  function extractClaimDateRaw() {
+    const monthDate = (document.body.innerText || "").match(
+      /([A-Za-z]{3,9})\s+\d{1,2},?\s+\d{4}|\d{1,2},?\s+[A-Za-z]{3,9},?\s+\d{4}/
+    );
+    if (monthDate) return monthDate[0];
+    const lines = pageLines();
+    return lines.find((line) => /[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}/.test(line)) || "";
+  }
+
+  function extractOrderPlacedTime() {
+    const lines = pageLines();
+    for (let i = 0; i < lines.length; i++) {
+      if (!/order placed by customer/i.test(lines[i])) continue;
+      const time = extractTime(lines[i]) || extractTime(lines[i - 1] || "") || extractTime(lines[i + 1] || "");
+      if (time) {
+        hits.push({ label: "Order Time", el: null, valueEl: null, value: time });
+        return time;
       }
-      if (name) items.push({ name, reason: canonicalizeReason(lines[i]) });
+    }
+    return extractTime(document.body.innerText);
+  }
+
+  function readLabeledMoney(labels) {
+    const lines = pageLines();
+    for (const label of labels) {
+      const wanted = normalizeKey(label);
+      for (let i = 0; i < lines.length - 1; i++) {
+        if (normalizeKey(lines[i]) !== wanted) continue;
+        const amount = parseMoney(lines[i + 1]);
+        if (amount != null) return amount;
+      }
+      const inline = lines.find((line) => normalizeKey(line).startsWith(wanted));
+      if (inline) {
+        const amount = parseMoney(inline.replace(new RegExp(label, "i"), ""));
+        if (amount != null) return amount;
+      }
+    }
+    return null;
+  }
+
+  function extractOrderItems() {
+    const items = [];
+    const lines = pageLines();
+    const reasonFromPage = extractRefundReasonRaw();
+
+    for (let i = 0; i < lines.length; i++) {
+      const priceMatch = lines[i].match(/^(.+?)\s+(?:NZ\$|\$|£|€)\s*(\d+(?:\.\d{2})?)$/);
+      if (!priceMatch) continue;
+      const name = normalizeSpace(priceMatch[1]);
+      if (!isValidItemName(name)) continue;
+      if (/^(sales|marketplace fee|net payout|subtotal|total|tax|gst)/i.test(name)) continue;
+      items.push({
+        name,
+        reason: reasonFromPage ? canonicalizeReason(reasonFromPage) : "",
+      });
     }
 
-    return uniqueBy(items, (item) => `${normalizeKey(item.name)}|${item.reason}`);
+    if (!items.length) {
+      for (let i = 0; i < lines.length; i++) {
+        if (!/^\d+$/.test(lines[i])) continue;
+        const name = lines[i + 1];
+        const priceLine = lines[i + 2] || "";
+        if (!name || !/(NZ\$|\$|£|€)\s*\d/.test(priceLine)) continue;
+        if (!isValidItemName(name)) continue;
+        items.push({
+          name: normalizeSpace(name),
+          reason: reasonFromPage ? canonicalizeReason(reasonFromPage) : "",
+        });
+      }
+    }
+
+    return uniqueBy(items, (item) => normalizeKey(item.name));
+  }
+
+  function extractRefundReasonRaw() {
+    const lines = pageLines();
+    const issuePatterns = [
+      /^missing item/i,
+      /^missing items/i,
+      /^wrong order/i,
+      /^wrong item/i,
+      /^poor food quality/i,
+      /^food quality/i,
+      /^food safety/i,
+      /^incorrect item/i,
+      /^prepared incorrectly/i,
+    ];
+    for (const line of lines) {
+      if (issuePatterns.some((re) => re.test(line))) return line;
+    }
+    for (let i = 0; i < lines.length; i++) {
+      if (/issue type|refund reason|customer feedback|complaint reason/i.test(lines[i]) && lines[i + 1]) {
+        return lines[i + 1];
+      }
+    }
+    return "";
+  }
+
+  function extractDisputeAmount() {
+    const marketplaceFee = readLabeledMoney([
+      "Marketplace Fee (incl. GST)",
+      "Marketplace Fee (incl GST)",
+      "Marketplace Fee",
+      "Marketplace fee",
+    ]);
+    if (marketplaceFee != null) return Math.abs(marketplaceFee);
+
+    const refund = readLabeledMoney([
+      "Refund amount",
+      "Customer refund",
+      "Refund total",
+      "Adjustment amount",
+      "Issue refund",
+      "Refund issued",
+    ]);
+    if (refund != null) return Math.abs(refund);
+
+    const lines = pageLines();
+    for (const line of lines) {
+      if (!/marketplace\s*fee|refund|adjustment|issue payout/i.test(line)) continue;
+      const amount = parseMoney(line);
+      if (amount != null) return Math.abs(amount);
+    }
+    return null;
   }
 
   function itemsMatchingReason(items, refundReason) {
@@ -579,39 +614,32 @@
     clearHits();
     invalidatePageLines();
     const errors = [];
-    const root = document.body;
 
     const orderNumber = extractOrderNumber();
     if (!orderNumber) errors.push("Order Number");
 
-    const { customer, location } = extractBrandAndLocation(orderNumber);
+    const { customer, location: storeLocation } = extractBrandAndLocation();
     if (!customer) errors.push("Customer");
-    if (!location) errors.push("Location");
+    if (!storeLocation) errors.push("Location");
 
-    const dateHit = readUiValue(root, "Date ordered");
-    const dateRaw = valuesAfterLabel("Date ordered")[0] || dateHit.value;
+    const dateRaw = extractClaimDateRaw();
     const claimDate = parseClaimDate(dateRaw);
-    if (!claimDate.iso) errors.push("Date ordered");
+    if (!claimDate.iso) errors.push("Order date");
 
-    let orderTime = extractOrderSubmittedTime();
-    if (!orderTime) orderTime = extractTime(dateRaw);
-    if (!orderTime) errors.push("Order submitted");
+    let orderTime = extractOrderPlacedTime();
+    if (!orderTime) errors.push("Order placed time");
 
-    const totalHit = readUiValue(root, "Order total");
-    const orderValue = parseMoney(valuesAfterLabel("Order total")[0] || totalHit.value);
-    if (orderValue == null) errors.push("Order total");
+    const orderValue =
+      readLabeledMoney(["Sales (incl. GST)", "Sales (incl GST)", "Subtotal", "Order total"]) ||
+      readLabeledMoney(["Net payout"]);
+    if (orderValue == null) errors.push("Sales total");
 
-    const refundHit = readUiValue(root, "Partner refund value");
-    const disputeRaw = valuesAfterLabel("Partner refund value")[0] || refundHit.value;
-    const disputeAmount = parseMoney(disputeRaw);
-    if (disputeAmount == null) errors.push("Partner refund value");
+    const disputeAmount = extractDisputeAmount();
 
-    const items = extractRefundedItems();
-    const reasonValues = valuesAfterLabel("Refund reason");
-    const reasonRaw = [...reasonValues].reverse().find((v) => canonicalizeReason(v)) || "";
+    const items = extractOrderItems();
+    const reasonRaw = extractRefundReasonRaw();
     const itemReason = (items.find((item) => item && item.reason) || {}).reason || "";
     const refundReason = canonicalizeReason(reasonRaw) || itemReason || "";
-    if (!refundReason) errors.push("Refund reason");
 
     const alreadyDisputed = detectAlreadyDisputed();
     highlightHits();
@@ -620,14 +648,14 @@
     const disputeFields = buildDisputeFieldValues(items, refundReason);
     const payload = {
       extractedAt: new Date().toISOString(),
-      sourceUrl: location.href,
+      sourceUrl: window.location.href,
       claimDate: claimDate.raw,
       claimDateISO: claimDate.iso,
       claimDateDMY: claimDate.dmy,
       claimDateDash: claimDate.dash,
       orderTime,
       customer,
-      location,
+      location: storeLocation,
       platform: CONFIG.PLATFORM,
       orderNumber,
       orderValue: orderValue == null ? "" : orderValue.toFixed(2),
@@ -646,7 +674,7 @@
       errors,
     };
 
-    log("UI payload", payload);
+    log("Uber payload", payload);
     return payload;
   }
 
@@ -665,7 +693,7 @@
       const text = normalizeSpace(el.textContent);
       if (!text || text.length > 60) continue;
       if (/dispute this refund/i.test(text)) continue;
-      if (/^disputed$/i.test(text) || /^refund\s+contested$/i.test(text) || /dispute\s+sent/i.test(text)) return true;
+      if (/^disputed$/i.test(text) || /^refund\s+contested$/i.test(text) || /dispute\s+sent/i.test(text) || /appeal submitted/i.test(text)) return true;
     }
     return false;
   }
@@ -758,10 +786,10 @@
   function resetFillGuards() {
     lastFilledOrder = "";
     claimsFillInFlight = false;
-    const btn = document.getElementById("dcf-btn");
+    const btn = document.getElementById("ucf-btn");
     if (btn) {
       btn.disabled = false;
-      btn.textContent = "Fill from Deliveroo";
+      btn.textContent = "Fill from Uber Eats";
     }
   }
 
@@ -872,7 +900,7 @@
       } else {
         toast("Ready for next order.", "success", 2500);
         if (payload && payload.orderNumber === savedOrderNumber) {
-          toast("Run Auto-Fill on the next Deliveroo refund first.", "info", 5000);
+          toast("Run Auto-Fill on the Uber Eats order tab first.", "info", 5000);
         }
       }
     };
@@ -1398,7 +1426,7 @@
 
     const row = found.row;
     const labelEl = found.labelEl;
-    if (labelEl) labelEl.classList.add("dcf-hit");
+    if (labelEl) labelEl.classList.add("ucf-hit");
 
     if (/video submitted/i.test(label)) return { ok: fillYesNo(row, value), method: "yes-no" };
 
@@ -1414,7 +1442,7 @@
       }
       return { ok: false, reason: "no control next to label" };
     }
-    control.classList.add("dcf-hit");
+    control.classList.add("ucf-hit");
 
     if (control.tagName === "SELECT") return { ok: await fillSelect(control, value, controlCell(control) || row), method: "select" };
     if (control.type === "date") {
@@ -1461,7 +1489,7 @@
 
   async function fillClaimsForm(payload, options = {}) {
     const modal = await ensureClaimsModal();
-    if (!modal) throw new Error("Click the green Add New button, then click Fill from Deliveroo.");
+    if (!modal) throw new Error("Click the green Add New button, then click Fill from Uber Eats.");
 
     const fieldPause = options.fast || fastFillMode ? 45 : 140;
     const L = CONFIG.opspotLabels;
@@ -1547,40 +1575,39 @@
     if (stylesInjected) return;
     stylesInjected = true;
     GM_addStyle(`
-      .dcf-hit { outline: 2px solid #00ccbc !important; outline-offset: 2px; background: rgba(0,204,188,.12) !important; }
-      #dcf-btn {
+      .ucf-hit { outline: 2px solid #06c167 !important; outline-offset: 2px; background: rgba(6,193,103,.12) !important; }
+      #ucf-btn {
         position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
         z-index: 2147483647;
-        background: #00ccbc; color: #06221f; border: 0; cursor: pointer;
+        background: #06c167; color: #062816; border: 0; cursor: pointer;
         border-radius: 999px; padding: 12px 22px;
         box-shadow: 0 10px 30px rgba(0,0,0,.35);
         font: 700 15px/1.2 Segoe UI, system-ui, sans-serif;
       }
-      #dcf-btn:hover { background: #111827; color: #fff; }
-      #dcf-btn:hover { background: #00ccbc; color: #06221f; }
-      #dcf-btn:disabled { opacity: .65; cursor: wait; }
-      #dcf-toast, #dcf-preview {
+      #ucf-btn:hover { background: #05a857; color: #fff; }
+      #ucf-btn:disabled { opacity: .65; cursor: wait; }
+      #ucf-toast, #ucf-preview {
         position: fixed; top: 64px; right: 18px; z-index: 2147483646;
         max-width: 380px; border-radius: 12px; padding: 12px 14px;
         box-shadow: 0 10px 30px rgba(0,0,0,.28);
         font: 13px/1.45 Segoe UI, system-ui, sans-serif;
       }
-      #dcf-toast { background: #111827; color: #f9fafb; }
-      #dcf-toast.error { background: #7f1d1d; }
-      #dcf-toast.success { background: #065f46; }
-      #dcf-preview { background: #fff; color: #111827; width: 380px; max-height: 70vh; overflow: auto; }
-      #dcf-preview h3 { margin: 0 0 8px; font-size: 14px; }
-      #dcf-preview table { width: 100%; border-collapse: collapse; }
-      #dcf-preview td { padding: 4px 0; vertical-align: top; }
-      #dcf-preview td:first-child { color: #6b7280; width: 44%; padding-right: 8px; }
-      #dcf-preview .missing { color: #b91c1c; }
+      #ucf-toast { background: #111827; color: #f9fafb; }
+      #ucf-toast.error { background: #7f1d1d; }
+      #ucf-toast.success { background: #065f46; }
+      #ucf-preview { background: #fff; color: #111827; width: 380px; max-height: 70vh; overflow: auto; }
+      #ucf-preview h3 { margin: 0 0 8px; font-size: 14px; }
+      #ucf-preview table { width: 100%; border-collapse: collapse; }
+      #ucf-preview td { padding: 4px 0; vertical-align: top; }
+      #ucf-preview td:first-child { color: #6b7280; width: 44%; padding-right: 8px; }
+      #ucf-preview .missing { color: #b91c1c; }
     `);
   }
 
   function toast(message, kind = "info", ms = 4500) {
-    document.getElementById("dcf-toast")?.remove();
+    document.getElementById("ucf-toast")?.remove();
     const el = document.createElement("div");
-    el.id = "dcf-toast";
+    el.id = "ucf-toast";
     el.className = kind;
     el.textContent = message;
     document.body.appendChild(el);
@@ -1595,9 +1622,9 @@
   }
 
   function showPreview(payload) {
-    document.getElementById("dcf-preview")?.remove();
+    document.getElementById("ucf-preview")?.remove();
     const el = document.createElement("div");
-    el.id = "dcf-preview";
+    el.id = "ucf-preview";
     const rows = [
       ["Claim Date", payload.claimDate],
       ["Order Time", payload.orderTime],
@@ -1672,10 +1699,10 @@
 
   function injectButton(text, onClick) {
     ensureStyles();
-    let btn = document.getElementById("dcf-btn");
+    let btn = document.getElementById("ucf-btn");
     if (!btn) {
       btn = document.createElement("button");
-      btn.id = "dcf-btn";
+      btn.id = "ucf-btn";
       btn.type = "button";
       (document.body || document.documentElement).appendChild(btn);
     }
@@ -1690,15 +1717,15 @@
       return;
     }
 
-    const existing = document.getElementById("dcf-btn");
+    const existing = document.getElementById("ucf-btn");
     if (existing && existing.onclick) return;
 
     if (isOpSpotPage()) {
-      injectButton("Fill from Deliveroo", async () => {
+      injectButton("Fill from Uber Eats", async () => {
         resetFillGuards();
         const payload = await loadPayload();
         if (!payload) {
-          toast("No stored order. Click Auto-Fill & Dispute on the refund tab first, then click here.", "error", 7000);
+          toast("No stored order. Click Extract Order on the Uber Eats tab first, then click here.", "error", 7000);
           return;
         }
         await applyPayloadToClaims(payload, { force: true });
@@ -1706,8 +1733,8 @@
       return;
     }
 
-    if (isDeliverooHub()) {
-      injectButton("Auto-Fill & Dispute", onExtractClick);
+    if (isUberEatsPage()) {
+      injectButton("Extract Order → OpSpot", onExtractClick);
     }
   }
 
@@ -1715,17 +1742,17 @@
     ensureStyles();
     if (typeof GM_registerMenuCommand === "function") {
       if (typeof location !== "undefined" && /opspot/i.test(location.host)) {
-        GM_registerMenuCommand("Fill from Deliveroo", async () => {
+        GM_registerMenuCommand("Fill from Uber Eats", async () => {
           resetFillGuards();
           const payload = await loadPayload();
           if (!payload) {
-            toast("No stored order. Run Auto-Fill on the refund tab first.", "error", 7000);
+            toast("No stored order. Run Extract Order on the Uber Eats tab first.", "error", 7000);
             return;
           }
           await applyPayloadToClaims(payload, { force: true });
         });
       } else {
-        GM_registerMenuCommand("Auto-Fill & Dispute", onExtractClick);
+        GM_registerMenuCommand("Extract Order → OpSpot", onExtractClick);
       }
     }
     const remount = debounce(mount, 800);
@@ -1743,7 +1770,7 @@
       for (let i = 0; i < mutations.length; i++) {
         const m = mutations[i];
         if (m.type === "childList" && (m.addedNodes.length || m.removedNodes.length)) {
-          if (!document.getElementById("dcf-btn")) remount();
+          if (!document.getElementById("ucf-btn")) remount();
           invalidateModalCache();
           return;
         }
@@ -1762,7 +1789,7 @@
   }
 
   async function onExtractClick() {
-    const btn = document.getElementById("dcf-btn");
+    const btn = document.getElementById("ucf-btn");
     if (btn) {
       btn.disabled = true;
       btn.textContent = "Reading screen…";
@@ -1772,13 +1799,13 @@
       showPreview(payload);
       savePayload(payload);
       if (payload.errors.length) toast(`UI miss: ${payload.errors.join(", ")}`, "error", 7000);
-      else toast(`v1.6.0 stored order #${payload.orderNumber}. Click Fill from Deliveroo on OpSpot.`, "success", 7000);
+      else toast(`v1.0.0 stored order #${payload.orderNumber}. Click Fill from Uber Eats on OpSpot.`, "success", 7000);
     } catch (err) {
       toast(`Extraction failed: ${err.message || err}`, "error");
     } finally {
       if (btn) {
         btn.disabled = false;
-        btn.textContent = "Auto-Fill & Dispute";
+        btn.textContent = "Extract Order → OpSpot";
       }
     }
   }
@@ -1787,7 +1814,7 @@
     if (!payload || !payload.orderNumber || claimsFillInFlight) return;
     if (!options.force && lastFilledOrder === payload.orderNumber) return;
     claimsFillInFlight = true;
-    const btn = document.getElementById("dcf-btn");
+    const btn = document.getElementById("ucf-btn");
     if (btn) {
       btn.disabled = true;
       btn.textContent = "Filling Claims…";
@@ -1805,7 +1832,7 @@
         .filter(([, r]) => !r.ok)
         .map(([k, r]) => (r.reason ? `${k} (${r.reason})` : k));
       if (failed.length) toast(`Could not fill: ${failed.join(", ")}`, "error", 7000);
-      else if (!options.fast) toast(`v1.6.0 filled claim ${payload.orderNumber}.`, "success");
+      else if (!options.fast) toast(`v1.0.0 filled claim ${payload.orderNumber}.`, "success");
     } catch (err) {
       toast(`Fill failed: ${err.message || err}`, "error");
     } finally {
@@ -1813,7 +1840,7 @@
       claimsFillInFlight = false;
       if (btn) {
         btn.disabled = false;
-        btn.textContent = "Fill from Deliveroo";
+        btn.textContent = "Fill from Uber Eats";
       }
     }
   }

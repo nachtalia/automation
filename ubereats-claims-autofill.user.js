@@ -78,6 +78,8 @@
       "wrong item": "Incorrect Item",
       "poor food quality": "Prepared incorrectly",
       "food quality": "Prepared incorrectly",
+      "customization missing": "Missing Item",
+      "customization reported missing": "Missing Item",
     },
     reasonForDisputeOtherOption: "Other",
     foodSafetyComplaintLabel: "Food safety complaint",
@@ -230,7 +232,7 @@
   }
 
   const HEADER_WORDS = /^(quantity|qty|price|item|items|name|category|total|refund reason|refund details)$/i;
-  const UI_NOISE = /^(refund details|refund reason|partner refund value|order total|date ordered|order submitted|order timeline|dispute this refund|prepared incorrectly|missing|missing item|missing items|incorrect|incorrect item|incorrect items|food safety complaint|category|quantity|qty|price|item|items|name|total|deliveroo|uber eats|partner hub|marketplace fee|net payout|sales \(incl\. gst\))$/i;
+  const UI_NOISE = /^(refund details|refund reason|partner refund value|order total|date ordered|order submitted|order timeline|dispute this refund|prepared incorrectly|missing|missing item|missing items|incorrect|incorrect item|incorrect items|food safety complaint|category|quantity|qty|price|item|items|name|total|deliveroo|uber eats|partner hub|marketplace fee|net payout|sales \(incl\. gst\)|chargeback amount|customization reported missing|\d+\s+customization(?:s)?\s+missing)$/i;
 
   function isValidItemName(name) {
     const text = normalizeSpace(name);
@@ -246,7 +248,7 @@
   function canonicalizeReason(reason) {
     const key = normalizeKey(reason);
     if (!key || HEADER_WORDS.test(key)) return "";
-    if (key === "missing" || key.includes("missing item")) return "missing items";
+    if (key === "missing" || key.includes("missing item") || (key.includes("customization") && key.includes("missing"))) return "missing items";
     if (key.includes("prepared incorrectly") || key.includes("poor food quality") || key.includes("quality issue")) return "prepared incorrectly";
     if (key.includes("food safety")) return "food safety complaint";
     if (key.includes("wrong order") || key.includes("wrong item") || key.includes("incorrect")) return "incorrect item";
@@ -468,18 +470,64 @@
 
   function readLabeledMoney(labels) {
     const lines = pageLines();
+    const lineKey = (line) =>
+      normalizeKey(line)
+        .replace(/\s*dispute\s*$/i, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
     for (const label of labels) {
       const wanted = normalizeKey(label);
       for (let i = 0; i < lines.length - 1; i++) {
-        if (normalizeKey(lines[i]) !== wanted) continue;
-        const amount = parseMoney(lines[i + 1]);
+        const key = lineKey(lines[i]);
+        if (key !== wanted && !key.startsWith(wanted)) continue;
+        const amount = parseMoney(lines[i + 1]) ?? parseMoney(lines[i]);
         if (amount != null) return amount;
       }
-      const inline = lines.find((line) => normalizeKey(line).startsWith(wanted));
+      const inline = lines.find((line) => {
+        const key = lineKey(line);
+        return key === wanted || key.startsWith(wanted) || normalizeKey(line).includes(wanted);
+      });
       if (inline) {
-        const amount = parseMoney(inline.replace(new RegExp(label, "i"), ""));
+        const amount = parseMoney(inline);
         if (amount != null) return amount;
       }
+    }
+    return null;
+  }
+
+  function extractDisputeAmount() {
+    const lines = pageLines();
+    for (let i = 0; i < lines.length; i++) {
+      if (!/chargeback\s*amount/i.test(lines[i])) continue;
+      const amount = parseMoney(lines[i + 1]) ?? parseMoney(lines[i]);
+      if (amount != null) return Math.abs(amount);
+    }
+
+    const chargeback = readLabeledMoney([
+      "Chargeback Amount (incl. GST) Dispute",
+      "Chargeback Amount (incl. GST)Dispute",
+      "Chargeback Amount (incl. GST)",
+      "Chargeback Amount (incl GST)",
+      "Chargeback Amount",
+      "Chargeback amount",
+    ]);
+    if (chargeback != null) return Math.abs(chargeback);
+
+    const refund = readLabeledMoney([
+      "Refund amount",
+      "Customer refund",
+      "Refund total",
+      "Adjustment amount",
+      "Issue refund",
+      "Refund issued",
+    ]);
+    if (refund != null) return Math.abs(refund);
+
+    for (const line of lines) {
+      if (!/chargeback\s*amount|refund|adjustment|issue payout/i.test(line)) continue;
+      const amount = parseMoney(line);
+      if (amount != null) return Math.abs(amount);
     }
     return null;
   }
@@ -520,7 +568,13 @@
 
   function extractRefundReasonRaw() {
     const lines = pageLines();
+    const body = document.body ? document.body.innerText : "";
+    if (/customization(?:s)?\s+(?:reported\s+)?missing/i.test(body)) {
+      return "Customization reported missing";
+    }
     const issuePatterns = [
+      /customization(?:s)?\s+(?:reported\s+)?missing/i,
+      /^\d+\s+customization/i,
       /^missing item/i,
       /^missing items/i,
       /^wrong order/i,
@@ -540,34 +594,6 @@
       }
     }
     return "";
-  }
-
-  function extractDisputeAmount() {
-    const marketplaceFee = readLabeledMoney([
-      "Marketplace Fee (incl. GST)",
-      "Marketplace Fee (incl GST)",
-      "Marketplace Fee",
-      "Marketplace fee",
-    ]);
-    if (marketplaceFee != null) return Math.abs(marketplaceFee);
-
-    const refund = readLabeledMoney([
-      "Refund amount",
-      "Customer refund",
-      "Refund total",
-      "Adjustment amount",
-      "Issue refund",
-      "Refund issued",
-    ]);
-    if (refund != null) return Math.abs(refund);
-
-    const lines = pageLines();
-    for (const line of lines) {
-      if (!/marketplace\s*fee|refund|adjustment|issue payout/i.test(line)) continue;
-      const amount = parseMoney(line);
-      if (amount != null) return Math.abs(amount);
-    }
-    return null;
   }
 
   function itemsMatchingReason(items, refundReason) {

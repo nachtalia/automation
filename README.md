@@ -40,6 +40,31 @@ Confirm the **Platform** dropdown includes **Deliveroo** and **Uber Eats**.
 5. Click **Fill from Deliveroo**.
 6. Review the form, then click **Save** (or **Save and Add New**).
 
+### Copy to Google Sheet (Refund Dispute Log)
+
+The script picks the sheet **tab from the branch/brand**:
+
+| Deliveroo brand | Google Sheet tab |
+|-----------------|------------------|
+| Shake Shack… | **Shake Shack** |
+| Jollibee… | **Jollibee UK** |
+| Popeyes… | **Popeyes** |
+
+1. On the Deliveroo refund page, click **Copy for Google Sheet**.
+2. Open `Refund_Dispute_Log_2` in Google Sheets.
+3. Click **Paste Deliveroo → Sheet Tab** (top of the sheet page).
+4. The script switches to the matching tab (e.g. Shake Shack).
+5. Click the next empty row and paste (`Ctrl+V`).
+
+| Sheet column | Copied value |
+|--------------|--------------|
+| Date | Claim / order date (`DD-MM-YYYY`) |
+| # Order Number | Order number |
+| Refund Reason | **Reason for Dispute** (`Missing Item`, `Incorrect Item`, `Prepared Incorrectly`) |
+| With Video? | `No` (default) |
+| Footage Status | Computed footage status |
+| Comments | Item names, store, refund amount |
+
 ---
 
 ## Uber Eats workflow

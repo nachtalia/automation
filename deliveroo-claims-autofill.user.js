@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Deliveroo Refund → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      1.6.0
-// @description  Read Deliveroo Partner Hub refunds and fill OpSpot Claims.
+// @version      1.8.1
+// @description  Read Deliveroo Partner Hub refunds, fill OpSpot Claims, and copy rows into the matching Google Sheet tab.
 // @author       Claims Ops
 // @match        https://partner-hub.deliveroo.com/*
 // @match        https://partner-hub.deliveroo.com/orders/refunds/*
@@ -15,6 +15,8 @@
 // @match        https://opspot.workhorselive.com/sysTable.php*
 // @match        *://opspot.workhorselive.com/*
 // @match        *://*.workhorselive.com/*
+// @match        https://docs.google.com/spreadsheets/*
+// @match        *://docs.google.com/spreadsheets/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM.setValue
@@ -31,6 +33,7 @@
  * Pages
  *   Deliveroo: https://partner-hub.deliveroo.com/orders/refunds/...
  *   OpSpot:    https://opspot.workhorselive.com/sysTable.php?sys_module_id=10000&sys_data_entity_id=10000#
+ *   Sheets:    https://docs.google.com/spreadsheets/d/... (Refund_Dispute_Log_2)
  *
  * You must be logged in on both. The login screens have no order data.
  */
@@ -54,12 +57,21 @@
     DELIVEROO_HOST: "partner-hub.deliveroo.com",
     CLAIMS_FORM_URL: "https://opspot.workhorselive.com/sysTable.php?sys_module_id=10000&sys_data_entity_id=10000",
     STORAGE_KEY: "deliveroo_claim_payload_v1",
+    SHEET_STORAGE_KEY: "deliveroo_sheet_row_v1",
     CLIP_PREFIX: "DCF1:",
     PLATFORM: "Deliveroo",
     VIDEO_SUBMITTED: "No",
     DISPUTE_THRESHOLD_GBP: 2,
     DEBUG: false,
-    MODAL_CACHE_MS: 250,
+    MODAL_CACHE_MS: 800,
+    FAST_FILL: true,
+
+    branchSheetTabs: [
+      { match: /shake\s*shack/i, tab: "Shake Shack" },
+      { match: /jollibee/i, tab: "Jollibee UK" },
+      { match: /popeyes/i, tab: "Popeyes" },
+    ],
+    defaultSheetTab: "",
 
     outcomeOptions: {
       notDisputed: "Not disputed",
@@ -165,11 +177,9 @@
   }
 
   function visible(el) {
-    if (!el || !(el instanceof Element)) return false;
-    const style = window.getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    if (!el || el.nodeType !== 1) return false;
+    if (el.hidden) return false;
+    return el.offsetWidth > 0 || el.offsetHeight > 0;
   }
 
   function ownText(el) {
@@ -276,6 +286,10 @@
     return /partner-hub\.deliveroo\.com|restaurant-hub\.deliveroo\.com|deliveroo\.(com|co\.uk)/i.test(location.host);
   }
 
+  function isGoogleSheetsPage() {
+    return /docs\.google\.com/i.test(location.host) && /\/spreadsheets\//i.test(location.pathname);
+  }
+
   function invalidateModalCache() {
     cachedModal = null;
     cachedModalAt = 0;
@@ -297,14 +311,15 @@
     const wanted = normalizeKey(label);
     let best = null;
     let bestLen = Infinity;
-    const nodes = root.querySelectorAll("h1, h2, h3, h4, p, span, div, dt, dd, th, td, label, li, strong, button");
-    for (const el of nodes) {
+    const nodes = root.querySelectorAll("label, dt, th, td, strong, b, p, span, h1, h2, h3, h4, legend, li");
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
       if (!visible(el)) continue;
       const text = ownText(el) || (el.children.length === 0 ? normalizeSpace(el.textContent) : "");
       if (!text || text.length > 48) continue;
       const key = normalizeKey(text);
       if (key !== wanted && key !== `${wanted}*`) continue;
-      if (text.length <= bestLen && !el.closest("thead") && el.tagName !== "TH") {
+      if (text.length <= bestLen && el.tagName !== "TH") {
         best = el;
         bestLen = text.length;
       }
@@ -352,7 +367,6 @@
   }
 
   function highlightHits() {
-    document.querySelectorAll(".dcf-hit").forEach((el) => el.classList.remove("dcf-hit"));
     for (const hit of hits) {
       if (hit.el) hit.el.classList.add("dcf-hit");
       if (hit.valueEl) hit.valueEl.classList.add("dcf-hit");
@@ -360,8 +374,11 @@
   }
 
   function clearHits() {
+    for (const hit of hits) {
+      if (hit.el) hit.el.classList.remove("dcf-hit");
+      if (hit.valueEl) hit.valueEl.classList.remove("dcf-hit");
+    }
     hits.length = 0;
-    document.querySelectorAll(".dcf-hit").forEach((el) => el.classList.remove("dcf-hit"));
   }
 
   /* -------------------------------------------------------------------------- */
@@ -369,37 +386,48 @@
   /* -------------------------------------------------------------------------- */
 
   function findOrderHeading(orderNumber) {
-    const nodes = [...document.querySelectorAll("h1, h2, h3, h4, p, span, div, strong")];
+    const selectors = ["h1", "h2", "h3", "h4", "strong", "p", "span"];
     let best = null;
     let bestLen = Infinity;
-    for (const el of nodes) {
-      if (!visible(el)) continue;
-      const text = normalizeSpace(el.textContent);
-      if (text.length < 8 || text.length > 36) continue;
-      if (!/^order\s*#\s*\d+$/i.test(text)) continue;
-      if (orderNumber && !text.includes(orderNumber)) continue;
-      if (text.length < bestLen) {
-        best = el;
-        bestLen = text.length;
+    for (let s = 0; s < selectors.length; s++) {
+      const nodes = document.getElementsByTagName(selectors[s]);
+      for (let i = 0; i < nodes.length; i++) {
+        const el = nodes[i];
+        if (!visible(el)) continue;
+        const text = ownText(el) || normalizeSpace(el.textContent);
+        if (text.length < 8 || text.length > 36) continue;
+        if (!/^order\s*#\s*\d+$/i.test(text)) continue;
+        if (orderNumber && !text.includes(orderNumber)) continue;
+        if (text.length < bestLen) {
+          best = el;
+          bestLen = text.length;
+        }
       }
+      if (best && s < 4) return best;
     }
     return best;
   }
 
   function extractOrderNumber() {
     const heading = findOrderHeading();
-    const text = heading ? heading.textContent : document.body.innerText;
+    const text = heading ? heading.textContent : (pageLines()[0] ? pageLines().join("\n") : document.body.innerText);
     const match = String(text).match(/order\s*#\s*(\d+)/i);
     if (heading) hits.push({ label: "Order Number", el: heading, valueEl: heading, value: match && match[1] });
     return match ? match[1] : "";
   }
 
   function splitBrandLocation(line) {
-    const parts = normalizeSpace(line).split(" - ").map(normalizeSpace);
+    const text = normalizeSpace(line);
+    const parts = text.split(/\s*[–—−-]\s*/).map(normalizeSpace).filter(Boolean);
+    if (parts.length < 2) return { customer: "", location: "" };
     return {
       customer: parts[0] || "",
       location: parts.slice(1).join(" - ") || "",
     };
+  }
+
+  function looksLikeBrandLocation(text) {
+    return /\s+[–—−-]\s+/.test(normalizeSpace(text));
   }
 
   function extractBrandAndLocation(orderNumber) {
@@ -409,7 +437,7 @@
       if (!el || !visible(el)) return null;
       const text = ownText(el) || (el.childElementCount === 0 ? normalizeSpace(el.textContent) : "");
       if (!text || text.length > 80 || /order\s*#/i.test(text)) return null;
-      if (!text.includes(" - ")) return null;
+      if (!looksLikeBrandLocation(text)) return null;
       const parsed = splitBrandLocation(text);
       if (!parsed.customer || !parsed.location) return null;
       hits.push({ label: "Customer / Location", el, valueEl: el, value: text });
@@ -447,7 +475,7 @@
     const idx = lines.findIndex(
       (line) => orderNumber && /^order\s*#\s*\d+$/i.test(line) && line.includes(orderNumber)
     );
-    if (idx >= 0 && lines[idx + 1] && lines[idx + 1].includes(" - ")) {
+    if (idx >= 0 && lines[idx + 1] && looksLikeBrandLocation(lines[idx + 1])) {
       return splitBrandLocation(lines[idx + 1]);
     }
     return { customer: "", location: "" };
@@ -579,7 +607,7 @@
     clearHits();
     invalidatePageLines();
     const errors = [];
-    const root = document.body;
+    const lines = pageLines();
 
     const orderNumber = extractOrderNumber();
     if (!orderNumber) errors.push("Order Number");
@@ -588,22 +616,18 @@
     if (!customer) errors.push("Customer");
     if (!location) errors.push("Location");
 
-    const dateHit = readUiValue(root, "Date ordered");
-    const dateRaw = valuesAfterLabel("Date ordered")[0] || dateHit.value;
+    const dateRaw = valuesAfterLabel("Date ordered")[0] || "";
     const claimDate = parseClaimDate(dateRaw);
     if (!claimDate.iso) errors.push("Date ordered");
 
-    let orderTime = extractOrderSubmittedTime();
-    if (!orderTime) orderTime = extractTime(dateRaw);
+    let orderTime = extractTime(dateRaw);
+    if (!orderTime) orderTime = extractOrderSubmittedTime();
     if (!orderTime) errors.push("Order submitted");
 
-    const totalHit = readUiValue(root, "Order total");
-    const orderValue = parseMoney(valuesAfterLabel("Order total")[0] || totalHit.value);
+    const orderValue = parseMoney(valuesAfterLabel("Order total")[0] || "");
     if (orderValue == null) errors.push("Order total");
 
-    const refundHit = readUiValue(root, "Partner refund value");
-    const disputeRaw = valuesAfterLabel("Partner refund value")[0] || refundHit.value;
-    const disputeAmount = parseMoney(disputeRaw);
+    const disputeAmount = parseMoney(valuesAfterLabel("Partner refund value")[0] || "");
     if (disputeAmount == null) errors.push("Partner refund value");
 
     const items = extractRefundedItems();
@@ -613,7 +637,7 @@
     const refundReason = canonicalizeReason(reasonRaw) || itemReason || "";
     if (!refundReason) errors.push("Refund reason");
 
-    const alreadyDisputed = detectAlreadyDisputed();
+    const alreadyDisputed = detectAlreadyDisputed(lines);
     highlightHits();
 
     const outcome = computeOutcome({ disputeAmount, alreadyDisputed, refundReason });
@@ -654,20 +678,9 @@
     return disputeAmount != null && disputeAmount < CONFIG.DISPUTE_THRESHOLD_GBP;
   }
 
-  function detectAlreadyDisputed() {
-    const bodyText = (document.body && document.body.innerText) || "";
-    if (CONTESTED_BODY_RE.test(bodyText)) return true;
-
-    const nodes = document.querySelectorAll("span, div, p, li, strong, button");
-    for (let i = 0; i < nodes.length; i++) {
-      const el = nodes[i];
-      if (!visible(el)) continue;
-      const text = normalizeSpace(el.textContent);
-      if (!text || text.length > 60) continue;
-      if (/dispute this refund/i.test(text)) continue;
-      if (/^disputed$/i.test(text) || /^refund\s+contested$/i.test(text) || /dispute\s+sent/i.test(text)) return true;
-    }
-    return false;
+  function detectAlreadyDisputed(lines) {
+    const bodyText = Array.isArray(lines) ? lines.join("\n") : ((document.body && document.body.innerText) || "");
+    return CONTESTED_BODY_RE.test(bodyText);
   }
 
   function computeOutcome({ disputeAmount, alreadyDisputed, refundReason }) {
@@ -713,23 +726,28 @@
     }
 
     const candidates = document.querySelectorAll(
-      ".modal.show, .modal.in, [role='dialog'], .ew-modal, #ewModalDialog, .modal, form"
+      ".modal.show, .modal.in, [role='dialog'], .ew-modal, #ewModalDialog"
     );
     let best = null;
     let bestArea = Infinity;
 
-    for (let i = 0; i < candidates.length; i++) {
-      const el = candidates[i];
-      if (!visible(el) || !el.querySelector("input, select, textarea")) continue;
+    const consider = (el) => {
+      if (!el || !visible(el) || !el.querySelector("input, select, textarea")) return;
       const text = el.innerText || "";
-      if (!/video submitted/i.test(text) || !/other reason/i.test(text)) continue;
-      if (!/save and add new/i.test(text)) continue;
-      const rect = el.getBoundingClientRect();
-      const area = rect.width * rect.height;
+      if (!/video submitted/i.test(text) || !/other reason/i.test(text)) return;
+      if (!/save and add new/i.test(text)) return;
+      const area = el.offsetWidth * el.offsetHeight;
       if (area > 8000 && area < bestArea) {
         best = el;
         bestArea = area;
       }
+    };
+
+    for (let i = 0; i < candidates.length; i++) consider(candidates[i]);
+
+    if (!best) {
+      const forms = document.getElementsByTagName("form");
+      for (let i = 0; i < forms.length; i++) consider(forms[i]);
     }
 
     if (!best) {
@@ -877,7 +895,7 @@
       }
     };
 
-    await wait(280);
+    await wait(80);
 
     if (isFreshModal(getClaimsModal())) {
       await finishFresh();
@@ -1296,7 +1314,7 @@
   }
 
   async function fillSelect(select, value, row) {
-    const pause = fastFillMode ? 80 : 220;
+    const pause = fastFillMode || CONFIG.FAST_FILL ? 25 : 80;
     const nativeSelect = select && select.tagName === "SELECT" ? select : (row && row.querySelector("select"));
     const option = nativeSelect ? bestOption(nativeSelect, value) : null;
     const $ = pageJQuery();
@@ -1315,9 +1333,7 @@
       }
       const rendered = root && root.querySelector(".select2-selection__rendered");
       if (rendered && option.textContent) rendered.textContent = normalizeSpace(option.textContent);
-      if (!root || !root.querySelector(".select2-container, .select2-selection")) {
-        return nativeSelect.value === option.value;
-      }
+      if (nativeSelect.value === option.value) return true;
     }
 
     const box =
@@ -1349,7 +1365,7 @@
 
     if (search) {
       search.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
-      await wait(fastFillMode ? 60 : 120);
+      await wait(pause);
     }
 
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
@@ -1463,7 +1479,7 @@
     const modal = await ensureClaimsModal();
     if (!modal) throw new Error("Click the green Add New button, then click Fill from Deliveroo.");
 
-    const fieldPause = options.fast || fastFillMode ? 45 : 140;
+    const fieldPause = 0;
     const L = CONFIG.opspotLabels;
     const results = {};
     const fieldIndex = collectFormFields(modal);
@@ -1505,7 +1521,7 @@
         results[label] = { ok: false, reason: String(err && err.message ? err.message : err) };
       }
       if (label === L.reasonForDispute && (payload.preparedIncorrectlyWhy || payload.reason || /other/i.test(String(payload.reasonForDispute || "")))) {
-        await wait(options.fast || fastFillMode ? 150 : 350);
+        await wait(options.fast || fastFillMode || CONFIG.FAST_FILL ? 60 : 150);
       }
       if ((!results[label] || !results[label].ok) && label === L.reasonForDispute && /other/i.test(String(value || ""))) {
         for (const alt of ["Other", "Others", "other", "others"]) {
@@ -1533,7 +1549,9 @@
           if (results[label].ok) break;
         }
       }
-      await wait(fieldPause);
+      if (results[label] && /select/i.test(results[label].method || "") && fieldPause) {
+        await wait(fieldPause);
+      }
     }
     log("Fill results", results);
     return results;
@@ -1548,17 +1566,19 @@
     stylesInjected = true;
     GM_addStyle(`
       .dcf-hit { outline: 2px solid #00ccbc !important; outline-offset: 2px; background: rgba(0,204,188,.12) !important; }
-      #dcf-btn {
+      #dcf-btn-bar {
         position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
-        z-index: 2147483647;
+        z-index: 2147483647; display: flex; gap: 8px; align-items: center;
+      }
+      #dcf-btn, #dcf-sheet-btn {
         background: #00ccbc; color: #06221f; border: 0; cursor: pointer;
         border-radius: 999px; padding: 12px 22px;
         box-shadow: 0 10px 30px rgba(0,0,0,.35);
         font: 700 15px/1.2 Segoe UI, system-ui, sans-serif;
       }
-      #dcf-btn:hover { background: #111827; color: #fff; }
-      #dcf-btn:hover { background: #00ccbc; color: #06221f; }
-      #dcf-btn:disabled { opacity: .65; cursor: wait; }
+      #dcf-sheet-btn { background: #0f766e; color: #ecfdf5; }
+      #dcf-btn:hover, #dcf-sheet-btn:hover { background: #111827; color: #fff; }
+      #dcf-btn:disabled, #dcf-sheet-btn:disabled { opacity: .65; cursor: wait; }
       #dcf-toast, #dcf-preview {
         position: fixed; top: 64px; right: 18px; z-index: 2147483646;
         max-width: 380px; border-radius: 12px; padding: 12px 14px;
@@ -1624,6 +1644,134 @@
     setTimeout(() => el.remove(), 12000);
   }
 
+  function resolveSheetTab(payload) {
+    const haystack = [payload.customer, payload.location, payload.brand]
+      .filter(Boolean)
+      .join(" ");
+    for (const rule of CONFIG.branchSheetTabs || []) {
+      if (rule.match.test(haystack)) return rule.tab;
+    }
+    return CONFIG.defaultSheetTab || "";
+  }
+
+  function sheetCell(value) {
+    const text = String(value == null ? "" : value).replace(/\r\n/g, "\n").trim();
+    if (/[\t\n"]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
+    return text;
+  }
+
+  function buildGoogleSheetRow(payload) {
+    const date = payload.claimDateDash || payload.claimDateDMY || payload.claimDate || "";
+    const orderNumber = payload.orderNumber || "";
+    const refundReason = payload.reasonForDispute || "";
+    const withVideo = payload.videoSubmitted || CONFIG.VIDEO_SUBMITTED || "No";
+    const footageStatus = payload.footageStatus || "";
+    const comments = [
+      payload.otherReason && normalizeSpace(payload.otherReason.replace(/\n+/g, ", ")),
+      payload.customer && payload.location ? `${payload.customer} - ${payload.location}` : payload.customer || payload.location || "",
+      payload.disputeAmount ? `Refund £${payload.disputeAmount}` : "",
+    ]
+      .filter(Boolean)
+      .join(" | ");
+
+    return [date, orderNumber, refundReason, withVideo, footageStatus, comments]
+      .map(sheetCell)
+      .join("\t");
+  }
+
+  function buildSheetTransfer(payload) {
+    return {
+      extractedAt: new Date().toISOString(),
+      tab: resolveSheetTab(payload),
+      row: buildGoogleSheetRow(payload),
+      orderNumber: payload.orderNumber || "",
+      customer: payload.customer || "",
+      location: payload.location || "",
+      payload,
+    };
+  }
+
+  function saveSheetTransfer(transfer) {
+    try {
+      GM_setValue(CONFIG.SHEET_STORAGE_KEY, transfer);
+    } catch (err) {
+      log("sheet GM_setValue failed", err);
+    }
+    try {
+      if (typeof GM !== "undefined" && GM.setValue) GM.setValue(CONFIG.SHEET_STORAGE_KEY, transfer);
+    } catch (err) {
+      log("sheet GM.setValue failed", err);
+    }
+  }
+
+  async function loadSheetTransfer() {
+    let transfer = null;
+    try {
+      transfer = GM_getValue(CONFIG.SHEET_STORAGE_KEY, null);
+    } catch (err) {
+      log("sheet GM_getValue failed", err);
+    }
+    if (transfer && transfer.row) return transfer;
+    try {
+      if (typeof GM !== "undefined" && GM.getValue) transfer = await GM.getValue(CONFIG.SHEET_STORAGE_KEY, null);
+    } catch (err) {
+      log("sheet GM.getValue failed", err);
+    }
+    return transfer && transfer.row ? transfer : null;
+  }
+
+  function findGoogleSheetTabButton(tabName) {
+    if (!tabName) return null;
+    const wanted = normalizeKey(tabName);
+    const nodes = [
+      ...document.querySelectorAll(".docs-sheet-tab, .docs-sheet-tab-name, [role='tab'], .docs-sheet-container .docs-sheet-tab-caption"),
+    ];
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      const text = normalizeSpace(el.textContent || el.getAttribute("aria-label") || "");
+      if (!text) continue;
+      const key = normalizeKey(text);
+      if (key === wanted || key.includes(wanted) || wanted.includes(key)) {
+        return el.closest(".docs-sheet-tab") || el;
+      }
+    }
+    return null;
+  }
+
+  async function activateGoogleSheetTab(tabName) {
+    if (!tabName) return { ok: false, reason: "No branch tab matched" };
+    const tabBtn = await waitUntil(() => findGoogleSheetTabButton(tabName), 4000, 100);
+    if (!tabBtn) return { ok: false, reason: `Tab "${tabName}" not found` };
+    safeClick(tabBtn);
+    await wait(120);
+    return { ok: true, reason: "" };
+  }
+
+  function focusSheetPasteCell() {
+    const canvas = document.querySelector(".grid-container, .waffle, .docs-texteventtarget-iframe, .cell-input");
+    if (canvas) safeClick(canvas);
+    const editable = document.querySelector(".cell-input, [contenteditable='true'], .grid-container");
+    if (editable && editable.focus) editable.focus();
+  }
+
+  function copyTextToClipboard(text) {
+    try {
+      GM_setClipboard(text);
+      return true;
+    } catch (err) {
+      log("GM_setClipboard failed", err);
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (err) {
+      log("navigator clipboard failed", err);
+    }
+    return false;
+  }
+
   function savePayload(payload) {
     try {
       GM_setValue(CONFIG.STORAGE_KEY, payload);
@@ -1670,17 +1818,29 @@
     return null;
   }
 
-  function injectButton(text, onClick) {
+  function ensureButtonBar() {
     ensureStyles();
-    let btn = document.getElementById("dcf-btn");
+    let bar = document.getElementById("dcf-btn-bar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.id = "dcf-btn-bar";
+      (document.body || document.documentElement).appendChild(bar);
+    }
+    return bar;
+  }
+
+  function injectButton(id, text, onClick) {
+    const bar = ensureButtonBar();
+    let btn = document.getElementById(id);
     if (!btn) {
       btn = document.createElement("button");
-      btn.id = "dcf-btn";
+      btn.id = id;
       btn.type = "button";
-      (document.body || document.documentElement).appendChild(btn);
+      bar.appendChild(btn);
     }
     if (btn.textContent !== text) btn.textContent = text;
     btn.onclick = onClick;
+    return btn;
   }
 
   function mount() {
@@ -1690,11 +1850,19 @@
       return;
     }
 
+    if (isGoogleSheetsPage()) {
+      const existing = document.getElementById("dcf-sheet-btn");
+      if (existing && existing.onclick) return;
+      injectButton("dcf-sheet-btn", "Paste Deliveroo → Sheet Tab", onPasteSheetClick);
+      return;
+    }
+
     const existing = document.getElementById("dcf-btn");
-    if (existing && existing.onclick) return;
+    const sheetExisting = document.getElementById("dcf-sheet-btn");
+    if (existing && existing.onclick && (!isDeliverooHub() || (sheetExisting && sheetExisting.onclick))) return;
 
     if (isOpSpotPage()) {
-      injectButton("Fill from Deliveroo", async () => {
+      injectButton("dcf-btn", "Fill from Deliveroo", async () => {
         resetFillGuards();
         const payload = await loadPayload();
         if (!payload) {
@@ -1707,14 +1875,17 @@
     }
 
     if (isDeliverooHub()) {
-      injectButton("Auto-Fill & Dispute", onExtractClick);
+      injectButton("dcf-btn", "Auto-Fill & Dispute", onExtractClick);
+      injectButton("dcf-sheet-btn", "Copy for Google Sheet", onCopySheetClick);
     }
   }
 
   function boot() {
     ensureStyles();
     if (typeof GM_registerMenuCommand === "function") {
-      if (typeof location !== "undefined" && /opspot/i.test(location.host)) {
+      if (isGoogleSheetsPage()) {
+        GM_registerMenuCommand("Paste Deliveroo → Sheet Tab", onPasteSheetClick);
+      } else if (typeof location !== "undefined" && /opspot/i.test(location.host)) {
         GM_registerMenuCommand("Fill from Deliveroo", async () => {
           resetFillGuards();
           const payload = await loadPayload();
@@ -1726,9 +1897,11 @@
         });
       } else {
         GM_registerMenuCommand("Auto-Fill & Dispute", onExtractClick);
+        GM_registerMenuCommand("Copy for Google Sheet", onCopySheetClick);
       }
     }
-    const remount = debounce(mount, 800);
+    const remount = debounce(mount, 400);
+    let observerQueued = false;
     const wrap = (fn) =>
       function patched() {
         const ret = fn.apply(this, arguments);
@@ -1739,21 +1912,28 @@
     history.replaceState = wrap(history.replaceState);
     window.addEventListener("popstate", remount);
     window.addEventListener("load", mount);
-    new MutationObserver((mutations) => {
-      for (let i = 0; i < mutations.length; i++) {
-        const m = mutations[i];
-        if (m.type === "childList" && (m.addedNodes.length || m.removedNodes.length)) {
-          if (!document.getElementById("dcf-btn")) remount();
-          invalidateModalCache();
-          return;
+    new MutationObserver(() => {
+      if (observerQueued) return;
+      observerQueued = true;
+      requestAnimationFrame(() => {
+        observerQueued = false;
+        if (isGoogleSheetsPage()) {
+          if (!document.getElementById("dcf-sheet-btn")) remount();
+        } else if (!document.getElementById("dcf-btn") || (isDeliverooHub() && !document.getElementById("dcf-sheet-btn"))) {
+          remount();
         }
-      }
+      });
     }).observe(document.documentElement, { childList: true, subtree: true });
     if (typeof GM_addValueChangeListener === "function") {
       GM_addValueChangeListener(CONFIG.STORAGE_KEY, (_n, _o, value, remote) => {
         if (remote && isOpSpotPage() && value) {
           resetFillGuards();
           applyPayloadToClaims(value, { force: true });
+        }
+      });
+      GM_addValueChangeListener(CONFIG.SHEET_STORAGE_KEY, (_n, _o, value, remote) => {
+        if (remote && isGoogleSheetsPage() && value && value.row) {
+          toast(`Ready for tab "${value.tab || "?"}": click Paste Deliveroo → Sheet Tab`, "info", 7000);
         }
       });
     }
@@ -1772,13 +1952,82 @@
       showPreview(payload);
       savePayload(payload);
       if (payload.errors.length) toast(`UI miss: ${payload.errors.join(", ")}`, "error", 7000);
-      else toast(`v1.6.0 stored order #${payload.orderNumber}. Click Fill from Deliveroo on OpSpot.`, "success", 7000);
+      else toast(`v1.8.1 stored order #${payload.orderNumber}. Click Fill from Deliveroo on OpSpot.`, "success", 7000);
     } catch (err) {
       toast(`Extraction failed: ${err.message || err}`, "error");
     } finally {
       if (btn) {
         btn.disabled = false;
         btn.textContent = "Auto-Fill & Dispute";
+      }
+    }
+  }
+
+  async function onCopySheetClick() {
+    const btn = document.getElementById("dcf-sheet-btn");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Copying…";
+    }
+    try {
+      const payload = extractRefundPayload();
+      showPreview(payload);
+      savePayload(payload);
+      const transfer = buildSheetTransfer(payload);
+      saveSheetTransfer(transfer);
+      const ok = copyTextToClipboard(transfer.row);
+      if (!ok) throw new Error("Clipboard blocked");
+      const tabLabel = transfer.tab || "matching tab";
+      if (payload.errors.length) {
+        toast(`Copied for "${tabLabel}" with missing fields: ${payload.errors.join(", ")}. Open the sheet and click Paste.`, "error", 9000);
+      } else {
+        toast(`Copied #${payload.orderNumber} → tab "${tabLabel}". Open Google Sheet and click Paste Deliveroo → Sheet Tab.`, "success", 9000);
+      }
+    } catch (err) {
+      toast(`Sheet copy failed: ${err.message || err}`, "error");
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Copy for Google Sheet";
+      }
+    }
+  }
+
+  async function onPasteSheetClick() {
+    const btn = document.getElementById("dcf-sheet-btn");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Switching tab…";
+    }
+    try {
+      const transfer = await loadSheetTransfer();
+      if (!transfer || !transfer.row) {
+        toast("No copied Deliveroo row. Click Copy for Google Sheet on the refund page first.", "error", 8000);
+        return;
+      }
+
+      copyTextToClipboard(transfer.row);
+
+      if (transfer.tab) {
+        const switched = await activateGoogleSheetTab(transfer.tab);
+        if (!switched.ok) {
+          toast(`${switched.reason}. Row is on clipboard — select the "${transfer.tab}" tab and paste.`, "error", 9000);
+          return;
+        }
+      }
+
+      focusSheetPasteCell();
+      toast(
+        `On "${transfer.tab || "current"}" tab for #${transfer.orderNumber || "?"}. Click the next empty row and press Ctrl+V.`,
+        "success",
+        9000
+      );
+    } catch (err) {
+      toast(`Sheet paste failed: ${err.message || err}`, "error");
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Paste Deliveroo → Sheet Tab";
       }
     }
   }
@@ -1792,20 +2041,20 @@
       btn.disabled = true;
       btn.textContent = "Filling Claims…";
     }
-    fastFillMode = Boolean(options.fast);
+    fastFillMode = options.fast !== false && CONFIG.FAST_FILL !== false;
     try {
-      const modal = await waitUntil(() => getClaimsModal(), options.fast ? 5000 : 8000, options.fast ? 50 : 250);
+      const modal = await waitUntil(() => getClaimsModal(), 5000, 40);
       if (!modal && !getClaimsModal()) {
-        await waitUntil(() => getClaimsModal(), 2000, 50);
+        await waitUntil(() => getClaimsModal(), 1500, 40);
       }
-      const results = await fillClaimsForm(payload, options);
+      const results = await fillClaimsForm(payload, { ...options, fast: true });
       lastFilledOrder = payload.orderNumber;
-      if (!options.fast) showPreview(payload);
+      showPreview(payload);
       const failed = Object.entries(results)
         .filter(([, r]) => !r.ok)
         .map(([k, r]) => (r.reason ? `${k} (${r.reason})` : k));
       if (failed.length) toast(`Could not fill: ${failed.join(", ")}`, "error", 7000);
-      else if (!options.fast) toast(`v1.6.0 filled claim ${payload.orderNumber}.`, "success");
+      else toast(`v1.8.1 filled claim ${payload.orderNumber}.`, "success");
     } catch (err) {
       toast(`Fill failed: ${err.message || err}`, "error");
     } finally {

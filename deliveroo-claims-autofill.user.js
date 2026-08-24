@@ -62,6 +62,7 @@
     PLATFORM: "Deliveroo",
     VIDEO_SUBMITTED: "No",
     DISPUTE_THRESHOLD_GBP: 2,
+    FIVE_GUYS_NOT_DISPUTED_MAX_EUR: 5,
     DEBUG: false,
     MODAL_CACHE_MS: 800,
     FAST_FILL: true,
@@ -245,12 +246,33 @@
   const HEADER_WORDS = /^(quantity|qty|price|item|items|name|category|total|refund reason|refund details)$/i;
   const UI_NOISE = /^(refund details|refund reason|partner refund value|order total|date ordered|order submitted|order timeline|dispute this refund|prepared incorrectly|missing|missing item|missing items|incorrect|incorrect item|incorrect items|food safety complaint|category|quantity|qty|price|item|items|name|total|deliveroo|partner hub)$/i;
 
+  function isMoneyText(text) {
+    const value = normalizeSpace(text);
+    if (!value) return false;
+    if (/^(?:NZ\$|A\$|US\$|€|£|\$)\s*\d/.test(value)) return true;
+    if (/^\d+[.,]\d{2}$/.test(value)) return true;
+    if (/^-?\s*(?:NZ\$|A\$|US\$|€|£|\$)\s*\d/.test(value)) return true;
+    return false;
+  }
+
+  function firstItemNameLine(text) {
+    const line = normalizeSpace(String(text || "").split(/\n/)[0]);
+    return line.replace(/\s+(?:NZ\$|A\$|US\$|€|£|\$)\s*\d.*$/, "").trim();
+  }
+
+  const MENU_CATEGORIES = /^(drinks?|burgers?|sandwiches?|sides?|desserts?|fries|wings|box meals?|milkshakes?|saucin['’]? wings|world famous sandwiches|starters?|mains?|kids?|combos?|meals?|snacks?|sauces?)$/i;
+
+  function isCategoryName(name) {
+    return MENU_CATEGORIES.test(normalizeKey(firstItemNameLine(name)));
+  }
+
   function isValidItemName(name) {
-    const text = normalizeSpace(name);
+    const text = firstItemNameLine(name);
     if (!text || text.length < 2 || text.length > 80) return false;
     const key = normalizeKey(text);
     if (HEADER_WORDS.test(key) || UI_NOISE.test(key)) return false;
-    if (/^£/.test(text) || /^\d+(\.\d{2})?$/.test(text)) return false;
+    if (isMoneyText(text)) return false;
+    if (isCategoryName(text)) return false;
     if (/^order\s*#/i.test(text)) return false;
     if (/^(mon|tue|wed|thu|fri|sat|sun)\b/i.test(text)) return false;
     return true;
@@ -523,6 +545,14 @@
   function extractRefundedItems() {
     const items = [];
 
+    const pushItem = (name, reasonText, el, reasonEl) => {
+      const itemName = firstItemNameLine(name);
+      const reason = canonicalizeReason(reasonText);
+      if (!reason || !isValidItemName(itemName)) return;
+      items.push({ name: itemName, reason });
+      hits.push({ label: "Refunded item", el: el || null, valueEl: reasonEl || null, value: itemName });
+    };
+
     for (const table of document.querySelectorAll("table")) {
       const rows = table.rows;
       if (!rows || !rows.length) continue;
@@ -532,65 +562,74 @@
       for (let i = 0; i < headerCells.length; i++) headers.push(normalizeKey(headerCells[i].innerText));
       const reasonIdx = headers.findIndex((h) => /refund reason/.test(h));
       if (reasonIdx < 0) continue;
-      const nameIdx = headers.findIndex((h) => /^(item|item name|name|product|description)$/.test(h));
-      const catIdx = headers.findIndex((h) => /category/.test(h));
+      const nameIdx = headers.findIndex((h) => /item\s*name|product|description|^item$|^name$/.test(h));
 
       for (let r = 1; r < rows.length; r++) {
         const cells = rows[r].cells;
         if (!cells || !cells.length) continue;
         const reasonText = normalizeSpace((cells[reasonIdx] && cells[reasonIdx].innerText) || "");
         if (!REASON_ROW_RE.test(reasonText)) continue;
-        const itemName = nameIdx >= 0 ? normalizeSpace((cells[nameIdx] && cells[nameIdx].innerText) || "") : "";
-        const catName = catIdx >= 0 ? normalizeSpace((cells[catIdx] && cells[catIdx].innerText) || "") : "";
-        const name = itemName || catName;
-        if (!isValidItemName(name)) continue;
-        items.push({ name, reason: canonicalizeReason(reasonText) });
-        hits.push({ label: "Refunded item", el: rows[r], valueEl: cells[reasonIdx], value: name });
+        let itemName = nameIdx >= 0 ? (cells[nameIdx] && cells[nameIdx].innerText) || "" : "";
+        if (!isValidItemName(itemName)) {
+          for (let c = 0; c < cells.length; c++) {
+            if (c === reasonIdx) continue;
+            const candidate = firstItemNameLine((cells[c] && cells[c].innerText) || "");
+            if (isValidItemName(candidate) && !isCategoryName(candidate)) {
+              itemName = candidate;
+              break;
+            }
+          }
+        }
+        pushItem(itemName, reasonText, rows[r], cells[reasonIdx]);
       }
-      if (items.length) break;
+      if (items.length) return uniqueBy(items, (item) => `${normalizeKey(item.name)}|${item.reason}`);
     }
 
-    if (items.length) {
-      return uniqueBy(items, (item) => `${normalizeKey(item.name)}|${item.reason}`);
+    const reasonNodes = document.querySelectorAll("td, th, span, div, p, li, strong");
+    for (let i = 0; i < reasonNodes.length; i++) {
+      const el = reasonNodes[i];
+      if (!visible(el)) continue;
+      const reasonText = ownText(el) || (el.children.length === 0 ? normalizeSpace(el.textContent) : "");
+      if (!REASON_ROW_RE.test(reasonText)) continue;
+      const row = el.closest("tr, [role='row'], li, article") || el.parentElement;
+      if (!row) continue;
+      const chunks = [...row.querySelectorAll("td, th, span, div, p, strong")]
+        .map((node) => firstItemNameLine(ownText(node) || node.textContent))
+        .filter((text) => text && isValidItemName(text) && !REASON_ROW_RE.test(text) && !isCategoryName(text));
+      const bestName = chunks.sort((a, b) => b.length - a.length)[0];
+      if (bestName) pushItem(bestName, reasonText, row, el);
     }
+    if (items.length) return uniqueBy(items, (item) => `${normalizeKey(item.name)}|${item.reason}`);
 
     const lines = pageLines();
     for (let i = 0; i < lines.length; i++) {
       if (!REASON_ROW_RE.test(lines[i])) continue;
       if (/^missing items$/i.test(lines[i]) && /^refund reason$/i.test(lines[i - 1] || "")) continue;
-      let hasMoney = false;
-      for (let k = Math.max(0, i - 6); k < Math.min(lines.length, i + 5); k++) {
-        if (/£\d|\d+\.\d{2}/.test(lines[k])) {
-          hasMoney = true;
-          break;
-        }
-      }
-      if (!hasMoney) continue;
 
       let name = "";
       for (let j = i - 1; j >= Math.max(0, i - 8); j--) {
-        if (/^£/.test(lines[j]) || /£\d/.test(lines[j]) || /^\d+$/.test(lines[j])) continue;
-        if (/^(quantity|qty|price|refund reason|refund details|item|item name|category)$/i.test(lines[j])) continue;
-        if (UI_NOISE.test(normalizeKey(lines[j]))) continue;
-        if (REASON_ROW_RE.test(lines[j])) continue;
-        if (lines[j].length > 1 && lines[j].length < 70 && isValidItemName(lines[j])) {
-          name = lines[j];
+        const candidate = firstItemNameLine(lines[j]);
+        if (isMoneyText(candidate) || /^\d+$/.test(candidate)) continue;
+        if (/^(quantity|qty|price|refund reason|refund details|item|item name|category)$/i.test(candidate)) continue;
+        if (isCategoryName(candidate)) continue;
+        if (REASON_ROW_RE.test(candidate)) continue;
+        if (isValidItemName(candidate)) {
+          name = candidate;
           break;
         }
       }
-      if (name) items.push({ name, reason: canonicalizeReason(lines[i]) });
+      if (name) pushItem(name, lines[i]);
     }
 
     return uniqueBy(items, (item) => `${normalizeKey(item.name)}|${item.reason}`);
   }
 
   function itemsMatchingReason(items, refundReason) {
+    const withReason = (items || []).filter((item) => item && item.name && isValidItemName(item.name) && item.reason);
     const wanted = canonicalizeReason(refundReason);
-    const matched = (items || []).filter(
-      (item) => item && item.name && isValidItemName(item.name) && canonicalizeReason(item.reason) === wanted
-    );
+    const matched = withReason.filter((item) => canonicalizeReason(item.reason) === wanted);
     if (matched.length) return matched;
-    return (items || []).filter((item) => item && item.name && isValidItemName(item.name));
+    return withReason;
   }
 
   function buildDisputeFieldValues(items, refundReason) {
@@ -661,7 +700,7 @@
     const alreadyDisputed = detectAlreadyDisputed(lines);
     highlightHits();
 
-    const outcome = computeOutcome({ disputeAmount, alreadyDisputed, refundReason });
+    const outcome = computeOutcome({ disputeAmount, alreadyDisputed, refundReason, customer, location });
     const disputeFields = buildDisputeFieldValues(items, refundReason);
     const payload = {
       extractedAt: new Date().toISOString(),
@@ -682,7 +721,7 @@
       outcome,
       videoSubmitted: CONFIG.VIDEO_SUBMITTED,
       reasonForDispute: CONFIG.reasonForDisputeMap[refundReason] || "",
-      footageStatus: computeFootageStatus({ alreadyDisputed, disputeAmount, refundReason }),
+      footageStatus: computeFootageStatus({ alreadyDisputed, disputeAmount, refundReason, customer, location }),
       wrongFoodItem: disputeFields.wrongFoodItem,
       preparedIncorrectlyWhy: disputeFields.preparedIncorrectlyWhy,
       reason: disputeFields.reason || "",
@@ -695,6 +734,14 @@
     return payload;
   }
 
+  function isFiveGuys(customer, storeLocation) {
+    return /five\s*guys/i.test([customer, storeLocation].filter(Boolean).join(" "));
+  }
+
+  function isFiveGuysUnderFiveEuros({ customer, location: storeLocation, disputeAmount }) {
+    return isFiveGuys(customer, storeLocation) && disputeAmount != null && disputeAmount < CONFIG.FIVE_GUYS_NOT_DISPUTED_MAX_EUR;
+  }
+
   function isUnderTwoPounds(disputeAmount) {
     return disputeAmount != null && disputeAmount < CONFIG.DISPUTE_THRESHOLD_GBP;
   }
@@ -704,10 +751,11 @@
     return CONTESTED_BODY_RE.test(bodyText);
   }
 
-  function computeOutcome({ disputeAmount, alreadyDisputed, refundReason }) {
+  function computeOutcome({ disputeAmount, alreadyDisputed, refundReason, customer, location: storeLocation }) {
     const { notDisputed, reviewed, awaitingReview, pending } = CONFIG.outcomeOptions;
     const reason = canonicalizeReason(refundReason);
 
+    if (isFiveGuysUnderFiveEuros({ customer, location: storeLocation, disputeAmount })) return notDisputed;
     if (alreadyDisputed) return reviewed;
     if (isUnderTwoPounds(disputeAmount)) return notDisputed;
     if (reason === "missing items" || reason === "food safety complaint") return awaitingReview;
@@ -715,8 +763,11 @@
     return "";
   }
 
-  function computeFootageStatus({ alreadyDisputed, disputeAmount, refundReason }) {
+  function computeFootageStatus({ alreadyDisputed, disputeAmount, refundReason, customer, location: storeLocation }) {
     const reason = canonicalizeReason(refundReason);
+    if (isFiveGuysUnderFiveEuros({ customer, location: storeLocation, disputeAmount })) {
+      return CONFIG.footageStatusOptions.irrelevant;
+    }
     if (alreadyDisputed) return CONFIG.footageStatusOptions.disputedByThirdParty;
     if (isUnderTwoPounds(disputeAmount)) return CONFIG.footageStatusOptions.irrelevant;
     if (

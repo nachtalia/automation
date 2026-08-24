@@ -58,12 +58,13 @@ The script picks the sheet **tab from the branch/brand**:
 
 | Sheet column | Copied value |
 |--------------|--------------|
-| Date | Claim / order date (`DD-MM-YYYY`) |
+| Date | `DD-MM-YYYY` (e.g. `08-12-2026`) |
+| Location | Branch (e.g. Cardiff, Brighton) |
 | # Order Number | Order number |
-| Refund Reason | **Reason for Dispute** (`Missing Item`, `Incorrect Item`, `Prepared Incorrectly`) |
-| With Video? | `No` (default) |
+| Refund Reason | Missing Item / Incorrect Item / Prepared incorrectly |
+| With Video? | No |
 | Footage Status | Computed footage status |
-| Comments | Item names, store, refund amount |
+| Comments | (blank) |
 
 ---
 

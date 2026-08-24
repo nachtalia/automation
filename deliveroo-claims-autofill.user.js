@@ -72,6 +72,15 @@
       { match: /popeyes/i, tab: "Popeyes" },
     ],
     defaultSheetTab: "",
+    sheetColumns: [
+      "Date",
+      "Location",
+      "# Order Number",
+      "Refund Reason",
+      "With Video?",
+      "Footage Status",
+      "Comments",
+    ],
 
     outcomeOptions: {
       notDisputed: "Not disputed",
@@ -208,17 +217,29 @@
       jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
       jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
     };
-    const named = text.match(/(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})/);
-    if (!named) return { raw: text, iso: "", dmy: "", dash: "" };
-    const day = named[1].padStart(2, "0");
-    const month = months[named[2].slice(0, 3).toLowerCase()];
-    if (!month) return { raw: text, iso: "", dmy: "", dash: "" };
-    return {
-      raw: `${named[1]} ${named[2].slice(0, 3)} ${named[3]}`,
-      iso: `${named[3]}-${month}-${day}`,
-      dmy: `${day}/${month}/${named[3]}`,
-      dash: `${day}-${month}-${named[3]}`,
+    const pack = (day, monthName, year) => {
+      const month = months[String(monthName || "").slice(0, 3).toLowerCase()];
+      if (!month) return { raw: text, iso: "", dmy: "", dash: "" };
+      const d = String(day).padStart(2, "0");
+      return {
+        raw: `${Number.parseInt(day, 10)} ${String(monthName).slice(0, 3)} ${year}`,
+        iso: `${year}-${month}-${d}`,
+        dmy: `${d}/${month}/${year}`,
+        dash: `${d}-${month}-${year}`,
+      };
     };
+    let named = text.match(/(\d{1,2})\s+([A-Za-z]{3,9}),?\s+(\d{4})/);
+    if (named) return pack(named[1], named[2], named[3]);
+    named = text.match(/([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})/);
+    if (named) return pack(named[2], named[1], named[3]);
+    named = text.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+    if (named) {
+      const day = named[1].padStart(2, "0");
+      const month = named[2].padStart(2, "0");
+      const year = named[3];
+      return { raw: text, iso: `${year}-${month}-${day}`, dmy: `${day}/${month}/${year}`, dash: `${day}-${month}-${year}` };
+    }
+    return { raw: text, iso: "", dmy: "", dash: "" };
   }
 
   const HEADER_WORDS = /^(quantity|qty|price|item|items|name|category|total|refund reason|refund details)$/i;
@@ -1654,29 +1675,39 @@
     return CONFIG.defaultSheetTab || "";
   }
 
+  function toDayMonthYear(payload) {
+    if (payload.claimDateDash && /^\d{2}-\d{2}-\d{4}$/.test(payload.claimDateDash)) {
+      return payload.claimDateDash;
+    }
+    const parsed = parseClaimDate(payload.claimDateDash || payload.claimDateDMY || payload.claimDate || "");
+    return parsed.dash || "";
+  }
+
   function sheetCell(value) {
-    const text = String(value == null ? "" : value).replace(/\r\n/g, "\n").trim();
-    if (/[\t\n"]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
+    const text = String(value == null ? "" : value).replace(/\r\n/g, " ").replace(/\t/g, " ").trim();
+    if (/["\n]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
     return text;
   }
 
   function buildGoogleSheetRow(payload) {
-    const date = payload.claimDateDash || payload.claimDateDMY || payload.claimDate || "";
+    const date = toDayMonthYear(payload);
+    const location = payload.location || "";
     const orderNumber = payload.orderNumber || "";
     const refundReason = payload.reasonForDispute || "";
     const withVideo = payload.videoSubmitted || CONFIG.VIDEO_SUBMITTED || "No";
     const footageStatus = payload.footageStatus || "";
-    const comments = [
-      payload.otherReason && normalizeSpace(payload.otherReason.replace(/\n+/g, ", ")),
-      payload.customer && payload.location ? `${payload.customer} - ${payload.location}` : payload.customer || payload.location || "",
-      payload.disputeAmount ? `Refund £${payload.disputeAmount}` : "",
-    ]
-      .filter(Boolean)
-      .join(" | ");
 
-    return [date, orderNumber, refundReason, withVideo, footageStatus, comments]
-      .map(sheetCell)
-      .join("\t");
+    const row = {
+      Date: date ? `'${date}` : "",
+      Location: location,
+      "# Order Number": orderNumber,
+      "Refund Reason": refundReason,
+      "With Video?": withVideo,
+      "Footage Status": footageStatus,
+      Comments: "",
+    };
+
+    return CONFIG.sheetColumns.map((header) => sheetCell(row[header])).join("\t");
   }
 
   function buildSheetTransfer(payload) {

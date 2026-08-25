@@ -63,6 +63,9 @@
     VIDEO_SUBMITTED: "No",
     DISPUTE_THRESHOLD_GBP: 2,
     FIVE_GUYS_NOT_DISPUTED_MAX_EUR: 5,
+    customerAliases: [
+      { match: /popeyes.*louisiana|louisiana.*popeyes/i, value: "Popeyes France" },
+    ],
     DEBUG: false,
     MODAL_CACHE_MS: 800,
     FAST_FILL: true,
@@ -672,7 +675,8 @@
     const orderNumber = extractOrderNumber();
     if (!orderNumber) errors.push("Order Number");
 
-    const { customer, location } = extractBrandAndLocation(orderNumber);
+    const { customer: rawCustomer, location } = extractBrandAndLocation(orderNumber);
+    const customer = normalizeCustomerName(rawCustomer);
     if (!customer) errors.push("Customer");
     if (!location) errors.push("Location");
 
@@ -732,6 +736,15 @@
 
     log("UI payload", payload);
     return payload;
+  }
+
+  function normalizeCustomerName(name) {
+    const text = normalizeSpace(name);
+    if (!text) return "";
+    for (const rule of CONFIG.customerAliases || []) {
+      if (rule.match.test(text)) return rule.value;
+    }
+    return text;
   }
 
   function isFiveGuys(customer, storeLocation) {

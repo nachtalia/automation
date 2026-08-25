@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Eats Order → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      1.0.0
+// @version      1.0.1
 // @description  Read Uber Eats Manager orders/issues and fill OpSpot Claims.
 // @author       Claims Ops
 // @match        https://merchants.ubereats.com/*
@@ -49,6 +49,9 @@
     STORAGE_KEY: "ubereats_claim_payload_v1",
     CLIP_PREFIX: "UCF1:",
     PLATFORM: "Uber Eats",
+    customerAliases: [
+      { match: /popeyes.*louisiana|louisiana.*popeyes/i, value: "Popeyes France" },
+    ],
     VIDEO_SUBMITTED: "No",
     DISPUTE_THRESHOLD_GBP: 2,
     DEBUG: false,
@@ -438,17 +441,145 @@
   /* Uber Eats Manager — order drawer / timeline / items / adjustments          */
   /* -------------------------------------------------------------------------- */
 
+  function normalizeCustomerName(name) {
+    const text = normalizeSpace(name);
+    if (!text) return "";
+    for (const rule of CONFIG.customerAliases || []) {
+      if (rule.match.test(text)) return rule.value;
+    }
+    return text;
+  }
+
+  function looksLikeAddress(text) {
+    const value = normalizeSpace(text);
+    if (!value || value.length < 8) return false;
+    if (/,/.test(value)) return true;
+    return /\b(road|street|st\.?|ave\.?|avenue|drive|dr\.?|rd\.?|lane|way|boulevard|blvd\.?|place|plaza|highway|hwy)\b/i.test(value);
+  }
+
+  function stripOuterParens(text) {
+    const value = normalizeSpace(text);
+    const m = value.match(/^\((.+)\)$/);
+    return m ? normalizeSpace(m[1]) : value;
+  }
+
   function parseBrandLocation(text) {
     const line = normalizeSpace(text);
+
+    // Burger King (East Tamaki) (68 East Tamaki Road, Papatoetoe, Auckland)
+    const dual = line.match(/^(.+?\([^)]+\))\s*\((.+)\)\s*$/);
+    if (dual && looksLikeAddress(dual[2])) {
+      return { customer: normalizeSpace(dual[1]), location: normalizeSpace(dual[2]) };
+    }
+
+    // Legacy: Brand (Store area) when the paren is not a street address
     const paren = line.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
     if (paren) {
-      return { customer: normalizeSpace(paren[1]), location: normalizeSpace(paren[2]) };
+      const inside = normalizeSpace(paren[2]);
+      if (looksLikeAddress(inside)) {
+        return { customer: normalizeSpace(paren[1]), location: inside };
+      }
+      return { customer: line, location: "" };
     }
+
     if (line.includes(" - ")) {
       const parts = line.split(" - ").map(normalizeSpace);
       return { customer: parts[0] || "", location: parts.slice(1).join(" - ") || "" };
     }
     return { customer: line, location: "" };
+  }
+
+  function extractBrandAndLocation() {
+    const root = getExtractionRoot();
+    const dateRe = /[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2},?\s+[A-Za-z]{3,9},?\s+\d{4}/;
+
+    const tryPair = (customerText, locationText, el) => {
+      const customer = normalizeSpace(customerText);
+      let location = stripOuterParens(locationText);
+      if (!customer || customer.length > 90) return null;
+      if (/order placed|delivery details|order details|sales \(incl/i.test(customer)) return null;
+      if (!location || !looksLikeAddress(location)) return null;
+      hits.push({
+        label: "Customer / Location",
+        el: el || null,
+        valueEl: el || null,
+        value: `${customer} | ${location}`,
+      });
+      return { customer, location };
+    };
+
+    // DOM: find the date under the order heading, then customer below it and address beside it
+    const nodes = root.querySelectorAll("h1, h2, h3, h4, p, span, div, strong");
+    for (let i = 0; i < nodes.length; i++) {
+      const dateEl = nodes[i];
+      if (!visible(dateEl)) continue;
+      const dateText = ownText(dateEl) || normalizeSpace(dateEl.textContent);
+      if (!dateText || dateText.length > 40 || !dateRe.test(dateText)) continue;
+
+      const parent = dateEl.parentElement;
+      const siblings = parent ? [...parent.children] : [];
+      const dateIdx = siblings.indexOf(dateEl);
+      const after = dateIdx >= 0 ? siblings.slice(dateIdx + 1, dateIdx + 6) : [];
+
+      for (let s = 0; s < after.length; s++) {
+        const block = after[s];
+        if (!visible(block)) continue;
+        const blockText = normalizeSpace(block.innerText || block.textContent);
+        const dual = parseBrandLocation(blockText);
+        if (dual.customer && dual.location) {
+          hits.push({ label: "Customer / Location", el: block, valueEl: block, value: blockText });
+          return dual;
+        }
+
+        const kids = [...block.querySelectorAll("span, div, p, strong, a")].filter(visible);
+        for (let a = 0; a < kids.length; a++) {
+          for (let b = a + 1; b < Math.min(kids.length, a + 4); b++) {
+            const left = ownText(kids[a]) || normalizeSpace(kids[a].textContent);
+            const right = ownText(kids[b]) || normalizeSpace(kids[b].textContent);
+            const paired = tryPair(left, right, block);
+            if (paired) return paired;
+          }
+        }
+
+        const next = after[s + 1];
+        if (next && visible(next)) {
+          const left = ownText(block) || normalizeSpace(block.textContent);
+          const right = ownText(next) || normalizeSpace(next.textContent);
+          const paired = tryPair(left, right, block);
+          if (paired) return paired;
+        }
+      }
+    }
+
+    // Lines: date, then customer, then address (or both on one line)
+    const lines = pageLines();
+    for (let i = 0; i < lines.length - 1; i++) {
+      if (!dateRe.test(lines[i]) || lines[i].length > 40) continue;
+
+      const combined = parseBrandLocation(lines[i + 1]);
+      if (combined.customer && combined.location) return combined;
+
+      const paired = tryPair(lines[i + 1], lines[i + 2] || "");
+      if (paired) return paired;
+    }
+
+    // Fallback: Brand (Store area) only when no street address is present
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      if (!visible(el)) continue;
+      const text = ownText(el) || normalizeSpace(el.textContent);
+      if (!text || text.length > 90) continue;
+      if (!/\(.+\)/.test(text)) continue;
+      if (/order placed|delivery details|order details|sales \(incl/i.test(text)) continue;
+      if (looksLikeAddress(text)) continue;
+      const paren = text.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
+      if (paren && !looksLikeAddress(paren[2])) {
+        hits.push({ label: "Customer / Location", el, valueEl: el, value: text });
+        return { customer: text, location: normalizeSpace(paren[2]) };
+      }
+    }
+
+    return { customer: "", location: "" };
   }
 
   function parseOrderHeadingText(text) {
@@ -652,31 +783,6 @@
       if (isLikelyOrderCode(tail)) return tail;
     }
     return "";
-  }
-
-  function extractBrandAndLocation() {
-    const nodes = document.querySelectorAll("h1, h2, h3, h4, p, span, div, strong");
-    for (let i = 0; i < nodes.length; i++) {
-      const el = nodes[i];
-      if (!visible(el)) continue;
-      const text = ownText(el) || normalizeSpace(el.textContent);
-      if (!text || text.length > 90) continue;
-      if (!/\(.+\)/.test(text)) continue;
-      if (/order placed|delivery details|order details|sales \(incl/i.test(text)) continue;
-      const parsed = parseBrandLocation(text);
-      if (parsed.customer && parsed.location) {
-        hits.push({ label: "Customer / Location", el, valueEl: el, value: text });
-        return parsed;
-      }
-    }
-
-    const lines = pageLines();
-    for (let i = 0; i < lines.length; i++) {
-      if (!/\(.+\)/.test(lines[i])) continue;
-      const parsed = parseBrandLocation(lines[i]);
-      if (parsed.customer && parsed.location) return parsed;
-    }
-    return { customer: "", location: "" };
   }
 
   function extractClaimDateRaw() {
@@ -938,17 +1044,24 @@
     return (items || []).filter((item) => item && item.name && isValidItemName(item.name));
   }
 
-  function buildDisputeFieldValues(items, refundReason) {
+  function buildOtherReasonText({ items, customer, location: storeLocation }) {
+    const issueItems = (items || []).filter((item) => item && item.name && isValidItemName(item.name));
+    const itemNames = [...new Set(issueItems.map((item) => item.name))];
+    return [customer, storeLocation, ...itemNames].filter(Boolean).join("\n");
+  }
+
+  function buildDisputeFieldValues(items, refundReason, customer = "", storeLocation = "") {
     const issueItems = (items || []).filter((item) => item && item.name && isValidItemName(item.name));
     const itemNames = [...new Set(issueItems.map((item) => item.name))];
     const reason = canonicalizeReason(refundReason);
+    const otherReason = buildOtherReasonText({ items, customer, location: storeLocation });
 
     if (reason === "prepared incorrectly") {
       return {
         wrongFoodItem: "",
         preparedIncorrectlyWhy: CONFIG.preparedIncorrectlyOthersOption,
         reason: "",
-        otherReason: itemNames.join("\n"),
+        otherReason,
       };
     }
 
@@ -957,7 +1070,7 @@
         wrongFoodItem: "",
         preparedIncorrectlyWhy: "",
         reason: CONFIG.foodSafetyComplaintLabel,
-        otherReason: itemNames.join("\n"),
+        otherReason,
       };
     }
 
@@ -965,7 +1078,7 @@
       wrongFoodItem: itemNames[0] || "",
       preparedIncorrectlyWhy: "",
       reason: "",
-      otherReason: itemNames.join("\n"),
+      otherReason,
     };
   }
 
@@ -977,7 +1090,8 @@
     const orderNumber = extractOrderNumber();
     if (!orderNumber) errors.push("Order Number");
 
-    const { customer, location: storeLocation } = extractBrandAndLocation();
+    const { customer: rawCustomer, location: storeLocation } = extractBrandAndLocation();
+    const customer = normalizeCustomerName(rawCustomer);
     if (!customer) errors.push("Customer");
     if (!storeLocation) errors.push("Location");
 
@@ -1004,7 +1118,7 @@
     highlightHits();
 
     const outcome = computeOutcome({ disputeAmount, alreadyDisputed, refundReason });
-    const disputeFields = buildDisputeFieldValues(items, refundReason);
+    const disputeFields = buildDisputeFieldValues(items, refundReason, customer, storeLocation);
     const payload = {
       extractedAt: new Date().toISOString(),
       sourceUrl: window.location.href,

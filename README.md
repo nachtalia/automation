@@ -83,8 +83,8 @@ The script picks the sheet **tab from the branch/brand**:
 | OpSpot field | Source on Uber Eats |
 |--------------|---------------------|
 | Order Number | Short order code (e.g. `6BAE4`) |
-| Customer | Brand name (e.g. Burger King) |
-| Location | Location in parentheses (e.g. Wellington Airport) |
+| Customer | Brand under the date (e.g. `Burger King (East Tamaki)`) |
+| Location | Address beside the customer (e.g. `68 East Tamaki Road, Papatoetoe, Auckland`) |
 | Claim Date | Order date |
 | Order Time | “Order placed by customer” time |
 | Order Value | Sales (incl. GST) |

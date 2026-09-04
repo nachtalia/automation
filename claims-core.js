@@ -34,6 +34,11 @@
       value: rule.value,
     }));
 
+    const locationAliases = (platform.locationAliases || []).map((rule) => ({
+      match: rule.match instanceof RegExp ? rule.match : new RegExp(String(rule.match), "i"),
+      value: rule.value,
+    }));
+
     /* ---- per-create() instance state ---- */
     let claimsFillInFlight = false;
     let lastFilledOrder = "";
@@ -245,6 +250,15 @@
       const text = normalizeSpace(name);
       if (!text) return "";
       for (const rule of customerAliases) {
+        if (rule.match.test(text)) return rule.value;
+      }
+      return text;
+    }
+
+    function normalizeLocationName(name) {
+      const text = normalizeSpace(name);
+      if (!text) return "";
+      for (const rule of locationAliases) {
         if (rule.match.test(text)) return rule.value;
       }
       return text;
@@ -1738,6 +1752,7 @@
       canonicalizeReason,
       mapReasonForDispute,
       normalizeCustomerName,
+      normalizeLocationName,
       computeOutcome,
       computeFootageStatus,
       buildDisputeFieldValues,

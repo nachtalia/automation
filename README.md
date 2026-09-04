@@ -90,10 +90,13 @@ After editing presets or core **and pushing to `main`**, refresh the platform/Op
 ## Deliveroo workflow
 
 1. Open the refund page on **Deliveroo Partner Hub**.
-2. Click **Auto-Fill & Dispute**.
-3. Check the preview.
-4. OpSpot Claims → **Add New** → **Fill from Deliveroo**.
-5. Review, then **Save** (or **Save and Add New**).
+2. *(Optional)* Click **Map & conditions**:
+   - **Field maps** — click page text for each Workhorse field  
+   - **Conditions** — location/customer aliases (when Deliveroo names differ from Workhorse), reason overrides, and a list of built-in outcome rules  
+3. Click **Auto-Fill & Dispute**.
+4. Check the preview.
+5. OpSpot Claims → **Add New** → **Fill from Deliveroo**.
+6. Review, then **Save** (or **Save and Add New**).
 
 ### Copy to Google Sheet
 

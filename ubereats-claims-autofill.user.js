@@ -46,7 +46,7 @@
     normalizeSpace, normalizeKey, visible, ownText, debounce,
     parseMoney, parseClaimDate,
     isOpSpotPage,
-    canonicalizeReason, normalizeCustomerName,
+    canonicalizeReason, normalizeCustomerName, normalizeLocationName,
     buildDisputeFieldValues, enrichPayload,
     savePayload, loadPayload, toast, showPreview, ensureStyles, injectButton, ensureButtonBar,
     applyPayloadToClaims, setupOpSpotSaveHooks, resetFillGuards,
@@ -805,8 +805,9 @@
     const orderNumber = extractOrderNumber();
     if (!orderNumber) errors.push("Order Number");
 
-    const { customer: rawCustomer, location: storeLocation } = extractBrandAndLocation();
+    const { customer: rawCustomer, location: storeLocationRaw } = extractBrandAndLocation();
     const customer = normalizeCustomerName(rawCustomer);
+    const storeLocation = normalizeLocationName(storeLocationRaw);
     if (!customer) errors.push("Customer");
     if (!storeLocation) errors.push("Location");
 

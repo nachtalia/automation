@@ -94,9 +94,14 @@
       buttonFill: "Fill from Deliveroo",
       buttonSheetCopy: "Copy for Google Sheet",
       buttonSheetPaste: "Paste Deliveroo → Sheet Tab",
-      versionLabel: "2.0.0",
+      versionLabel: "2.2.0",
       fiveGuysNotDisputedMaxEur: 5,
       customerAliases: sharedCustomerAliases,
+      /** Deliveroo branch text → Workhorse Location dropdown value */
+      locationAliases: [
+        // { match: "victoria station", value: "Victoria" },
+        // { match: "brighton marina", value: "Brighton" },
+      ],
 
       reasonMap: {
         missing: "Missing Item",
@@ -179,9 +184,10 @@
       buttonFill: "Fill from Uber Eats",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "2.0.0",
+      versionLabel: "2.2.0",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: sharedCustomerAliases,
+      locationAliases: [],
 
       reasonMap: {
         missing: "Missing Item",

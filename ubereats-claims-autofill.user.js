@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Eats Order → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.0.0
+// @version      2.2.1
 // @description  Read Uber Eats Manager orders/issues and fill OpSpot Claims (preset-driven Workhorse fills).
 // @author       Claims Ops
 // @match        https://merchants.ubereats.com/*
@@ -10,8 +10,8 @@
 // @match        https://opspot.workhorselive.com/sysTable.php*
 // @match        *://opspot.workhorselive.com/*
 // @match        *://*.workhorselive.com/*
-// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-presets.js
-// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-core.js
+// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-presets.js?v=2.2.1
+// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-core.js?v=2.2.1
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM.setValue
@@ -46,12 +46,17 @@
     normalizeSpace, normalizeKey, visible, ownText, debounce,
     parseMoney, parseClaimDate,
     isOpSpotPage,
-    canonicalizeReason, normalizeCustomerName, normalizeLocationName,
+    canonicalizeReason, normalizeCustomerName,
     buildDisputeFieldValues, enrichPayload,
     savePayload, loadPayload, toast, showPreview, ensureStyles, injectButton, ensureButtonBar,
     applyPayloadToClaims, setupOpSpotSaveHooks, resetFillGuards,
     clearHits, highlightHits, hits, platform, version,
   } = core;
+
+  const normalizeLocationName =
+    typeof core.normalizeLocationName === "function"
+      ? core.normalizeLocationName
+      : (name) => normalizeSpace(name);
 
   const uiPrefix = platform.uiPrefix || "ucf";
   const btnId = `${uiPrefix}-btn`;

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Deliveroo Refund → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.2.0
+// @version      2.2.1
 // @description  Read Deliveroo refunds, map fields/conditions (incl. location aliases) to Workhorse, fill OpSpot, copy Sheets.
 // @author       Claims Ops
 // @match        https://partner-hub.deliveroo.com/*
@@ -17,8 +17,8 @@
 // @match        *://*.workhorselive.com/*
 // @match        https://docs.google.com/spreadsheets/*
 // @match        *://docs.google.com/spreadsheets/*
-// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-presets.js
-// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-core.js
+// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-presets.js?v=2.2.1
+// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-core.js?v=2.2.1
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM.setValue
@@ -54,7 +54,7 @@
     normalizeSpace, normalizeKey, compactKey, visible, ownText, wait, waitUntil, debounce,
     parseMoney, extractTime, parseClaimDate, safeClick, findVisibleLabel,
     isOpSpotPage, isGoogleSheetsPage,
-    canonicalizeReason, normalizeCustomerName, normalizeLocationName, computeOutcome, computeFootageStatus,
+    canonicalizeReason, normalizeCustomerName, computeOutcome, computeFootageStatus,
     buildDisputeFieldValues, mapReasonForDispute,
     savePayload, loadPayload, toast, showPreview, ensureStyles, injectButton, ensureButtonBar,
     applyPayloadToClaims, setupOpSpotSaveHooks, resetFillGuards,
@@ -62,6 +62,25 @@
     focusSheetPasteCell, copyTextToClipboard,
     clearHits, highlightHits, hits, hitClass, platform, version,
   } = core;
+
+  const normalizeLocationName =
+    typeof core.normalizeLocationName === "function"
+      ? core.normalizeLocationName
+      : function fallbackNormalizeLocationName(name) {
+          const text = normalizeSpace(name);
+          if (!text) return "";
+          const aliases = (platform && platform.locationAliases) || [];
+          for (const rule of aliases) {
+            if (!rule || !rule.match || !rule.value) continue;
+            try {
+              const re = rule.match instanceof RegExp ? rule.match : new RegExp(String(rule.match), "i");
+              if (re.test(text)) return normalizeSpace(rule.value);
+            } catch {
+              if (normalizeKey(text) === normalizeKey(rule.match)) return normalizeSpace(rule.value);
+            }
+          }
+          return text;
+        };
 
   const uiPrefix = platform.uiPrefix || "dcf";
   const btnId = `${uiPrefix}-btn`;
@@ -1290,7 +1309,7 @@
       if (payload.errors.length) toast(`UI miss: ${payload.errors.join(", ")}`, "error", 7000);
       else {
         const mapped = payload.fieldMapApplied ? " (custom maps)" : "";
-        toast(`v2.2.0 stored order #${payload.orderNumber}${mapped}. Click ${platform.buttonFill || "Fill from Deliveroo"} on OpSpot.`, "success", 7000);
+        toast(`v2.2.1 stored order #${payload.orderNumber}${mapped}. Click ${platform.buttonFill || "Fill from Deliveroo"} on OpSpot.`, "success", 7000);
       }
     } catch (err) {
       toast(`Extraction failed: ${err.message || err}`, "error");

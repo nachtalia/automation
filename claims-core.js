@@ -1279,16 +1279,55 @@
       let fieldIndex = collectFormFields(modal);
       const fast = options.fast || fastFillMode || workhorse.fastFill;
 
+      const defaultFills = [
+        { key: "claimDate", labelKey: "claimDate", from: "claimDateDash", extras: "claimDate" },
+        { key: "orderTime", labelKey: "orderTime", from: "orderTime" },
+        { key: "customer", labelKey: "customer", from: "customer" },
+        { key: "location", labelKey: "location", from: "location" },
+        { key: "platform", labelKey: "platform", from: "platform" },
+        { key: "orderNumber", labelKey: "orderNumber", from: "orderNumber" },
+        { key: "orderValue", labelKey: "orderValue", from: "orderValue" },
+        { key: "disputeAmount", labelKey: "disputeAmount", from: "disputeAmount" },
+        { key: "outcome", labelKey: "outcome", from: "outcome" },
+        { key: "videoSubmitted", labelKey: "videoSubmitted", from: "videoSubmitted" },
+        { key: "reasonForDispute", labelKey: "reasonForDispute", from: "reasonForDispute" },
+        { key: "footageStatus", labelKey: "footageStatus", from: "footageStatus" },
+        { key: "preparedIncorrectlyWhy", labelKey: "preparedIncorrectlyWhy", from: "preparedIncorrectlyWhy", when: "hasPreparedIncorrectlyWhy" },
+        { key: "wrongFoodItem", labelKey: "wrongFoodItem", from: "wrongFoodItem", when: "hasWrongFoodItem" },
+        { key: "reason", labelKey: "reason", from: "reason", when: "hasReason" },
+        { key: "otherReason", labelKey: "otherReason", from: "otherReason" },
+      ];
+      const fillList = Array.isArray(workhorse.fills) && workhorse.fills.length ? workhorse.fills : defaultFills;
+
+      const defaultLabels = {
+        claimDate: "Claim Date",
+        orderTime: "Order Time",
+        customer: "Customer",
+        location: "Location",
+        platform: "Platform",
+        orderNumber: "Order Number",
+        orderValue: "Order Value",
+        disputeAmount: "Dispute Amount",
+        outcome: "Outcome",
+        videoSubmitted: "Video Submitted",
+        reasonForDispute: "Reason for Dispute",
+        reason: "Reason",
+        footageStatus: "Footage Status",
+        otherReason: "Other reason",
+        wrongFoodItem: "Wrong, Missing or Incorrect Food Item",
+        preparedIncorrectlyWhy: "Why was the Item Prepared Incorrectly?",
+      };
+
       const gates = {
         hasPreparedIncorrectlyWhy: !!payload.preparedIncorrectlyWhy,
         hasWrongFoodItem: !payload.preparedIncorrectlyWhy && !!payload.wrongFoodItem,
         hasReason: !!payload.reason,
       };
 
-      for (const fill of workhorse.fills || []) {
+      for (const fill of fillList) {
         if (fill.when && !gates[fill.when]) continue;
 
-        const label = L[fill.labelKey] || fill.labelKey;
+        const label = L[fill.labelKey] || defaultLabels[fill.labelKey] || fill.labelKey;
         let value = payload[fill.from];
         let extras = {};
 
@@ -1300,8 +1339,13 @@
           value = payload.claimDateDash || payload.claimDateDMY;
         }
 
+        if (value == null || value === "") {
+          results[label] = { ok: false, reason: "empty" };
+          continue;
+        }
+
         try {
-          if (fill.key === "reason" || label === L.reason) {
+          if (fill.key === "reason" || label === (L.reason || defaultLabels.reason)) {
             await waitUntil(() => {
               fieldIndex = collectFormFields(modal);
               return matchFormField(fieldIndex, [L.reason || "Reason", `${L.reason || "Reason"}*`]);
@@ -1314,7 +1358,7 @@
         }
 
         if (
-          (fill.key === "reasonForDispute" || label === L.reasonForDispute) &&
+          (fill.key === "reasonForDispute" || /reason for dispute/i.test(label)) &&
           (payload.preparedIncorrectlyWhy || payload.reason || /other/i.test(String(payload.reasonForDispute || "")))
         ) {
           if (!fast) await wait(150);
@@ -1672,8 +1716,18 @@
     }
 
     async function applyPayloadToClaims(payload, options = {}) {
-      if (!payload || !payload.orderNumber || claimsFillInFlight) return;
-      if (!options.force && lastFilledOrder === payload.orderNumber) return;
+      if (!payload || !payload.orderNumber) {
+        toast("No order payload to fill. Run Auto-Fill on Deliveroo first.", "error", 7000);
+        return;
+      }
+      if (claimsFillInFlight) {
+        toast("Fill already in progress…", "info", 2500);
+        return;
+      }
+      if (!options.force && lastFilledOrder === payload.orderNumber) {
+        toast(`Order ${payload.orderNumber} was already filled. Click Fill again to retry.`, "info", 4000);
+        lastFilledOrder = "";
+      }
       claimsFillInFlight = true;
       const btn = document.getElementById(`${uiPrefix}-btn`);
       if (btn) {
@@ -1682,17 +1736,31 @@
       }
       fastFillMode = options.fast !== false && workhorse.fastFill !== false;
       try {
-        await waitUntil(() => getClaimsModal(), 5000, 30);
+        const modalReady = await waitUntil(() => getClaimsModal(true), 5000, 30);
+        if (!modalReady) {
+          throw new Error("Claims form not found. Click Add New, then Fill from Deliveroo.");
+        }
         const results = await fillClaimsForm(payload, { ...options, fast: true });
         lastFilledOrder = payload.orderNumber;
         showPreview(payload);
-        const failed = Object.entries(results)
-          .filter(([, r]) => !r.ok)
+        const entries = Object.entries(results || {});
+        if (!entries.length) {
+          toast("Fill ran but no fields were processed. Update claims-core / refresh Tampermonkey @require cache.", "error", 9000);
+          return;
+        }
+        const failed = entries
+          .filter(([, r]) => !r.ok && r.reason !== "empty")
           .map(([k, r]) => (r.reason ? `${k} (${r.reason})` : k));
-        if (failed.length) toast(`Could not fill: ${failed.join(", ")}`, "error", 7000);
-        else toast(`v${platform.versionLabel || "?"} filled claim ${payload.orderNumber}.`, "success");
+        const okCount = entries.filter(([, r]) => r.ok).length;
+        if (!okCount) {
+          toast(`Could not fill any fields: ${failed.slice(0, 6).join(", ") || "unknown"}`, "error", 9000);
+        } else if (failed.length) {
+          toast(`Filled ${okCount} fields. Still missing: ${failed.slice(0, 5).join(", ")}`, "error", 8000);
+        } else {
+          toast(`Filled claim ${payload.orderNumber} (${okCount} fields).`, "success");
+        }
       } catch (err) {
-        toast(`Fill failed: ${err.message || err}`, "error");
+        toast(`Fill failed: ${err.message || err}`, "error", 8000);
       } finally {
         fastFillMode = false;
         claimsFillInFlight = false;

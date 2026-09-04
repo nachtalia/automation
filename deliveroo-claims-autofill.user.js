@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Deliveroo Refund → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.2.1
+// @version      2.2.3
 // @description  Read Deliveroo refunds, map fields/conditions (incl. location aliases) to Workhorse, fill OpSpot, copy Sheets.
 // @author       Claims Ops
 // @match        https://partner-hub.deliveroo.com/*
@@ -17,8 +17,8 @@
 // @match        *://*.workhorselive.com/*
 // @match        https://docs.google.com/spreadsheets/*
 // @match        *://docs.google.com/spreadsheets/*
-// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-presets.js?v=2.2.1
-// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-core.js?v=2.2.1
+// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-presets.js?v=2.2.3
+// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-core.js?v=2.2.3
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM.setValue
@@ -642,7 +642,7 @@
     document.body && document.body.classList.remove("dcf-map-picking");
   }
 
-  function inferMappingFromElement(el) {
+  function inferMappingFromElement(el, fieldKey = "") {
     if (!el || el.closest(`#${mapPanelId}, #${uiPrefix}-btn-bar`)) return null;
     let node = el;
     if (node.nodeType === 3) node = node.parentElement;
@@ -651,16 +651,23 @@
     }
     if (!node || node === document.body) return null;
 
-    const value = normalizeSpace((ownText(node) || node.innerText || "").split("\n")[0]);
-    if (!value || value.length > 100) return null;
+    let value = normalizeSpace((ownText(node) || node.innerText || "").split("\n")[0]);
+    if (!value || value.length > 100) {
+      value = normalizeSpace((node.innerText || "").split("\n")[0]);
+    }
+    if (!value || value.length > 120) return null;
 
     node.classList.add("dcf-map-flash");
     setTimeout(() => node.classList.remove("dcf-map-flash"), 1200);
 
-    if (/^order\s*#\s*\d+$/i.test(value)) {
-      return { type: "orderNumber", sampleValue: value };
+    if (/^order\s*#\s*\d+$/i.test(value) || fieldKey === "orderNumber") {
+      if (/order\s*#\s*\d+/i.test(value) || /^\d{3,}$/.test(value)) {
+        return { type: "orderNumber", sampleValue: value };
+      }
     }
-    if (looksLikeBrandLocation(value)) {
+
+    const allowBrandLine = fieldKey === "customer" || fieldKey === "location";
+    if (allowBrandLine && looksLikeBrandLocation(value)) {
       return { type: "brandLocationLine", sampleValue: value };
     }
 
@@ -679,20 +686,73 @@
       if (prevText && prevText.length < 48 && prevText !== value) label = prevText;
     }
 
-    if (label && !HEADER_WORDS.test(label) && label.length < 60) {
+    // Known Deliveroo labels — prefer these over nearby item names (e.g. BBQ Sauce)
+    const knownLabels = [
+      "Date ordered", "Order total", "Partner refund value", "Refund reason",
+      "Order submitted", "Refund details",
+    ];
+    for (const known of knownLabels) {
+      if (normalizeKey(label) === normalizeKey(known) || normalizeKey(value) === normalizeKey(known)) {
+        label = known;
+        break;
+      }
+    }
+    if (fieldKey === "disputeAmount" && !label) label = "Partner refund value";
+    if (fieldKey === "orderValue" && !label) label = "Order total";
+    if (fieldKey === "claimDate" && !label) label = "Date ordered";
+    if (fieldKey === "refundReason" && REASON_ROW_RE.test(value)) {
+      return { type: "afterLabel", label: "Refund reason", sampleValue: value };
+    }
+    if (fieldKey === "otherReason") {
+      return { type: "literal", sampleValue: firstItemNameLine(value) || value };
+    }
+
+    if (label && !HEADER_WORDS.test(label) && label.length < 60 && normalizeKey(label) !== normalizeKey(value)) {
       return { type: "afterLabel", label, sampleValue: value };
     }
 
-    return { type: "afterLabel", label: value, sampleValue: value, clickedLabel: true };
+    if (/^(date ordered|order total|partner refund value|refund reason)$/i.test(value)) {
+      return { type: "afterLabel", label: value, sampleValue: "", clickedLabel: true };
+    }
+
+    return { type: "literal", sampleValue: value };
   }
 
-  function readMappedRaw(mapping) {
+  function pickBestLabeledValue(label, sampleValue, asMoney) {
+    const vals = valuesAfterLabel(label).filter(Boolean);
+    if (!vals.length) return sampleValue || "";
+    if (sampleValue) {
+      const sampleKey = normalizeKey(sampleValue);
+      const sampleNum = asMoney ? parseMoney(sampleValue) : null;
+      const exact = vals.find((v) => normalizeKey(v) === sampleKey || v.includes(String(sampleValue).slice(0, 12)));
+      if (exact) return exact;
+      if (asMoney && sampleNum != null) {
+        const byNum = vals.find((v) => parseMoney(v) === sampleNum);
+        if (byNum) return byNum;
+      }
+    }
+    if (asMoney) {
+      const nonZero = vals.filter((v) => {
+        const n = parseMoney(v);
+        return n != null && Math.abs(n) > 0;
+      });
+      if (nonZero.length) return nonZero[nonZero.length - 1];
+    }
+    return vals[vals.length - 1];
+  }
+
+  function readMappedRaw(mapping, fieldKey = "") {
     if (!mapping || !mapping.type) return "";
+    if (mapping.type === "literal") return mapping.sampleValue || "";
     if (mapping.type === "orderNumber") {
       const n = extractOrderNumber();
-      return n ? `Order #${n}` : "";
+      return n ? `Order #${n}` : mapping.sampleValue || "";
     }
     if (mapping.type === "brandLocationLine") {
+      // Never resolve brand line for item/reason fields — use what was clicked
+      if (fieldKey === "otherReason" || fieldKey === "refundReason") {
+        return mapping.sampleValue || "";
+      }
       const orderNumber = extractOrderNumber();
       const brand = extractBrandAndLocation(orderNumber);
       if (brand.customer && brand.location) return `${brand.customer} - ${brand.location}`;
@@ -701,12 +761,11 @@
       return hit || mapping.sampleValue || "";
     }
     if (mapping.type === "afterLabel" && mapping.label) {
+      const asMoney = fieldKey === "orderValue" || fieldKey === "disputeAmount";
       if (mapping.clickedLabel) {
-        const vals = valuesAfterLabel(mapping.label);
-        return vals[0] || mapping.sampleValue || "";
+        return pickBestLabeledValue(mapping.label, mapping.sampleValue, asMoney);
       }
-      const vals = valuesAfterLabel(mapping.label);
-      return vals.length ? vals[vals.length - 1] : mapping.sampleValue || "";
+      return pickBestLabeledValue(mapping.label, mapping.sampleValue, asMoney);
     }
     return mapping.sampleValue || "";
   }
@@ -719,14 +778,19 @@
     for (const [key, mapping] of Object.entries(map)) {
       const meta = fieldMeta[key];
       if (!meta || !mapping) continue;
-      const raw = readMappedRaw(mapping);
-      if (!raw) continue;
+      // Repair bad maps saved earlier (item names stored as brandLocationLine)
+      const fixedMapping =
+        (key === "otherReason" || key === "refundReason") && mapping.type === "brandLocationLine"
+          ? { type: "literal", sampleValue: mapping.sampleValue }
+          : mapping;
+      const raw = readMappedRaw(fixedMapping, key);
+      if (!raw && key !== "disputeAmount") continue;
 
       if (key === "orderNumber") {
         const m = String(raw).match(/(\d{3,})/);
         if (m) out.orderNumber = m[1];
       } else if (key === "customer") {
-        if (mapping.type === "brandLocationLine") {
+        if (fixedMapping.type === "brandLocationLine") {
           const parsed = splitBrandLocation(raw);
           if (parsed.customer) out.customer = resolveCustomerName(parsed.customer);
           if (parsed.location && !map.location) out.location = resolveLocationName(parsed.location);
@@ -734,7 +798,7 @@
           out.customer = resolveCustomerName(raw);
         }
       } else if (key === "location") {
-        if (mapping.type === "brandLocationLine") {
+        if (fixedMapping.type === "brandLocationLine") {
           const parsed = splitBrandLocation(raw);
           if (parsed.location) out.location = resolveLocationName(parsed.location);
           if (parsed.customer && !map.customer) out.customer = resolveCustomerName(parsed.customer);
@@ -754,17 +818,29 @@
       } else if (key === "orderTime") {
         out.orderTime = extractTime(raw) || raw;
       } else if (key === "orderValue") {
-        const n = parseMoney(raw);
+        const n = parseMoney(raw) ?? parseMoney(fixedMapping.sampleValue);
         if (n != null) out.orderValue = n.toFixed(2);
       } else if (key === "disputeAmount") {
-        const n = parseMoney(raw);
+        let n = parseMoney(raw);
+        if (n == null || n === 0) n = parseMoney(fixedMapping.sampleValue);
+        // If map still yields 0, fall back to auto Partner refund value (non-zero)
+        if (n == null || n === 0) {
+          const auto = pickBestLabeledValue("Partner refund value", fixedMapping.sampleValue, true);
+          n = parseMoney(auto);
+        }
         if (n != null) out.disputeAmount = n.toFixed(2);
       } else if (key === "refundReason") {
-        out.refundReason = canonicalizeReason(raw) || raw;
+        const reasonText = REASON_ROW_RE.test(raw) ? raw : fixedMapping.sampleValue || raw;
+        out.refundReason = canonicalizeReason(reasonText) || reasonText;
         out.reasonForDispute = resolveReasonForDispute(out.refundReason);
       } else if (key === "otherReason") {
-        out.otherReason = raw;
-        if (!out.wrongFoodItem) out.wrongFoodItem = String(raw).split("\n")[0];
+        const item = firstItemNameLine(raw) || raw;
+        // Ignore accidental brand/location
+        if (looksLikeBrandLocation(item) && /shake|jollibee|popeyes|five\s*guys/i.test(item)) {
+          continue;
+        }
+        out.otherReason = item;
+        if (!out.wrongFoodItem) out.wrongFoodItem = String(item).split("\n")[0];
       }
     }
 
@@ -795,7 +871,7 @@
       if (event.target.closest(`#${mapPanelId}, #${uiPrefix}-btn-bar`)) return;
       event.preventDefault();
       event.stopPropagation();
-      const mapping = inferMappingFromElement(event.target);
+      const mapping = inferMappingFromElement(event.target, fieldKey);
       stopMapPick();
       if (!mapping) {
         toast("Could not read that click. Try a clearer label or value.", "error");
@@ -815,6 +891,7 @@
 
   function mappingSummary(mapping) {
     if (!mapping) return "Default (auto)";
+    if (mapping.type === "literal") return `Clicked text: ${mapping.sampleValue || "?"}`;
     if (mapping.type === "afterLabel") {
       return mapping.clickedLabel
         ? `After label “${mapping.label}”`
@@ -1116,8 +1193,8 @@
     let orderTime = extractTime(dateRaw);
     if (!orderTime) orderTime = extractOrderSubmittedTime();
 
-    let orderValue = parseMoney(valuesAfterLabel("Order total")[0] || "");
-    let disputeAmount = parseMoney(valuesAfterLabel("Partner refund value")[0] || "");
+    let orderValue = parseMoney(pickBestLabeledValue("Order total", "", true) || valuesAfterLabel("Order total")[0] || "");
+    let disputeAmount = parseMoney(pickBestLabeledValue("Partner refund value", "", true) || "");
 
     const items = extractRefundedItems();
     const reasonValues = valuesAfterLabel("Refund reason");
@@ -1309,7 +1386,7 @@
       if (payload.errors.length) toast(`UI miss: ${payload.errors.join(", ")}`, "error", 7000);
       else {
         const mapped = payload.fieldMapApplied ? " (custom maps)" : "";
-        toast(`v2.2.1 stored order #${payload.orderNumber}${mapped}. Click ${platform.buttonFill || "Fill from Deliveroo"} on OpSpot.`, "success", 7000);
+        toast(`v2.2.2 stored order #${payload.orderNumber}${mapped}. Click ${platform.buttonFill || "Fill from Deliveroo"} on OpSpot.`, "success", 7000);
       }
     } catch (err) {
       toast(`Extraction failed: ${err.message || err}`, "error");

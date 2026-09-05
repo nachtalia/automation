@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Deliveroo Refund → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.2.3
+// @version      2.3.7
 // @description  Read Deliveroo refunds, map fields/conditions (incl. location aliases) to Workhorse, fill OpSpot, copy Sheets.
 // @author       Claims Ops
 // @match        https://partner-hub.deliveroo.com/*
@@ -17,8 +17,6 @@
 // @match        *://*.workhorselive.com/*
 // @match        https://docs.google.com/spreadsheets/*
 // @match        *://docs.google.com/spreadsheets/*
-// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-presets.js?v=2.2.3
-// @require      https://raw.githubusercontent.com/nachtalia/automation/main/claims-core.js?v=2.2.3
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM.setValue
@@ -31,6 +29,2230 @@
 // @run-at       document-end
 // ==/UserScript==
 
+/* ==== BEGIN INLINED SHARED (from claims-presets.js + claims-core.js) ==== */
+/**
+ * Claims presets — Workhorse field maps + Deliveroo / Uber Eats platform rules.
+ * Edit this file to change OpSpot fill order, reason maps, outcome rules, or sheet tabs.
+ * Inlined into platform userscripts by build-static.js.
+ */
+(function (root) {
+  "use strict";
+
+  const workhorse = {
+    claimsFormUrl: "https://opspot.workhorselive.com/sysTable.php?sys_module_id=10000&sys_data_entity_id=10000",
+    videoSubmitted: "No",
+    disputeThresholdGbp: 2, // Partner refund ≤ this (£) → Outcome: Not disputed
+    fastFill: true,
+    modalCacheMs: 800,
+    debug: false,
+    preparedIncorrectlyOthersOption: "Others",
+    reasonForDisputeOtherOption: "Other",
+    foodSafetyComplaintLabel: "Food safety complaint",
+
+    labels: {
+      claimDate: "Claim Date",
+      orderTime: "Order Time",
+      customer: "Customer",
+      location: "Location",
+      platform: "Platform",
+      orderNumber: "Order Number",
+      orderValue: "Order Value",
+      disputeAmount: "Dispute Amount",
+      outcome: "Outcome",
+      videoSubmitted: "Video Submitted",
+      reasonForDispute: "Reason for Dispute",
+      reason: "Reason",
+      footageStatus: "Footage Status",
+      otherReason: "Other reason",
+      wrongFoodItem: "Wrong, Missing or Incorrect Food Item",
+      preparedIncorrectlyWhy: "Why was the Item Prepared Incorrectly?",
+    },
+
+    /** Ordered OpSpot fills. `from` = payload key. `when` gates optional fields. */
+    fills: [
+      { key: "claimDate", labelKey: "claimDate", from: "claimDateDash", extras: "claimDate" },
+      { key: "orderTime", labelKey: "orderTime", from: "orderTime" },
+      { key: "customer", labelKey: "customer", from: "customer" },
+      { key: "location", labelKey: "location", from: "location" },
+      { key: "platform", labelKey: "platform", from: "platform" },
+      { key: "orderNumber", labelKey: "orderNumber", from: "orderNumber" },
+      { key: "orderValue", labelKey: "orderValue", from: "orderValue" },
+      { key: "disputeAmount", labelKey: "disputeAmount", from: "disputeAmount" },
+      { key: "outcome", labelKey: "outcome", from: "outcome" },
+      { key: "videoSubmitted", labelKey: "videoSubmitted", from: "videoSubmitted" },
+      { key: "reasonForDispute", labelKey: "reasonForDispute", from: "reasonForDispute" },
+      { key: "footageStatus", labelKey: "footageStatus", from: "footageStatus" },
+      { key: "preparedIncorrectlyWhy", labelKey: "preparedIncorrectlyWhy", from: "preparedIncorrectlyWhy", when: "hasPreparedIncorrectlyWhy" },
+      { key: "wrongFoodItem", labelKey: "wrongFoodItem", from: "wrongFoodItem", when: "hasWrongFoodItem" },
+      { key: "reason", labelKey: "reason", from: "reason", when: "hasReason" },
+      { key: "otherReason", labelKey: "otherReason", from: "otherReason" },
+    ],
+
+    outcomeOptions: {
+      notDisputed: "Not disputed",
+      reviewed: "Reviewed",
+      awaitingReview: "Awaiting review",
+      pending: "Pending",
+      disputedByThirdParty: "Disputed by 3rd party",
+    },
+    footageStatusOptions: {
+      disputedByThirdParty: "Disputed by 3rd party",
+      irrelevant: "Footage status irrelevant for this claim",
+    },
+
+    fieldCaptions: [
+      "claim date", "order time", "customer", "location", "platform", "order number",
+      "order value", "dispute amount", "outcome", "video submitted", "reason for dispute",
+      "footage status", "other reason", "wrong, missing or incorrect food item",
+      "why was the item prepared incorrectly", "agent", "won revenue", "lost revenue",
+    ],
+  };
+
+  const sharedCustomerAliases = [
+    { match: "popeyes.*louisiana|louisiana.*popeyes", value: "Popeyes France" },
+  ];
+
+  const platforms = {
+    deliveroo: {
+      id: "deliveroo",
+      platform: "Deliveroo",
+      hostHint: "partner-hub.deliveroo.com",
+      storageKey: "deliveroo_claim_payload_v1",
+      sheetStorageKey: "deliveroo_sheet_row_v1",
+      clipPrefix: "DCF1:",
+      uiPrefix: "dcf",
+      hitColor: "#00ccbc",
+      buttonExtract: "Auto-Fill & Dispute",
+      buttonFill: "Fill from Deliveroo",
+      buttonSheetCopy: "Copy for Google Sheet",
+      buttonSheetPaste: "Paste Deliveroo → Sheet Tab",
+      versionLabel: "2.2.0",
+      fiveGuysNotDisputedMaxEur: 5,
+      customerAliases: sharedCustomerAliases,
+      /** Deliveroo branch text → Workhorse Location dropdown value */
+      locationAliases: [
+        // { match: "victoria station", value: "Victoria" },
+        // { match: "brighton marina", value: "Brighton" },
+      ],
+
+      reasonMap: {
+        missing: "Missing Item",
+        "missing item": "Missing Item",
+        "missing items": "Missing Item",
+        incomplete: "Missing Item",
+        "incomplete item": "Missing Item",
+        "incomplete items": "Missing Item",
+        "prepared incorrectly": "Prepared incorrectly",
+        incorrect: "Incorrect Item",
+        "incorrect item": "Incorrect Item",
+        "incorrect items": "Incorrect Item",
+        "food safety complaint": "Other",
+      },
+
+      /** First matching rule wins. Patterns are string regex sources. */
+      canonicalizeRules: [
+        { test: "^missing$|missing item", canonical: "missing items" },
+        { test: "^incomplete$|incomplete item", canonical: "missing items" },
+        { test: "prepared incorrectly", canonical: "prepared incorrectly" },
+        { test: "food safety", canonical: "food safety complaint" },
+        { test: "incorrect", canonical: "incorrect item" },
+      ],
+
+      outcomeRules: [
+        { type: "fiveGuysUnderMax", outcomeKey: "notDisputed" },
+        { type: "alreadyDisputed", outcomeKey: "reviewed" },
+        { type: "underDisputeThreshold", outcomeKey: "notDisputed" },
+        { type: "reasonIn", reasons: ["missing items", "food safety complaint"], outcomeKey: "awaitingReview" },
+        { type: "reasonIn", reasons: ["prepared incorrectly", "incorrect item"], outcomeKey: "pending" },
+      ],
+
+      footageRules: [
+        { type: "fiveGuysUnderMax", footageKey: "irrelevant" },
+        { type: "alreadyDisputed", footageKey: "disputedByThirdParty" },
+        { type: "underDisputeThreshold", footageKey: "irrelevant" },
+        {
+          type: "reasonIn",
+          reasons: ["missing items", "prepared incorrectly", "incorrect item", "food safety complaint"],
+          footageKey: "irrelevant",
+        },
+      ],
+
+      sheet: {
+        enabled: true,
+        columns: [
+          "Date",
+          "Location",
+          "# Order Number",
+          "Refund Reason",
+          "With Video?",
+          "Footage Status",
+          "Comments",
+        ],
+        branchSheetTabs: [
+          { match: "shake\\s*shack", tab: "Shake Shack" },
+          { match: "jollibee", tab: "Jollibee UK" },
+          { match: "popeyes", tab: "Popeyes" },
+        ],
+        defaultSheetTab: "",
+        /** Map Workhorse Reason for Dispute → sheet “Refund Reason” wording */
+        refundReasonOverrides: [
+          { test: "^missing\\s*items?$", value: "Missing Items" },
+          { test: "^incorrect\\s*items?$", value: "Incorrect Item" },
+          { test: "^incomplete\\s*items?$", value: "Incorrect Item" },
+          { test: "prepared incorrectly", value: "Prepared incorrectly" },
+          { test: "food safety", value: "Food safety complaint" },
+        ],
+      },
+
+      otherReasonIncludesCustomerLocation: false,
+    },
+
+    ubereats: {
+      id: "ubereats",
+      platform: "Uber Eats",
+      hostHint: "merchants.ubereats.com",
+      storageKey: "ubereats_claim_payload_v1",
+      sheetStorageKey: "",
+      clipPrefix: "UCF1:",
+      uiPrefix: "ucf",
+      hitColor: "#06c167",
+      buttonExtract: "Extract Order → OpSpot",
+      buttonFill: "Fill from Uber Eats",
+      buttonSheetCopy: "",
+      buttonSheetPaste: "",
+      versionLabel: "2.2.0",
+      fiveGuysNotDisputedMaxEur: null,
+      customerAliases: sharedCustomerAliases,
+      locationAliases: [],
+
+      reasonMap: {
+        missing: "Missing Item",
+        "missing item": "Missing Item",
+        "missing items": "Missing Item",
+        "prepared incorrectly": "Prepared incorrectly",
+        incorrect: "Incorrect Item",
+        "incorrect item": "Incorrect Item",
+        "incorrect items": "Incorrect Item",
+        "food safety complaint": "Other",
+        "wrong order": "Incorrect Item",
+        "wrong item": "Incorrect Item",
+        "poor food quality": "Prepared incorrectly",
+        "food quality": "Prepared incorrectly",
+        "customization missing": "Missing Item",
+        "customization reported missing": "Missing Item",
+        "item reported missing": "Missing Item",
+        "reported missing": "Missing Item",
+      },
+
+      canonicalizeRules: [
+        { test: "customization\\s*(reported\\s*)?missing|item\\s*reported\\s*missing|reported\\s*missing|^missing$|missing item", canonical: "missing items" },
+        { test: "prepared incorrectly|poor food quality|food quality", canonical: "prepared incorrectly" },
+        { test: "food safety", canonical: "food safety complaint" },
+        { test: "wrong order|wrong item|incorrect", canonical: "incorrect item" },
+      ],
+
+      outcomeRules: [
+        { type: "alreadyDisputed", outcomeKey: "reviewed" },
+        { type: "underDisputeThreshold", outcomeKey: "notDisputed" },
+        { type: "reasonIn", reasons: ["missing items", "food safety complaint"], outcomeKey: "awaitingReview" },
+        { type: "reasonIn", reasons: ["prepared incorrectly", "incorrect item"], outcomeKey: "pending" },
+      ],
+
+      footageRules: [
+        { type: "alreadyDisputed", footageKey: "disputedByThirdParty" },
+        { type: "underDisputeThreshold", footageKey: "irrelevant" },
+        {
+          type: "reasonIn",
+          reasons: ["missing items", "prepared incorrectly", "incorrect item", "food safety complaint"],
+          footageKey: "irrelevant",
+        },
+      ],
+
+      sheet: { enabled: false },
+
+      /** Labels the Uber extractor prefers for dispute amount / order value */
+      extractHints: {
+        disputeAmountLabels: ["Chargeback Amount", "Marketplace Fee", "Refund", "Adjustment"],
+        orderValueLabels: ["Sales (incl. GST)", "Sales", "Subtotal", "Net payout"],
+      },
+
+      otherReasonIncludesCustomerLocation: true,
+    },
+  };
+
+  root.ClaimsPresets = {
+    workhorse,
+    platforms,
+    getPlatform(id) {
+      return platforms[id] || null;
+    },
+  };
+})(typeof unsafeWindow !== "undefined" ? unsafeWindow : typeof window !== "undefined" ? window : globalThis);
+
+/**
+ * ClaimsCore — shared OpSpot fill / rules / transfer helpers for Deliveroo & Uber Eats.
+ * Inlined into platform userscripts by build-static.js (after claims-presets).
+ *
+ *   const core = ClaimsCore.create("deliveroo"); // or "ubereats"
+ */
+(function (root) {
+  "use strict";
+
+  const HEADER_WORDS = /^(quantity|qty|price|item|items|name|category|total|refund reason|refund details)$/i;
+
+  function ClaimsCoreCreate(platformId) {
+    const presets = root.ClaimsPresets || (typeof globalThis !== "undefined" && globalThis.ClaimsPresets);
+    if (!presets || !presets.getPlatform) {
+      throw new Error("ClaimsCore: ClaimsPresets is missing. Load claims-presets.js before claims-core.js.");
+    }
+
+    const workhorse = presets.workhorse;
+    const platform = presets.getPlatform(platformId);
+    if (!platform) {
+      throw new Error(`ClaimsCore: unknown platformId "${platformId}". Expected "deliveroo" or "ubereats".`);
+    }
+    if (!workhorse) {
+      throw new Error("ClaimsCore: ClaimsPresets.workhorse is missing.");
+    }
+
+    const uiPrefix = platform.uiPrefix || "claims";
+    const hitColor = platform.hitColor || "#00ccbc";
+    const hitClass = `${uiPrefix}-hit`;
+    const FIELD_CAPTIONS = workhorse.fieldCaptions || [];
+
+    const customerAliases = (platform.customerAliases || []).map((rule) => ({
+      match: rule.match instanceof RegExp ? rule.match : new RegExp(String(rule.match), "i"),
+      value: rule.value,
+    }));
+
+    const locationAliases = (platform.locationAliases || []).map((rule) => ({
+      match: rule.match instanceof RegExp ? rule.match : new RegExp(String(rule.match), "i"),
+      value: rule.value,
+    }));
+
+    /* ---- per-create() instance state ---- */
+    let claimsFillInFlight = false;
+    let lastFilledOrder = "";
+    let saveInProgress = false;
+    let pendingAutoFillAfterSave = false;
+    let fastFillMode = false;
+    let cachedModal = null;
+    let cachedModalAt = 0;
+    let stylesInjected = false;
+    let saveHooksInstalled = false;
+    const hits = [];
+
+    /* ---------------------------------------------------------------------- */
+    /* Utils                                                                  */
+    /* ---------------------------------------------------------------------- */
+
+    function wait(ms) {
+      return new Promise((r) => setTimeout(r, ms));
+    }
+
+    async function waitUntil(testFn, timeoutMs = 3000, stepMs = 50) {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const value = testFn();
+        if (value) return value;
+        await wait(stepMs);
+      }
+      return null;
+    }
+
+    function debounce(fn, ms) {
+      let t;
+      return (...args) => {
+        clearTimeout(t);
+        t = setTimeout(() => fn(...args), ms);
+      };
+    }
+
+    function normalizeSpace(value) {
+      return String(value || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    function normalizeKey(value) {
+      return normalizeSpace(value)
+        .toLowerCase()
+        .replace(/\s*\*+\s*$/g, "")
+        .replace(/\*+$/g, "")
+        .trim();
+    }
+
+    function compactKey(value) {
+      return normalizeKey(value).replace(/[^a-z0-9]/g, "");
+    }
+
+    function visible(el) {
+      if (!el || el.nodeType !== 1) return false;
+      if (el.hidden) return false;
+      return el.offsetWidth > 0 || el.offsetHeight > 0;
+    }
+
+    function ownText(el) {
+      let out = "";
+      for (let n = el.firstChild; n; n = n.nextSibling) {
+        if (n.nodeType === Node.TEXT_NODE) out += n.nodeValue;
+      }
+      return normalizeSpace(out);
+    }
+
+    function parseMoney(value) {
+      const cleaned = String(value || "").replace(/[^\d.,-]/g, "").replace(/,/g, "");
+      if (!cleaned) return null;
+      const num = Number.parseFloat(cleaned);
+      return Number.isFinite(num) ? num : null;
+    }
+
+    function extractTime(text) {
+      const m = String(text || "").match(/\b([01]?\d|2[0-3]):([0-5]\d)/);
+      return m ? `${m[1].padStart(2, "0")}:${m[2]}` : "";
+    }
+
+    function parseClaimDate(raw) {
+      const text = normalizeSpace(raw);
+      const months = {
+        jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
+        jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
+      };
+      const pack = (day, monthName, year) => {
+        const month = months[String(monthName || "").slice(0, 3).toLowerCase()];
+        if (!month) return { raw: text, iso: "", dmy: "", dash: "" };
+        const d = String(day).padStart(2, "0");
+        return {
+          raw: `${Number.parseInt(day, 10)} ${String(monthName).slice(0, 3)} ${year}`,
+          iso: `${year}-${month}-${d}`,
+          dmy: `${d}/${month}/${year}`,
+          dash: `${d}-${month}-${year}`,
+        };
+      };
+      let named = text.match(/(\d{1,2})\s+([A-Za-z]{3,9}),?\s+(\d{4})/);
+      if (named) return pack(named[1], named[2], named[3]);
+      named = text.match(/([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})/);
+      if (named) return pack(named[2], named[1], named[3]);
+      named = text.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+      if (named) {
+        const day = named[1].padStart(2, "0");
+        const month = named[2].padStart(2, "0");
+        const year = named[3];
+        return { raw: text, iso: `${year}-${month}-${day}`, dmy: `${day}/${month}/${year}`, dash: `${day}-${month}-${year}` };
+      }
+      return { raw: text, iso: "", dmy: "", dash: "" };
+    }
+
+    const pageJQuery = () =>
+      (typeof unsafeWindow !== "undefined" && (unsafeWindow.jQuery || unsafeWindow.$)) ||
+      (typeof window !== "undefined" && (window.jQuery || window.$)) ||
+      null;
+
+    function safeClick(el) {
+      if (!el) return;
+      try {
+        el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      } catch {
+        /* Tampermonkey sandbox cannot always build MouseEvent */
+      }
+      try {
+        el.click();
+      } catch {
+        /* ignore */
+      }
+    }
+
+    function isOpSpotPage() {
+      return typeof location !== "undefined" && /opspot\.workhorselive\.com/i.test(location.host);
+    }
+
+    function isGoogleSheetsPage() {
+      return (
+        typeof location !== "undefined" &&
+        /docs\.google\.com/i.test(location.host) &&
+        /\/spreadsheets\//i.test(location.pathname)
+      );
+    }
+
+    function log(...args) {
+      if (workhorse.debug) console.log(`[ClaimsCore:${platform.id}]`, ...args);
+    }
+
+    function addStyle(css) {
+      if (typeof GM_addStyle === "function") {
+        GM_addStyle(css);
+        return;
+      }
+      const el = document.createElement("style");
+      el.textContent = css;
+      (document.head || document.documentElement).appendChild(el);
+    }
+
+    function hexToRgba(hex, alpha) {
+      const raw = String(hex || "").replace("#", "");
+      const full = raw.length === 3 ? raw.split("").map((c) => c + c).join("") : raw;
+      const m = full.match(/^([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
+      if (!m) return `rgba(0, 204, 188, ${alpha})`;
+      return `rgba(${Number.parseInt(m[1], 16)}, ${Number.parseInt(m[2], 16)}, ${Number.parseInt(m[3], 16)}, ${alpha})`;
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    function compiledRegex(cache, source, flags) {
+      if (!source) return null;
+      if (source instanceof RegExp) return source;
+      const key = `${flags || ""}::${source}`;
+      if (!cache[key]) cache[key] = new RegExp(source, flags || "i");
+      return cache[key];
+    }
+
+    const ruleRegexCache = Object.create(null);
+
+    /* ---------------------------------------------------------------------- */
+    /* Rules                                                                  */
+    /* ---------------------------------------------------------------------- */
+
+    function canonicalizeReason(reason) {
+      const key = normalizeKey(reason);
+      if (!key || HEADER_WORDS.test(key)) return "";
+      for (const rule of platform.canonicalizeRules || []) {
+        if (!rule || !rule.test) continue;
+        const re = compiledRegex(ruleRegexCache, rule.test, "i");
+        if (re && re.test(key)) return rule.canonical;
+      }
+      return key;
+    }
+
+    function mapReasonForDispute(canonical) {
+      const key = normalizeKey(canonical);
+      if (!key) return "";
+      const map = platform.reasonMap || {};
+      return map[key] || map[canonicalizeReason(key)] || "";
+    }
+
+    function normalizeCustomerName(name) {
+      const text = normalizeSpace(name);
+      if (!text) return "";
+      for (const rule of customerAliases) {
+        if (rule.match.test(text)) return rule.value;
+      }
+      return text;
+    }
+
+    function normalizeLocationName(name) {
+      const text = normalizeSpace(name);
+      if (!text) return "";
+      for (const rule of locationAliases) {
+        if (rule.match.test(text)) return rule.value;
+      }
+      return text;
+    }
+
+    function disputeAmountNum(ctx) {
+      if (typeof ctx.disputeAmount === "number") return ctx.disputeAmount;
+      return parseMoney(ctx.disputeAmount);
+    }
+
+    function isFiveGuys(customer, storeLocation) {
+      return /five\s*guys/i.test([customer, storeLocation].filter(Boolean).join(" "));
+    }
+
+    function reasonKeyForOutcomeRules(ctx) {
+      const dispute = normalizeKey(ctx && ctx.reasonForDispute);
+      if (/incorrect/.test(dispute)) return "incorrect item";
+      if (/prepared/.test(dispute)) return "prepared incorrectly";
+      if (/missing/.test(dispute)) return "missing items";
+      if (/food\s*safety|other/.test(dispute) && /food\s*safety/.test(normalizeKey(ctx.refundReasonRaw || ""))) {
+        return "food safety complaint";
+      }
+      if (/food\s*safety/.test(dispute)) return "food safety complaint";
+
+      const raw = normalizeKey((ctx && ctx.refundReasonRaw) || "");
+      // Incomplete mapped to Incorrect Item should use the incorrect-item outcome path
+      if (/incomplete/.test(raw)) {
+        if (/incorrect/.test(dispute) || !dispute) return "incorrect item";
+      }
+      return canonicalizeReason((ctx && (ctx.refundReasonRaw || ctx.refundReason)) || "") ||
+        canonicalizeReason(ctx && ctx.refundReason);
+    }
+
+    function matchRule(rule, ctx) {
+      const amount = disputeAmountNum(ctx);
+      const reason = reasonKeyForOutcomeRules(ctx);
+      switch (rule.type) {
+        case "fiveGuysUnderMax": {
+          const max =
+            ctx.fiveGuysMax != null && !Number.isNaN(Number(ctx.fiveGuysMax))
+              ? Number(ctx.fiveGuysMax)
+              : platform.fiveGuysNotDisputedMaxEur;
+          if (max == null) return false;
+          return (
+            isFiveGuys(ctx.customer, ctx.location) &&
+            amount != null &&
+            amount < max
+          );
+        }
+        case "alreadyDisputed":
+          return !!ctx.alreadyDisputed;
+        case "underDisputeThreshold": {
+          const threshold =
+            ctx.disputeThreshold != null && !Number.isNaN(Number(ctx.disputeThreshold))
+              ? Number(ctx.disputeThreshold)
+              : workhorse.disputeThresholdGbp || 2;
+          return amount != null && amount <= threshold;
+        }
+        case "reasonIn":
+          return Array.isArray(rule.reasons) && rule.reasons.includes(reason);
+        default:
+          return false;
+      }
+    }
+
+    function conditionRuleKey(rule) {
+      if (!rule || !rule.type) return "";
+      if (rule.type === "reasonIn") {
+        const reasons = (rule.reasons || []).slice().sort().join("|");
+        if (/food safety/.test(reasons) && /missing items/.test(reasons)) return "missingFoodSafety";
+        if (/prepared incorrectly/.test(reasons) || /incorrect item/.test(reasons)) return "preparedIncorrect";
+        return `reasonIn:${reasons}`;
+      }
+      return rule.type;
+    }
+
+    function resolveOutcomeMatch(ctx) {
+      const opts = workhorse.outcomeOptions || {};
+      const tweaks = (ctx && ctx.conditionTweaks) || {};
+      for (const rule of platform.outcomeRules || []) {
+        if (!matchRule(rule, ctx)) continue;
+        const key = conditionRuleKey(rule);
+        const tweak = tweaks[key] || {};
+        return {
+          key,
+          outcome: tweak.outcome || opts[rule.outcomeKey] || "",
+          reasonForDispute: Array.isArray(tweak.reasonForDispute)
+            ? tweak.reasonForDispute
+            : tweak.reasonForDispute
+              ? [tweak.reasonForDispute]
+              : [],
+        };
+      }
+      return { key: "", outcome: "", reasonForDispute: [] };
+    }
+
+    function computeOutcome(ctx) {
+      return resolveOutcomeMatch(ctx).outcome;
+    }
+
+    function computeFootageStatus(ctx) {
+      const opts = workhorse.footageStatusOptions || {};
+      const tweaks = (ctx && ctx.conditionTweaks) || {};
+      for (const rule of platform.footageRules || []) {
+        if (!matchRule(rule, ctx)) continue;
+        const key = conditionRuleKey(rule);
+        if (tweaks[key] && tweaks[key].footage) return tweaks[key].footage;
+        return opts[rule.footageKey] || "";
+      }
+      return "";
+    }
+
+    function itemNamesFrom(items) {
+      return [...new Set((items || []).map((item) => item && item.name).filter(Boolean))];
+    }
+
+    function buildDisputeFieldValues(items, refundReason, customer, storeLocation) {
+      const reason = canonicalizeReason(refundReason);
+      const itemNames = itemNamesFrom(items);
+      let result;
+
+      if (reason === "prepared incorrectly") {
+        result = {
+          wrongFoodItem: "",
+          preparedIncorrectlyWhy: workhorse.preparedIncorrectlyOthersOption || "Others",
+          reason: "",
+          otherReason: itemNames.join("\n"),
+        };
+      } else if (reason === "food safety complaint") {
+        result = {
+          wrongFoodItem: "",
+          preparedIncorrectlyWhy: "",
+          reason: workhorse.foodSafetyComplaintLabel || "Food safety complaint",
+          otherReason: itemNames.join("\n"),
+        };
+      } else {
+        result = {
+          wrongFoodItem: itemNames[0] || "",
+          preparedIncorrectlyWhy: "",
+          reason: "",
+          otherReason: itemNames.join("\n"),
+        };
+      }
+
+      if (platform.otherReasonIncludesCustomerLocation) {
+        const prefix = [customer, storeLocation].filter(Boolean).join("\n");
+        if (prefix) {
+          result.otherReason = result.otherReason ? `${prefix}\n${result.otherReason}` : prefix;
+        }
+      }
+      return result;
+    }
+
+    function enrichPayload(partial) {
+      const p = Object.assign({}, partial || {});
+      const amount = disputeAmountNum(p);
+      const canonical = canonicalizeReason(p.refundReason || "");
+      if (canonical) p.refundReason = canonical;
+
+      p.platform = p.platform || platform.platform;
+      p.videoSubmitted = p.videoSubmitted != null && p.videoSubmitted !== ""
+        ? p.videoSubmitted
+        : workhorse.videoSubmitted || "No";
+
+      if (!p.reasonForDispute) {
+        p.reasonForDispute = mapReasonForDispute(canonical || p.refundReason);
+      }
+
+      const ruleCtx = {
+        disputeAmount: amount,
+        alreadyDisputed: p.alreadyDisputed,
+        refundReason: p.refundReason,
+        refundReasonRaw: p.refundReasonRaw,
+        reasonForDispute: p.reasonForDispute,
+        customer: p.customer,
+        location: p.location,
+      };
+
+      if (!p.outcome) p.outcome = computeOutcome(ruleCtx);
+      if (!p.footageStatus) p.footageStatus = computeFootageStatus(ruleCtx);
+
+      return p;
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* Hits / cache                                                           */
+    /* ---------------------------------------------------------------------- */
+
+    function highlightHits() {
+      for (const hit of hits) {
+        if (hit.el) hit.el.classList.add(hitClass);
+        if (hit.valueEl) hit.valueEl.classList.add(hitClass);
+      }
+    }
+
+    function clearHits() {
+      for (const hit of hits) {
+        if (hit.el) hit.el.classList.remove(hitClass);
+        if (hit.valueEl) hit.valueEl.classList.remove(hitClass);
+      }
+      hits.length = 0;
+    }
+
+    function invalidateModalCache() {
+      cachedModal = null;
+      cachedModalAt = 0;
+    }
+
+    function resetFillGuards() {
+      lastFilledOrder = "";
+      claimsFillInFlight = false;
+      const btn = document.getElementById(`${uiPrefix}-btn`);
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = platform.buttonFill || "Fill Claims";
+      }
+    }
+
+    function findVisibleLabel(root, label) {
+      const wanted = normalizeKey(label);
+      let best = null;
+      let bestLen = Infinity;
+      const nodes = root.querySelectorAll("label, dt, th, td, strong, b, p, span, h1, h2, h3, h4, legend, li");
+      for (let i = 0; i < nodes.length; i++) {
+        const el = nodes[i];
+        if (!visible(el)) continue;
+        const text = ownText(el) || (el.children.length === 0 ? normalizeSpace(el.textContent) : "");
+        if (!text || text.length > 48) continue;
+        const key = normalizeKey(text);
+        if (key !== wanted && key !== `${wanted}*`) continue;
+        if (text.length <= bestLen && el.tagName !== "TH") {
+          best = el;
+          bestLen = text.length;
+        }
+      }
+      return best;
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* OpSpot modal discovery                                                 */
+    /* ---------------------------------------------------------------------- */
+
+    function getClaimsModal(force = false) {
+      const now = Date.now();
+      const cacheMs = workhorse.modalCacheMs != null ? workhorse.modalCacheMs : 800;
+      if (
+        !force &&
+        cachedModal &&
+        now - cachedModalAt < cacheMs &&
+        document.contains(cachedModal) &&
+        visible(cachedModal)
+      ) {
+        return cachedModal;
+      }
+
+      const candidates = document.querySelectorAll(
+        ".modal.show, .modal.in, [role='dialog'], .ew-modal, #ewModalDialog"
+      );
+      let best = null;
+      let bestArea = Infinity;
+
+      const consider = (el) => {
+        if (!el || !visible(el) || !el.querySelector("input, select, textarea")) return;
+        const text = el.innerText || "";
+        if (!/video submitted/i.test(text) || !/other reason/i.test(text)) return;
+        if (!/save and add new/i.test(text)) return;
+        const area = el.offsetWidth * el.offsetHeight;
+        if (area > 8000 && area < bestArea) {
+          best = el;
+          bestArea = area;
+        }
+      };
+
+      for (let i = 0; i < candidates.length; i++) consider(candidates[i]);
+
+      if (!best) {
+        const forms = document.getElementsByTagName("form");
+        for (let i = 0; i < forms.length; i++) consider(forms[i]);
+      }
+
+      if (!best) {
+        const buttons = document.querySelectorAll("button, input, a");
+        for (let i = 0; i < buttons.length; i++) {
+          const el = buttons[i];
+          if (!visible(el) || !/save and add new/i.test(normalizeSpace(el.textContent || el.value || ""))) continue;
+          let node = el.parentElement;
+          while (node) {
+            const text = node.innerText || "";
+            if (/video submitted/i.test(text) && /claim date/i.test(text) && node.querySelector("input, select, textarea")) {
+              best = node;
+              break;
+            }
+            node = node.parentElement;
+          }
+          if (best) break;
+        }
+      }
+
+      cachedModal = best;
+      cachedModalAt = now;
+      return best;
+    }
+
+    function closeOpenDropdowns() {
+      try {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      } catch {
+        /* ignore */
+      }
+      const $ = pageJQuery();
+      if ($) {
+        try {
+          $(".select2-hidden-accessible").each(function () {
+            try {
+              $(this).select2("close");
+            } catch {
+              /* ignore */
+            }
+          });
+        } catch {
+          /* ignore */
+        }
+      }
+      const search = document.querySelector(".select2-search__field");
+      if (search && search.blur) search.blur();
+    }
+
+    function findClaimsCancelButton(modal) {
+      if (!modal) return null;
+      return [...modal.querySelectorAll("button, input, a")].find((el) => {
+        if (!visible(el)) return false;
+        const text = normalizeSpace(el.textContent || el.value || "");
+        return /^cancel$/i.test(text);
+      });
+    }
+
+    function findPageAddNewButton() {
+      return [...document.querySelectorAll("a, button, input[type='button'], input[type='submit']")].find((el) => {
+        if (!visible(el)) return false;
+        const text = normalizeSpace(el.textContent || el.value || el.getAttribute("title") || "");
+        if (/save/i.test(text)) return false;
+        return /\badd new\b/i.test(text);
+      });
+    }
+
+    async function reopenClaimsModal() {
+      closeOpenDropdowns();
+      invalidateModalCache();
+      const modal = getClaimsModal(true);
+      const cancel = findClaimsCancelButton(modal);
+      if (cancel) safeClick(cancel);
+      else {
+        const dismiss = document.querySelector(".modal.show .close, .modal.in .close, [data-dismiss='modal']");
+        if (dismiss) safeClick(dismiss);
+      }
+
+      await waitUntil(() => !getClaimsModal(true), 2500, 40);
+
+      const addBtn = findPageAddNewButton();
+      if (addBtn) safeClick(addBtn);
+
+      invalidateModalCache();
+      return waitUntil(() => getClaimsModal(true), 3500, 40);
+    }
+
+    function getModalOrderNumber(modal) {
+      if (!modal) return "";
+      const L = workhorse.labels || {};
+      const found =
+        controlAfterLabel(modal, L.orderNumber || "Order Number") || controlByFieldName(modal, "Order Number");
+      const control = found && (found.control || controlForField(found.labelEl, found.row));
+      return control ? normalizeSpace(control.value) : "";
+    }
+
+    function isClaimsFormEmpty(modal) {
+      if (!modal) return false;
+      const orderNo = getModalOrderNumber(modal);
+      if (orderNo) return false;
+      const L = workhorse.labels || {};
+      const dateFound = controlAfterLabel(modal, L.claimDate || "Claim Date");
+      const dateControl = dateFound && (dateFound.control || controlForField(dateFound.labelEl, dateFound.row));
+      if (dateControl && normalizeSpace(dateControl.value)) return false;
+      return true;
+    }
+
+    function isSaveButton(el) {
+      if (!el || !visible(el)) return false;
+      const text = normalizeSpace(el.textContent || el.value || el.getAttribute("title") || "");
+      return /^save$/i.test(text) || /save\s+and\s+add\s+new/i.test(text);
+    }
+
+    async function waitForFreshClaimsForm(savedOrderNumber, hooks) {
+      pendingAutoFillAfterSave = true;
+
+      const isFreshModal = (modal) => {
+        if (!modal) return false;
+        if (isClaimsFormEmpty(modal)) return true;
+        const current = getModalOrderNumber(modal);
+        return current && savedOrderNumber && current !== savedOrderNumber;
+      };
+
+      const finishFresh = async () => {
+        saveInProgress = false;
+        pendingAutoFillAfterSave = false;
+        resetFillGuards();
+        const payload = await loadPayload();
+        if (payload && payload.orderNumber && payload.orderNumber !== savedOrderNumber) {
+          await applyPayloadToClaims(payload, { force: true, fast: true });
+          toast(`Ready — filled order ${payload.orderNumber}.`, "success", 3000);
+        } else {
+          toast("Ready for next order.", "success", 2500);
+          if (payload && payload.orderNumber === savedOrderNumber) {
+            const msg =
+              (hooks && hooks.onNeedNextExtractMessage) ||
+              "Run extract on the next refund first.";
+            toast(msg, "info", 5000);
+          }
+        }
+      };
+
+      await wait(80);
+
+      if (isFreshModal(getClaimsModal())) {
+        await finishFresh();
+        return;
+      }
+
+      toast("Opening next claim…", "info", 1500);
+      await reopenClaimsModal();
+
+      if (isFreshModal(getClaimsModal())) {
+        await finishFresh();
+        return;
+      }
+
+      await reopenClaimsModal();
+      if (isFreshModal(getClaimsModal())) {
+        await finishFresh();
+        return;
+      }
+
+      saveInProgress = false;
+      pendingAutoFillAfterSave = false;
+      resetFillGuards();
+      toast("Could not reset form. Click Cancel, then Add New.", "error", 6000);
+    }
+
+    function setupOpSpotSaveHooks(options = {}) {
+      if (!isOpSpotPage() || saveHooksInstalled) return;
+      saveHooksInstalled = true;
+      const hooks = options || {};
+      document.addEventListener(
+        "click",
+        (event) => {
+          const el = event.target.closest("button, input[type='button'], input[type='submit'], a");
+          if (!el || !isSaveButton(el)) return;
+
+          closeOpenDropdowns();
+          invalidateModalCache();
+          const modal = getClaimsModal(true);
+          const savedOrderNumber = getModalOrderNumber(modal);
+          const saveAndAddNew = /save\s+and\s+add\s+new/i.test(
+            normalizeSpace(el.textContent || el.value || "")
+          );
+
+          resetFillGuards();
+          saveInProgress = true;
+
+          if (saveAndAddNew) {
+            setTimeout(() => waitForFreshClaimsForm(savedOrderNumber, hooks), 300);
+          } else {
+            setTimeout(() => {
+              saveInProgress = false;
+            }, 3000);
+          }
+        },
+        true
+      );
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* Form field resolution / fill                                           */
+    /* ---------------------------------------------------------------------- */
+
+    function labelNearControl(control) {
+      if (control.labels && control.labels[0]) return normalizeKey(control.labels[0].innerText);
+      const aria = control.getAttribute("aria-label");
+      if (aria) return normalizeKey(aria);
+
+      const td = control.closest("td");
+      if (td && td.previousElementSibling) {
+        const prev = normalizeKey(td.previousElementSibling.innerText);
+        if (prev && prev.length < 60) return prev;
+      }
+
+      const wrap = control.closest("tr, .form-group, .mb-3, .ew-row, li") || control.parentElement;
+      if (wrap) {
+        const lab = [...wrap.querySelectorAll("label, .control-label, .col-form-label, td, span, div")].find((el) => {
+          if (el.contains(control)) return false;
+          const t = normalizeKey(el.innerText);
+          return t && t.length < 50 && t.length > 2;
+        });
+        if (lab) return normalizeKey(lab.innerText);
+      }
+
+      return normalizeKey((control.name || control.id || "").replace(/^x_/i, "").replace(/[_-]+/g, " "));
+    }
+
+    function collectFormFields(modal) {
+      const fields = [];
+      const controls = [...modal.querySelectorAll("input, select, textarea")].filter((el) => {
+        if (el.type === "hidden" || el.type === "submit" || el.type === "button") return false;
+        if (el.disabled) return false;
+        return true;
+      });
+      for (const control of controls) {
+        const label = labelNearControl(control);
+        if (!label) continue;
+        fields.push({
+          label,
+          row: control.closest("tr, .form-group, .mb-3, .ew-row, div") || control.parentElement,
+          control,
+          labelEl: (control.labels && control.labels[0]) || null,
+        });
+      }
+      return fields;
+    }
+
+    function matchFormField(fields, names) {
+      const wanted = names.map(normalizeKey);
+      return (
+        fields.find((f) => wanted.some((w) => f.label === w)) ||
+        fields.find((f) => wanted.some((w) => f.label.startsWith(`${w} `) || f.label.startsWith(`${w}*`))) ||
+        fields.find((f) => wanted.some((w) => f.label.includes(w) && w.length > 8))
+      );
+    }
+
+    function captionText(el) {
+      const own = ownText(el).replace(/\s*\*+\s*$/g, "");
+      if (own && own.length < 80) return normalizeKey(own);
+      const first = normalizeKey((el.innerText || "").split("\n")[0] || "");
+      if (first && first.length < 80) return first;
+      return "";
+    }
+
+    function captionMatches(el, label) {
+      const wanted = compactKey(label);
+      if (!wanted) return false;
+      return compactKey(captionText(el)) === wanted;
+    }
+
+    function fieldCaptionCount(el) {
+      const text = normalizeKey(el.innerText || "");
+      let count = 0;
+      for (let i = 0; i < FIELD_CAPTIONS.length; i++) {
+        if (text.includes(FIELD_CAPTIONS[i])) count += 1;
+      }
+      return count;
+    }
+
+    function isFillableControl(el) {
+      if (!el || el.disabled) return false;
+      if (el.type === "hidden" || el.type === "submit" || el.type === "button" || el.type === "file" || el.type === "reset") return false;
+      if (el.tagName === "SELECT") return true;
+      if (el.classList && el.classList.contains("select2-hidden-accessible")) return true;
+      return visible(el);
+    }
+
+    function controlCell(el) {
+      return (
+        (el && el.closest(".ew-cell, .ew-ctrl, .form-group, .mb-3, .col-sm-10, .col-sm-8, td, li")) ||
+        (el && el.parentElement)
+      );
+    }
+
+    function controlNearCaption(modal, cap) {
+      const inner = [...cap.querySelectorAll("input, select, textarea")].find(isFillableControl);
+      if (inner) return inner;
+
+      if (cap.getAttribute && cap.getAttribute("for")) {
+        try {
+          const byId = document.getElementById(cap.getAttribute("for"));
+          if (byId && modal.contains(byId) && isFillableControl(byId)) return byId;
+        } catch {
+          /* ignore */
+        }
+      }
+      if (cap.control && isFillableControl(cap.control)) return cap.control;
+
+      let sib = cap.nextElementSibling;
+      while (sib) {
+        if (sib.matches && sib.matches("input, select, textarea") && isFillableControl(sib)) return sib;
+        const nested = sib.querySelector && [...sib.querySelectorAll("input, select, textarea")].find(isFillableControl);
+        if (nested) return nested;
+        sib = sib.nextElementSibling;
+      }
+
+      const td = cap.closest("td, th");
+      if (td && td.nextElementSibling) {
+        const inNext = [...td.nextElementSibling.querySelectorAll("input, select, textarea")].find(isFillableControl);
+        if (inNext) return inNext;
+      }
+
+      const group = cap.closest(".form-group, .mb-3, .ew-cell, .ew-ctrl, li") || cap.parentElement;
+      if (group && fieldCaptionCount(group) <= 1) {
+        const inGroup = [...group.querySelectorAll("input, select, textarea")].find(isFillableControl);
+        if (inGroup) return inGroup;
+      }
+
+      const lr = cap.getBoundingClientRect();
+      let best = null;
+      let bestScore = Infinity;
+      for (const el of modal.querySelectorAll("input, select, textarea")) {
+        if (!isFillableControl(el)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 && el.tagName !== "SELECT") continue;
+        const midY = (lr.top + lr.bottom) / 2;
+        const sameRow = r.top < midY + 16 && r.bottom > midY - 16;
+        const below = r.top >= lr.top - 2 && r.top <= lr.bottom + 56;
+        const toRight = r.left >= lr.left - 4;
+        if (!(sameRow || below) || !toRight) continue;
+        if (sameRow && r.right < lr.left) continue;
+        const dx = Math.max(0, r.left - lr.right);
+        const dy = Math.max(0, r.top - lr.bottom);
+        const score = sameRow ? dx : dy + 40;
+        if (score < bestScore) {
+          best = el;
+          bestScore = score;
+        }
+      }
+      return bestScore < 280 ? best : null;
+    }
+
+    function controlByFieldName(modal, label) {
+      const wanted = compactKey(label);
+      if (wanted.length < 5) return null;
+      const aliases = {
+        ordernumber: ["ordernumber", "orderno", "orderid", "ordernum", "ordernumber"],
+        ordervalue: ["ordervalue", "ordertotal", "orderval", "ordervalue"],
+        disputeamount: ["disputeamount", "refundvalue", "refundamount", "disputeamt"],
+        footagestatus: ["footagestatus", "footage"],
+        wrongmissingorincorrectfooditem: ["fooditem", "wrongmissing", "incorrectfood", "missingitem", "wrongfood"],
+        whywastheitempreparedincorrectly: ["preparedincorrectly", "whywas", "preparedwhy", "itemprepared"],
+      };
+      const keys = aliases[wanted] || [wanted];
+      const preferText = /ordernumber|ordervalue|disputeamount/i.test(wanted);
+      const controls = [...modal.querySelectorAll("input, select, textarea")].filter((el) => {
+        if (!isFillableControl(el)) return false;
+        if (!modal.contains(el)) return false;
+        const raw = `${el.name || ""} ${el.id || ""} ${el.getAttribute("data-field") || ""} ${el.getAttribute("data-name") || ""}`;
+        const key = compactKey(raw);
+        return keys.some((alias) => key.includes(alias));
+      });
+      if (!controls.length) return null;
+      if (preferText) {
+        return controls.find((el) => el.tagName === "INPUT" || el.tagName === "TEXTAREA") || controls[0];
+      }
+      return controls[0];
+    }
+
+    function controlAfterLabel(modal, label) {
+      const wanted = normalizeKey(label);
+      const nodes = [...modal.querySelectorAll("label, .ew-label, .col-form-label, td, th, span, div, p, strong, b, legend, li")];
+      const matches = nodes.filter((el) => {
+        if (el.closest("thead")) return false;
+        if (!visible(el) && el.tagName !== "LABEL") return false;
+        if (!captionMatches(el, label)) return false;
+        return fieldCaptionCount(el) <= 1;
+      });
+      matches.sort((a, b) => {
+        const tagScore = (el) => (el.tagName === "LABEL" || el.classList.contains("ew-label") ? 0 : 1);
+        const area = (el) => {
+          const r = el.getBoundingClientRect();
+          return Math.max(1, r.width * r.height);
+        };
+        return tagScore(a) - tagScore(b) || area(a) - area(b);
+      });
+
+      for (const labelEl of matches) {
+        const control = controlNearCaption(modal, labelEl);
+        if (!control) continue;
+        return {
+          label: wanted,
+          labelEl,
+          row: controlCell(control) || labelEl,
+          control,
+        };
+      }
+
+      const named = controlByFieldName(modal, label);
+      if (named) {
+        return {
+          label: wanted,
+          labelEl: null,
+          row: controlCell(named),
+          control: named,
+        };
+      }
+      return null;
+    }
+
+    function fieldRow(modal, label) {
+      const labelEl = findVisibleLabel(modal, label) || findVisibleLabel(modal, `${label}*`);
+      if (!labelEl) return null;
+
+      const candidates = [
+        labelEl.closest("tr"),
+        labelEl.closest(".form-group, .mb-3, .ew-row, .ew-cell"),
+        labelEl.parentElement,
+        labelEl.closest(".row"),
+      ].filter(Boolean);
+
+      for (const row of candidates) {
+        const tooWide = (row.innerText.match(/Claim Date|Customer|Location|Platform|Outcome|Footage Status/gi) || []).length > 3;
+        if (tooWide) continue;
+        if (row.querySelector("select, input, textarea, .select2-container, .select2")) {
+          return { labelEl, row };
+        }
+      }
+      return { labelEl, row: labelEl.parentElement };
+    }
+
+    function controlForField(labelEl, row, preferInput = false) {
+      const forId = labelEl && labelEl.getAttribute && labelEl.getAttribute("for");
+      if (forId) {
+        try {
+          const byId = document.getElementById(forId);
+          if (byId) return byId;
+        } catch {
+          /* ignore */
+        }
+      }
+      if (labelEl && labelEl.control) return labelEl.control;
+
+      const roots = [labelEl && labelEl.nextElementSibling, row, labelEl && labelEl.parentElement].filter(Boolean);
+      const pick = (root) => {
+        if (preferInput) {
+          const input = [...root.querySelectorAll("input:not([type='hidden'])")].find(visible);
+          if (input) return input;
+          const area = root.querySelector("textarea");
+          if (area) return area;
+        }
+        const select = root.querySelector("select");
+        if (select && !preferInput) return select;
+        const area = root.querySelector("textarea");
+        if (area) return area;
+        const input = [...root.querySelectorAll("input:not([type='hidden'])")].find(visible);
+        if (input) return input;
+        if (preferInput && select) return select;
+        return null;
+      };
+      for (const root of roots) {
+        const found = pick(root);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    function dispatch(el) {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new Event("blur", { bubbles: true }));
+    }
+
+    function setInputValue(el, value, opts = {}) {
+      const text = String(value);
+      const fast = opts.skipFocus || fastFillMode || workhorse.fastFill;
+      if (!fast) el.focus();
+      const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, "value");
+      if (desc && desc.set) desc.set.call(el, text);
+      else el.value = text;
+      try {
+        el.setAttribute("value", text);
+      } catch {
+        /* ignore */
+      }
+      dispatch(el);
+      const $ = pageJQuery();
+      if ($) {
+        try {
+          $(el).val(text).trigger("input").trigger("change").trigger("blur");
+        } catch {
+          /* ignore */
+        }
+      }
+      if (el.value !== text) {
+        if (fast) {
+          el.value = text;
+          dispatch(el);
+        } else {
+          try {
+            el.select();
+            document.execCommand("insertText", false, text);
+          } catch {
+            el.value = text;
+            dispatch(el);
+          }
+        }
+      }
+    }
+
+    function bestOption(select, value) {
+      const wanted = normalizeKey(value).replace(/[®™©]/g, "");
+      const compact = compactKey(value).replace(/[®™©]/g, "");
+      let best = null;
+      let score = 0;
+      for (const opt of select.options) {
+        const t = normalizeKey(opt.textContent).replace(/[®™©]/g, "");
+        const v = normalizeKey(opt.value).replace(/[®™©]/g, "");
+        const tc = compactKey(opt.textContent).replace(/[®™©]/g, "");
+        let s = 0;
+        if (!t || /^(select|-|please select)$/i.test(t)) continue;
+        if (t === wanted || v === wanted || tc === compact) s = 100;
+        else if (t.startsWith(wanted) || wanted.startsWith(t)) s = 80;
+        else if (t.includes(wanted) || wanted.includes(t)) s = 55;
+        else if (wanted.split(/\s+/).every((w) => w.length > 3 && t.includes(w))) s = 50;
+        else if (/irrelevant/.test(wanted) && /irrelevant/.test(t)) s = 90;
+        else if (/(3rd|third)\s*party/.test(wanted) && /(3rd|third)\s*party/.test(t)) s = 90;
+        if (s > score) {
+          best = opt;
+          score = s;
+        }
+      }
+      return score >= 45 ? best : null;
+    }
+
+    function clickMatchingMenuItem(value) {
+      const wanted = normalizeKey(value).replace(/[®™©]/g, "");
+      const options = [...document.querySelectorAll(
+        ".select2-results__option, .dropdown-item, [role='option'], .select2-result-label, li"
+      )].filter((el) => visible(el) && normalizeSpace(el.textContent).length < 120);
+
+      const match = options.find((el) => {
+        const t = normalizeKey(el.textContent).replace(/[®™©]/g, "");
+        if (t === wanted) return true;
+        if (t.includes(wanted) || wanted.includes(t)) return true;
+        return false;
+      });
+      if (!match) return false;
+      safeClick(match);
+      return true;
+    }
+
+    async function fillSelect(select, value, row) {
+      const fast = fastFillMode || workhorse.fastFill;
+      const pause = fast ? 35 : 80;
+      const nativeSelect = select && select.tagName === "SELECT" ? select : (row && row.querySelector("select"));
+      const option = nativeSelect ? bestOption(nativeSelect, value) : null;
+      const $ = pageJQuery();
+      const root = controlCell(nativeSelect || select) || row;
+
+      if (nativeSelect && option) {
+        nativeSelect.value = option.value;
+        nativeSelect.dispatchEvent(new Event("input", { bubbles: true }));
+        nativeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+        if ($) {
+          try {
+            $(nativeSelect).val(String(option.value)).trigger("change").trigger("select2:select");
+          } catch {
+            /* ignore */
+          }
+        }
+        const rendered = root && root.querySelector(".select2-selection__rendered");
+        if (rendered && option.textContent) rendered.textContent = normalizeSpace(option.textContent);
+        if (nativeSelect.value === option.value) return true;
+      }
+
+      const box =
+        (root && root.querySelector(".select2-selection, .select2-container, .dropdown-toggle")) ||
+        (nativeSelect && nativeSelect.parentElement && nativeSelect.parentElement.querySelector(".select2-selection, .select2-container")) ||
+        nativeSelect ||
+        select;
+      if (box) {
+        safeClick(box);
+        await wait(pause);
+      }
+
+      const clean = String(value).replace(/[®™©]/g, "").trim();
+      const searchTerms = [clean, value].filter(Boolean);
+      if (/irrelevant/i.test(String(value))) searchTerms.unshift("irrelevant");
+      if (/(3rd|third)\s*party/i.test(String(value))) searchTerms.unshift("3rd party");
+      const firstWord = clean.split(/\s+/)[0];
+      if (firstWord && firstWord.length > 3 && !searchTerms.includes(firstWord)) searchTerms.push(firstWord);
+
+      const search = document.querySelector(".select2-search__field, .dropdown-menu input, input[type='search']");
+      for (const term of searchTerms) {
+        if (search) {
+          search.focus();
+          setInputValue(search, term, { skipFocus: false });
+          search.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Enter" }));
+          await wait(pause);
+        }
+        if (await clickMatchingMenuItem(term)) return true;
+      }
+
+      if (search) {
+        search.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
+        await wait(pause);
+      }
+
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      return Boolean(nativeSelect && option && nativeSelect.value === option.value);
+    }
+
+    function fillYesNo(row, value) {
+      const wanted = normalizeKey(value);
+      const radio = [...row.querySelectorAll("input[type='radio']")].find((el) => {
+        const lab = el.closest("label") || (el.id && row.querySelector(`label[for='${el.id}']`));
+        return normalizeKey((lab && lab.textContent) || el.value) === wanted;
+      });
+      if (radio) {
+        radio.click();
+        radio.checked = true;
+        dispatch(radio);
+        return true;
+      }
+      const btn = [...row.querySelectorAll("button, label, span, a, div")].find((el) => {
+        return visible(el) && normalizeKey(el.textContent) === wanted && normalizeSpace(el.textContent).length <= 4;
+      });
+      if (btn) {
+        btn.click();
+        return true;
+      }
+      return false;
+    }
+
+    function resolveFormField(modal, label, fields) {
+      const preferText = /order number|order value|dispute amount/i.test(label);
+
+      if (preferText) {
+        const named = controlByFieldName(modal, label);
+        if (named && (named.tagName === "INPUT" || named.tagName === "TEXTAREA")) {
+          return {
+            label: normalizeKey(label),
+            labelEl: null,
+            row: controlCell(named),
+            control: named,
+          };
+        }
+        const byLabel = controlAfterLabel(modal, label);
+        if (byLabel && byLabel.control && byLabel.control.tagName !== "SELECT") return byLabel;
+        if (byLabel && byLabel.control && byLabel.control.tagName === "SELECT" && named) {
+          return {
+            label: normalizeKey(label),
+            labelEl: byLabel.labelEl,
+            row: controlCell(named),
+            control: named,
+          };
+        }
+      }
+
+      let found = matchFormField(fields, [label, `${label}*`]);
+      if (found && preferText && found.control && found.control.tagName === "SELECT") {
+        found = null;
+      }
+      if (found) return found;
+
+      found = controlAfterLabel(modal, label);
+      if (found && preferText && found.control && found.control.tagName === "SELECT") {
+        const named = controlByFieldName(modal, label);
+        if (named) {
+          return {
+            label: normalizeKey(label),
+            labelEl: found.labelEl,
+            row: controlCell(named),
+            control: named,
+          };
+        }
+      }
+      if (found) return found;
+
+      const rowInfo = fieldRow(modal, label);
+      if (rowInfo) {
+        const control = controlForField(rowInfo.labelEl, rowInfo.row, preferText);
+        if (control) {
+          return {
+            label: normalizeKey(label),
+            labelEl: rowInfo.labelEl,
+            row: rowInfo.row,
+            control,
+          };
+        }
+        return rowInfo;
+      }
+
+      const named = controlByFieldName(modal, label);
+      if (named) {
+        return {
+          label: normalizeKey(label),
+          labelEl: null,
+          row: controlCell(named),
+          control: named,
+        };
+      }
+      return null;
+    }
+
+    async function fillLabeledField(modal, label, value, extras = {}, fieldIndex = null) {
+      if (value == null || value === "") return { ok: false, reason: "empty" };
+      const fields = fieldIndex || collectFormFields(modal);
+      const found = resolveFormField(modal, label, fields);
+      if (!found) return { ok: false, reason: "label not on screen" };
+
+      const row = found.row;
+      const labelEl = found.labelEl;
+      if (labelEl) labelEl.classList.add(hitClass);
+
+      if (/video submitted/i.test(label)) return { ok: fillYesNo(row, value), method: "yes-no" };
+
+      let control = found.control || controlForField(labelEl, row, /order number|order value|dispute amount/i.test(label));
+      if (/order number|order value|dispute amount/i.test(label)) {
+        const named = controlByFieldName(modal, label);
+        if (named && (named.tagName === "INPUT" || named.tagName === "TEXTAREA")) control = named;
+        else if (control && control.tagName === "SELECT") control = named || control;
+      }
+      if (!control) {
+        const box = row && row.querySelector(".select2-selection, .select2-container");
+        if (box) {
+          const ok = await fillSelect(row.querySelector("select") || box, value, row);
+          return { ok, method: "select2-only" };
+        }
+        return { ok: false, reason: "no control next to label" };
+      }
+      control.classList.add(hitClass);
+
+      if (control.tagName === "SELECT") return { ok: await fillSelect(control, value, controlCell(control) || row), method: "select" };
+      if (control.type === "date") {
+        setInputValue(control, extras.iso || value);
+        return { ok: true, method: "date" };
+      }
+      if (control.type === "time") {
+        setInputValue(control, extractTime(value));
+        return { ok: true, method: "time" };
+      }
+      if (control.type === "radio") return { ok: fillYesNo(row, value), method: "radio" };
+
+      const written = extras.dmy && /date/i.test(label) ? extras.dmy : value;
+      setInputValue(control, written, { skipFocus: false });
+      const $ = pageJQuery();
+      if ($ && $(control).data("datepicker")) {
+        try {
+          $(control).datepicker("update", written);
+        } catch {
+          /* ignore */
+        }
+      }
+      const stuck = String(control.value || "").replace(/,/g, "") === String(written).replace(/,/g, "") ||
+        String(control.value || "").includes(String(written));
+      return { ok: stuck || Boolean(control.value), method: "input", reason: stuck ? "" : "value did not stick" };
+    }
+
+    async function ensureClaimsModal() {
+      const cached = getClaimsModal();
+      if (cached) return cached;
+
+      if (saveInProgress || pendingAutoFillAfterSave) {
+        return waitUntil(() => getClaimsModal(true), 8000, 40);
+      }
+
+      const addBtn = findPageAddNewButton();
+      if (addBtn) {
+        addBtn.click();
+        toast("Opening Add New…", "info", 2000);
+      }
+
+      return waitUntil(() => getClaimsModal(true), 10000, 80);
+    }
+
+    async function fillClaimsForm(payload, options = {}) {
+      const modal = await ensureClaimsModal();
+      if (!modal) {
+        throw new Error(`Click the green Add New button, then click ${platform.buttonFill || "Fill"}.`);
+      }
+
+      const L = workhorse.labels || {};
+      const results = {};
+      let fieldIndex = collectFormFields(modal);
+      const fast = options.fast || fastFillMode || workhorse.fastFill;
+
+      const defaultFills = [
+        { key: "claimDate", labelKey: "claimDate", from: "claimDateDash", extras: "claimDate" },
+        { key: "orderTime", labelKey: "orderTime", from: "orderTime" },
+        { key: "customer", labelKey: "customer", from: "customer" },
+        { key: "location", labelKey: "location", from: "location" },
+        { key: "platform", labelKey: "platform", from: "platform" },
+        { key: "orderNumber", labelKey: "orderNumber", from: "orderNumber" },
+        { key: "orderValue", labelKey: "orderValue", from: "orderValue" },
+        { key: "disputeAmount", labelKey: "disputeAmount", from: "disputeAmount" },
+        { key: "outcome", labelKey: "outcome", from: "outcome" },
+        { key: "videoSubmitted", labelKey: "videoSubmitted", from: "videoSubmitted" },
+        { key: "reasonForDispute", labelKey: "reasonForDispute", from: "reasonForDispute" },
+        { key: "footageStatus", labelKey: "footageStatus", from: "footageStatus" },
+        { key: "preparedIncorrectlyWhy", labelKey: "preparedIncorrectlyWhy", from: "preparedIncorrectlyWhy", when: "hasPreparedIncorrectlyWhy" },
+        { key: "wrongFoodItem", labelKey: "wrongFoodItem", from: "wrongFoodItem", when: "hasWrongFoodItem" },
+        { key: "reason", labelKey: "reason", from: "reason", when: "hasReason" },
+        { key: "otherReason", labelKey: "otherReason", from: "otherReason" },
+      ];
+      const fillList = Array.isArray(workhorse.fills) && workhorse.fills.length ? workhorse.fills : defaultFills;
+
+      const defaultLabels = {
+        claimDate: "Claim Date",
+        orderTime: "Order Time",
+        customer: "Customer",
+        location: "Location",
+        platform: "Platform",
+        orderNumber: "Order Number",
+        orderValue: "Order Value",
+        disputeAmount: "Dispute Amount",
+        outcome: "Outcome",
+        videoSubmitted: "Video Submitted",
+        reasonForDispute: "Reason for Dispute",
+        reason: "Reason",
+        footageStatus: "Footage Status",
+        otherReason: "Other reason",
+        wrongFoodItem: "Wrong, Missing or Incorrect Food Item",
+        preparedIncorrectlyWhy: "Why was the Item Prepared Incorrectly?",
+      };
+
+      const gates = {
+        hasPreparedIncorrectlyWhy: !!payload.preparedIncorrectlyWhy,
+        hasWrongFoodItem: !payload.preparedIncorrectlyWhy && !!payload.wrongFoodItem,
+        hasReason: !!payload.reason,
+      };
+
+      for (const fill of fillList) {
+        if (fill.when && !gates[fill.when]) continue;
+
+        const label = L[fill.labelKey] || defaultLabels[fill.labelKey] || fill.labelKey;
+        let value = payload[fill.from];
+        let extras = {};
+
+        if (fill.extras === "claimDate") {
+          extras = {
+            iso: payload.claimDateISO,
+            dmy: payload.claimDateDash || payload.claimDateDMY,
+          };
+          value = payload.claimDateDash || payload.claimDateDMY;
+        }
+
+        if (value == null || value === "") {
+          results[label] = { ok: false, reason: "empty" };
+          continue;
+        }
+
+        try {
+          if (fill.key === "reason" || label === (L.reason || defaultLabels.reason)) {
+            await waitUntil(() => {
+              fieldIndex = collectFormFields(modal);
+              return matchFormField(fieldIndex, [L.reason || "Reason", `${L.reason || "Reason"}*`]);
+            }, fast ? 700 : 2500, fast ? 25 : 50);
+          }
+          results[label] = await fillLabeledField(modal, label, value, extras, fieldIndex);
+        } catch (err) {
+          log("Field fill error", label, err);
+          results[label] = { ok: false, reason: String(err && err.message ? err.message : err) };
+        }
+
+        if (
+          (fill.key === "reasonForDispute" || /reason for dispute/i.test(label)) &&
+          (payload.preparedIncorrectlyWhy || payload.reason || /other/i.test(String(payload.reasonForDispute || "")))
+        ) {
+          if (!fast) await wait(150);
+          else fieldIndex = collectFormFields(modal);
+        }
+
+        if ((!results[label] || !results[label].ok) && /reason for dispute/i.test(label) && /other/i.test(String(value || ""))) {
+          for (const alt of ["Other", "Others", "other", "others"]) {
+            if (alt === value) continue;
+            results[label] = await fillLabeledField(modal, label, alt, {}, fieldIndex);
+            if (results[label].ok) break;
+          }
+        }
+        if ((!results[label] || !results[label].ok) && /prepared incorrectly/i.test(label)) {
+          for (const alt of ["Others", "Other", "others", "other"]) {
+            if (alt === value) continue;
+            results[label] = await fillLabeledField(modal, label, alt, {}, fieldIndex);
+            if (results[label].ok) break;
+          }
+        }
+        if ((!results[label] || !results[label].ok) && /wrong, missing/i.test(label)) {
+          const tries = [
+            ...((payload.items || []).map((item) => item && item.name)),
+            String(payload.otherReason || "").split("\n")[0],
+            payload.otherReason,
+          ].filter((v, i, arr) => v && arr.indexOf(v) === i);
+          for (const alt of tries) {
+            if (alt === value) continue;
+            results[label] = await fillLabeledField(modal, label, alt, {}, fieldIndex);
+            if (results[label].ok) break;
+          }
+        }
+      }
+
+      log("Fill results", results);
+      return results;
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* Transfer / UI / Sheet                                                  */
+    /* ---------------------------------------------------------------------- */
+
+    function ensureStyles() {
+      if (stylesInjected) return;
+      stylesInjected = true;
+      const rgba = hexToRgba(hitColor, 0.12);
+      addStyle(`
+      .${hitClass} { outline: 2px solid ${hitColor} !important; outline-offset: 2px; background: ${rgba} !important; }
+      #${uiPrefix}-btn-bar {
+        position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+        z-index: 2147483647; display: flex; gap: 8px; align-items: center;
+      }
+      #${uiPrefix}-btn, #${uiPrefix}-sheet-btn {
+        background: ${hitColor}; color: #06221f; border: 0; cursor: pointer;
+        border-radius: 999px; padding: 12px 22px;
+        box-shadow: 0 10px 30px rgba(0,0,0,.35);
+        font: 700 15px/1.2 Segoe UI, system-ui, sans-serif;
+      }
+      #${uiPrefix}-sheet-btn { background: #0f766e; color: #ecfdf5; }
+      #${uiPrefix}-btn:hover, #${uiPrefix}-sheet-btn:hover { background: #111827; color: #fff; }
+      #${uiPrefix}-btn:disabled, #${uiPrefix}-sheet-btn:disabled { opacity: .65; cursor: wait; }
+      #${uiPrefix}-toast, #${uiPrefix}-preview {
+        position: fixed; top: 64px; right: 18px; z-index: 2147483646;
+        max-width: 380px; border-radius: 12px; padding: 12px 14px;
+        box-shadow: 0 10px 30px rgba(0,0,0,.28);
+        font: 13px/1.45 Segoe UI, system-ui, sans-serif;
+      }
+      #${uiPrefix}-toast { background: #111827; color: #f9fafb; }
+      #${uiPrefix}-toast.error { background: #7f1d1d; }
+      #${uiPrefix}-toast.success { background: #065f46; }
+      #${uiPrefix}-preview { background: #fff; color: #111827; width: 380px; max-height: 70vh; overflow: auto; }
+      #${uiPrefix}-preview h3 { margin: 0 0 8px; font-size: 14px; }
+      #${uiPrefix}-preview table { width: 100%; border-collapse: collapse; }
+      #${uiPrefix}-preview td { padding: 4px 0; vertical-align: top; }
+      #${uiPrefix}-preview td:first-child { color: #6b7280; width: 44%; padding-right: 8px; }
+      #${uiPrefix}-preview .missing { color: #b91c1c; }
+    `);
+    }
+
+    function toast(message, kind = "info", ms = 4500) {
+      const id = `${uiPrefix}-toast`;
+      const existing = document.getElementById(id);
+      if (existing) existing.remove();
+      const el = document.createElement("div");
+      el.id = id;
+      el.className = kind;
+      el.textContent = message;
+      document.body.appendChild(el);
+      setTimeout(() => el.remove(), ms);
+    }
+
+    function showPreview(payload) {
+      const id = `${uiPrefix}-preview`;
+      const existing = document.getElementById(id);
+      if (existing) existing.remove();
+      const el = document.createElement("div");
+      el.id = id;
+      const rows = [
+        ["Claim Date", payload.claimDate],
+        ["Order Time", payload.orderTime],
+        ["Customer", payload.customer],
+        ["Location", payload.location],
+        ["Platform", payload.platform],
+        ["Order Number", payload.orderNumber],
+        ["Order Value", payload.orderValue],
+        ["Dispute Amount", payload.disputeAmount],
+        ["Outcome", payload.outcome],
+        ["Video Submitted", payload.videoSubmitted],
+        ["Reason for Dispute", payload.reasonForDispute],
+        ["Reason", payload.reason],
+        ["Footage Status", payload.footageStatus],
+        ["Why was the Item Prepared Incorrectly?", payload.preparedIncorrectlyWhy],
+        ["Wrong, Missing or Incorrect Food Item", payload.wrongFoodItem],
+        ["Other reason", payload.otherReason],
+        ["Contested / Disputed", payload.alreadyDisputed ? "Yes" : "No"],
+      ]
+        .map(([k, v]) => `<tr><td>${k}</td><td class="${v ? "" : "missing"}">${escapeHtml(v || "NOT FOUND")}</td></tr>`)
+        .join("");
+      el.innerHTML = `<h3>Read from screen</h3><table>${rows}</table>`;
+      document.body.appendChild(el);
+      setTimeout(() => el.remove(), 12000);
+    }
+
+    function ensureButtonBar() {
+      ensureStyles();
+      const id = `${uiPrefix}-btn-bar`;
+      let bar = document.getElementById(id);
+      if (!bar) {
+        bar = document.createElement("div");
+        bar.id = id;
+        (document.body || document.documentElement).appendChild(bar);
+      }
+      return bar;
+    }
+
+    function injectButton(id, text, onClick) {
+      const bar = ensureButtonBar();
+      let btn = document.getElementById(id);
+      if (!btn) {
+        btn = document.createElement("button");
+        btn.id = id;
+        btn.type = "button";
+        bar.appendChild(btn);
+      }
+      if (btn.textContent !== text) btn.textContent = text;
+      btn.onclick = onClick;
+      return btn;
+    }
+
+    function savePayload(payload) {
+      const key = platform.storageKey;
+      const prefix = platform.clipPrefix || "";
+      try {
+        if (typeof GM_setValue === "function") GM_setValue(key, payload);
+      } catch (err) {
+        log("GM_setValue failed", err);
+      }
+      try {
+        if (typeof GM !== "undefined" && GM.setValue) GM.setValue(key, payload);
+      } catch (err) {
+        log("GM.setValue failed", err);
+      }
+      try {
+        if (typeof GM_setClipboard === "function") GM_setClipboard(prefix + JSON.stringify(payload));
+      } catch (err) {
+        log("clipboard failed", err);
+      }
+    }
+
+    async function loadPayload() {
+      const key = platform.storageKey;
+      const prefix = platform.clipPrefix || "";
+      let payload = null;
+      try {
+        if (typeof GM_getValue === "function") payload = GM_getValue(key, null);
+      } catch (err) {
+        log("GM_getValue failed", err);
+      }
+      if (payload && payload.orderNumber) return payload;
+      try {
+        if (typeof GM !== "undefined" && GM.getValue) payload = await GM.getValue(key, null);
+      } catch (err) {
+        log("GM.getValue failed", err);
+      }
+      if (payload && payload.orderNumber) return payload;
+      try {
+        const text = await navigator.clipboard.readText();
+        if (!text) return null;
+        if (prefix && text.startsWith(prefix)) return JSON.parse(text.slice(prefix.length));
+        if (text.trim().startsWith("{")) {
+          const parsed = JSON.parse(text);
+          if (parsed.orderNumber) return parsed;
+        }
+      } catch (err) {
+        log("clipboard read failed", err);
+      }
+      return null;
+    }
+
+    function resolveSheetTab(payload) {
+      const sheet = platform.sheet || {};
+      const haystack = [payload.customer, payload.location, payload.brand]
+        .filter(Boolean)
+        .join(" ");
+      for (const rule of sheet.branchSheetTabs || []) {
+        const re = compiledRegex(ruleRegexCache, rule.match, "i");
+        if (re && re.test(haystack)) return rule.tab;
+      }
+      return sheet.defaultSheetTab || "";
+    }
+
+    function toDayMonthYear(payload) {
+      if (payload.claimDateDash && /^\d{2}-\d{2}-\d{4}$/.test(payload.claimDateDash)) {
+        return payload.claimDateDash;
+      }
+      const parsed = parseClaimDate(payload.claimDateDash || payload.claimDateDMY || payload.claimDate || "");
+      return parsed.dash || "";
+    }
+
+    function sheetCell(value) {
+      const text = String(value == null ? "" : value).replace(/\r\n/g, " ").replace(/\t/g, " ").trim();
+      if (/["\n]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
+      return text;
+    }
+
+    function sheetRefundReason(payload) {
+      // Prefer resolved Workhorse reason (includes user incomplete → Incorrect Item maps)
+      const mapped = normalizeSpace(
+        payload.reasonForDispute ||
+          mapReasonForDispute(canonicalizeReason(payload.refundReasonRaw || payload.refundReason || "")) ||
+          mapReasonForDispute(normalizeKey(payload.refundReasonRaw || payload.refundReason || "")) ||
+          ""
+      );
+
+      const overrides = (platform.sheet && platform.sheet.refundReasonOverrides) || [];
+      for (const rule of overrides) {
+        const re = compiledRegex(ruleRegexCache, rule.test, "i");
+        // Only rewrite from the resolved Workhorse reason — never re-apply raw
+        // Deliveroo "incomplete" → Missing Items after the user mapped it to Incorrect Item.
+        if (re && mapped && re.test(mapped)) return rule.value;
+      }
+
+      if (mapped) return mapped;
+
+      const raw = normalizeSpace(payload.refundReasonRaw || payload.refundReason || "");
+      if (/incomplete/i.test(raw)) return "Incorrect Item";
+      return raw;
+    }
+
+    function buildGoogleSheetRow(payload) {
+      const sheet = platform.sheet || {};
+      if (!sheet.enabled || !sheet.columns) return "";
+      const date = toDayMonthYear(payload);
+      const row = {
+        Date: date ? `'${date}` : "",
+        Location: payload.location || "",
+        "# Order Number": payload.orderNumber || "",
+        "Refund Reason": sheetRefundReason(payload),
+        "With Video?": payload.videoSubmitted || workhorse.videoSubmitted || "No",
+        "Footage Status": payload.footageStatus || "",
+        Comments: "",
+      };
+      return sheet.columns.map((header) => sheetCell(row[header])).join("\t");
+    }
+
+    function buildSheetTransfer(payload) {
+      return {
+        extractedAt: new Date().toISOString(),
+        tab: resolveSheetTab(payload),
+        row: buildGoogleSheetRow(payload),
+        orderNumber: payload.orderNumber || "",
+        customer: payload.customer || "",
+        location: payload.location || "",
+        payload,
+      };
+    }
+
+    function saveSheetTransfer(transfer) {
+      const key = platform.sheetStorageKey;
+      if (!key) return;
+      try {
+        if (typeof GM_setValue === "function") GM_setValue(key, transfer);
+      } catch (err) {
+        log("sheet GM_setValue failed", err);
+      }
+      try {
+        if (typeof GM !== "undefined" && GM.setValue) GM.setValue(key, transfer);
+      } catch (err) {
+        log("sheet GM.setValue failed", err);
+      }
+    }
+
+    async function loadSheetTransfer() {
+      const key = platform.sheetStorageKey;
+      if (!key) return null;
+      let transfer = null;
+      try {
+        if (typeof GM_getValue === "function") transfer = GM_getValue(key, null);
+      } catch (err) {
+        log("sheet GM_getValue failed", err);
+      }
+      if (transfer && transfer.row) return transfer;
+      try {
+        if (typeof GM !== "undefined" && GM.getValue) transfer = await GM.getValue(key, null);
+      } catch (err) {
+        log("sheet GM.getValue failed", err);
+      }
+      return transfer && transfer.row ? transfer : null;
+    }
+
+    function findGoogleSheetTabButton(tabName) {
+      if (!tabName) return null;
+      const wanted = normalizeKey(tabName);
+      const nodes = [
+        ...document.querySelectorAll(".docs-sheet-tab, .docs-sheet-tab-name, [role='tab'], .docs-sheet-container .docs-sheet-tab-caption"),
+      ];
+      for (let i = 0; i < nodes.length; i++) {
+        const el = nodes[i];
+        const text = normalizeSpace(el.textContent || el.getAttribute("aria-label") || "");
+        if (!text) continue;
+        const key = normalizeKey(text);
+        if (key === wanted || key.includes(wanted) || wanted.includes(key)) {
+          return el.closest(".docs-sheet-tab") || el;
+        }
+      }
+      return null;
+    }
+
+    async function activateGoogleSheetTab(tabName) {
+      if (!tabName) return { ok: false, reason: "No branch tab matched" };
+      const tabBtn = await waitUntil(() => findGoogleSheetTabButton(tabName), 4000, 100);
+      if (!tabBtn) return { ok: false, reason: `Tab "${tabName}" not found` };
+      safeClick(tabBtn);
+      await wait(120);
+      return { ok: true, reason: "" };
+    }
+
+    function focusSheetPasteCell() {
+      const canvas = document.querySelector(".grid-container, .waffle, .docs-texteventtarget-iframe, .cell-input");
+      if (canvas) safeClick(canvas);
+      const editable = document.querySelector(".cell-input, [contenteditable='true'], .grid-container");
+      if (editable && editable.focus) editable.focus();
+    }
+
+    function copyTextToClipboard(text) {
+      try {
+        if (typeof GM_setClipboard === "function") {
+          GM_setClipboard(text);
+          return true;
+        }
+      } catch (err) {
+        log("GM_setClipboard failed", err);
+      }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch (err) {
+        log("navigator clipboard failed", err);
+      }
+      return false;
+    }
+
+    async function applyPayloadToClaims(payload, options = {}) {
+      if (!payload || !payload.orderNumber) {
+        toast("No order payload to fill. Run Auto-Fill on Deliveroo first.", "error", 7000);
+        return;
+      }
+      if (claimsFillInFlight) {
+        toast("Fill already in progress…", "info", 2500);
+        return;
+      }
+      if (!options.force && lastFilledOrder === payload.orderNumber) {
+        toast(`Order ${payload.orderNumber} was already filled. Click Fill again to retry.`, "info", 4000);
+        lastFilledOrder = "";
+      }
+      claimsFillInFlight = true;
+      const btn = document.getElementById(`${uiPrefix}-btn`);
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Filling Claims…";
+      }
+      fastFillMode = options.fast !== false && workhorse.fastFill !== false;
+      try {
+        const modalReady = await waitUntil(() => getClaimsModal(true), 5000, 30);
+        if (!modalReady) {
+          throw new Error("Claims form not found. Click Add New, then Fill from Deliveroo.");
+        }
+        const results = await fillClaimsForm(payload, { ...options, fast: true });
+        lastFilledOrder = payload.orderNumber;
+        showPreview(payload);
+        const entries = Object.entries(results || {});
+        if (!entries.length) {
+          toast("Fill ran but no fields were processed. Re-paste the latest userscript (run node build-static.js if you edit shared files).", "error", 9000);
+          return;
+        }
+        const failed = entries
+          .filter(([, r]) => !r.ok && r.reason !== "empty")
+          .map(([k, r]) => (r.reason ? `${k} (${r.reason})` : k));
+        const okCount = entries.filter(([, r]) => r.ok).length;
+        if (!okCount) {
+          toast(`Could not fill any fields: ${failed.slice(0, 6).join(", ") || "unknown"}`, "error", 9000);
+        } else if (failed.length) {
+          toast(`Filled ${okCount} fields. Still missing: ${failed.slice(0, 5).join(", ")}`, "error", 8000);
+        } else {
+          toast(`Filled claim ${payload.orderNumber} (${okCount} fields).`, "success");
+        }
+      } catch (err) {
+        toast(`Fill failed: ${err.message || err}`, "error", 8000);
+      } finally {
+        fastFillMode = false;
+        claimsFillInFlight = false;
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = platform.buttonFill || "Fill Claims";
+        }
+      }
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* Public API                                                             */
+    /* ---------------------------------------------------------------------- */
+
+    const api = {
+      version: platform.versionLabel,
+      hitClass,
+      hits,
+
+      get platform() {
+        return platform;
+      },
+      get workhorse() {
+        return workhorse;
+      },
+      get config() {
+        return {
+          platform,
+          workhorse,
+          storageKey: platform.storageKey,
+          sheetStorageKey: platform.sheetStorageKey,
+          clipPrefix: platform.clipPrefix,
+          uiPrefix,
+          hitColor,
+          hitClass,
+        };
+      },
+
+      /* Utils */
+      normalizeSpace,
+      normalizeKey,
+      compactKey,
+      visible,
+      ownText,
+      wait,
+      waitUntil,
+      debounce,
+      parseMoney,
+      extractTime,
+      parseClaimDate,
+      pageJQuery,
+      safeClick,
+      isOpSpotPage,
+      isGoogleSheetsPage,
+
+      /* Rules */
+      canonicalizeReason,
+      mapReasonForDispute,
+      normalizeCustomerName,
+      normalizeLocationName,
+      conditionRuleKey,
+      resolveOutcomeMatch,
+      computeOutcome,
+      computeFootageStatus,
+      buildDisputeFieldValues,
+      enrichPayload,
+
+      /* OpSpot fill */
+      getClaimsModal,
+      ensureClaimsModal,
+      collectFormFields,
+      matchFormField,
+      resolveFormField,
+      controlAfterLabel,
+      controlByFieldName,
+      controlNearCaption,
+      controlForField,
+      fieldRow,
+      fillLabeledField,
+      fillSelect,
+      fillYesNo,
+      setInputValue,
+      bestOption,
+      clickMatchingMenuItem,
+      fillClaimsForm,
+      findVisibleLabel,
+
+      /* Transfer / UI / Sheet */
+      savePayload,
+      loadPayload,
+      toast,
+      showPreview,
+      ensureStyles,
+      injectButton,
+      ensureButtonBar,
+      applyPayloadToClaims,
+      setupOpSpotSaveHooks,
+      sheetCell,
+      sheetRefundReason,
+      buildGoogleSheetRow,
+      buildSheetTransfer,
+      saveSheetTransfer,
+      loadSheetTransfer,
+      activateGoogleSheetTab,
+      focusSheetPasteCell,
+      copyTextToClipboard,
+      resolveSheetTab,
+
+      /* State helpers */
+      clearHits,
+      highlightHits,
+      invalidateModalCache,
+      resetFillGuards,
+    };
+
+    return api;
+  }
+
+  const ClaimsCore = {
+    create: ClaimsCoreCreate,
+  };
+
+  root.ClaimsCore = ClaimsCore;
+  if (typeof globalThis !== "undefined" && root !== globalThis) {
+    try {
+      globalThis.ClaimsCore = ClaimsCore;
+    } catch {
+      /* ignore */
+    }
+  }
+})(typeof unsafeWindow !== "undefined" ? unsafeWindow : typeof window !== "undefined" ? window : globalThis);
+/* ==== END INLINED SHARED ==== */
+
 /**
  * Pages
  *   Deliveroo: https://partner-hub.deliveroo.com/orders/refunds/...
@@ -38,7 +2260,7 @@
  *   Sheets:    https://docs.google.com/spreadsheets/d/... (Refund_Dispute_Log_2)
  *
  * You must be logged in on both. The login screens have no order data.
- * Presets/core load from GitHub via @require (raw.githubusercontent.com).
+ * Self-contained: presets + core are inlined below (run `node build-static.js` after editing shared files).
  */
 
 (function () {
@@ -46,7 +2268,7 @@
 
   const root = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   if (!root.ClaimsCore || !root.ClaimsPresets) {
-    console.error("[Deliveroo Claims] Load claims-presets.js and claims-core.js via @require (check network / Tampermonkey @require).");
+    console.error("[Deliveroo Claims] Shared claims-presets/core failed to load (re-run node build-static.js and re-paste this userscript).");
     return;
   }
   const core = root.ClaimsCore.create("deliveroo");
@@ -54,7 +2276,7 @@
     normalizeSpace, normalizeKey, compactKey, visible, ownText, wait, waitUntil, debounce,
     parseMoney, extractTime, parseClaimDate, safeClick, findVisibleLabel,
     isOpSpotPage, isGoogleSheetsPage,
-    canonicalizeReason, normalizeCustomerName, computeOutcome, computeFootageStatus,
+    canonicalizeReason, normalizeCustomerName, computeOutcome, computeFootageStatus, resolveOutcomeMatch,
     buildDisputeFieldValues, mapReasonForDispute,
     savePayload, loadPayload, toast, showPreview, ensureStyles, injectButton, ensureButtonBar,
     applyPayloadToClaims, setupOpSpotSaveHooks, resetFillGuards,
@@ -132,6 +2354,10 @@
     return line.replace(/\s+(?:NZ\$|A\$|US\$|€|£|\$)\s*\d.*$/, "").trim();
   }
 
+  function itemNamesFrom(items) {
+    return [...new Set((items || []).map((item) => item && item.name).filter(Boolean))];
+  }
+
   function isCategoryName(name) {
     return MENU_CATEGORIES.test(normalizeKey(firstItemNameLine(name)));
   }
@@ -154,10 +2380,30 @@
 
   function pageLines() {
     if (pageLinesCache) return pageLinesCache;
-    pageLinesCache = ((document.body && document.body.innerText) || "")
-      .split(/\n+/)
-      .map(normalizeSpace)
-      .filter(Boolean);
+    const hideSelectors = [
+      `#${mapPanelId}`,
+      `#${uiPrefix}-btn-bar`,
+      `#${uiPrefix}-preview`,
+      `#${uiPrefix}-toast`,
+      `#${uiPrefix}-btn`,
+      `#${uiPrefix}-sheet-btn`,
+      `#${mapBtnId}`,
+    ];
+    const hidden = [];
+    for (const sel of hideSelectors) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      hidden.push({ el, display: el.style.display });
+      el.style.display = "none";
+    }
+    try {
+      pageLinesCache = ((document.body && document.body.innerText) || "")
+        .split(/\n+/)
+        .map(normalizeSpace)
+        .filter(Boolean);
+    } finally {
+      for (const row of hidden) row.el.style.display = row.display;
+    }
     return pageLinesCache;
   }
 
@@ -224,18 +2470,48 @@
     return match ? match[1] : "";
   }
 
+  const KNOWN_BRAND_PREFIXES = [
+    /^shake\s*shack\b/i,
+    /^jollibee\b/i,
+    /^popeyes\b/i,
+    /^five\s*guys\b/i,
+  ];
+
   function splitBrandLocation(line) {
     const text = normalizeSpace(line);
-    const parts = text.split(/\s*[–—−-]\s*/).map(normalizeSpace).filter(Boolean);
-    if (parts.length < 2) return { customer: "", location: "" };
-    return {
-      customer: parts[0] || "",
-      location: parts.slice(1).join(" - ") || "",
-    };
+    if (!text) return { customer: "", location: "" };
+
+    // Preferred: "Shake Shack - Manchester Ardwick"
+    const dashed = text.split(/\s*[–—−-]\s*/).map(normalizeSpace).filter(Boolean);
+    if (dashed.length >= 2) {
+      return {
+        customer: dashed[0] || "",
+        location: dashed.slice(1).join(" - ") || "",
+      };
+    }
+
+    // No dash: "Shake Shack Manchester Ardwick"
+    for (const re of KNOWN_BRAND_PREFIXES) {
+      const m = text.match(re);
+      if (!m) continue;
+      const customer = normalizeSpace(m[0]);
+      const location = normalizeSpace(text.slice(m[0].length));
+      if (customer && location) return { customer, location };
+    }
+
+    return { customer: "", location: "" };
   }
 
   function looksLikeBrandLocation(text) {
-    return /\s+[–—−-]\s+/.test(normalizeSpace(text));
+    const t = normalizeSpace(text);
+    if (!t || t.length > 100 || /order\s*#/i.test(t)) return false;
+    if (/\s+[–—−-]\s+/.test(t)) return true;
+    return KNOWN_BRAND_PREFIXES.some((re) => {
+      const m = t.match(re);
+      if (!m) return false;
+      const rest = normalizeSpace(t.slice(m[0].length));
+      return rest.length >= 2 && !HEADER_WORDS.test(rest) && !REASON_ROW_RE.test(rest);
+    });
   }
 
   function extractBrandAndLocation(orderNumber) {
@@ -312,13 +2588,15 @@
 
     const pushItem = (name, reasonText, el, reasonEl) => {
       const itemName = firstItemNameLine(name);
+      const reasonRaw = normalizeSpace(reasonText);
       const reason = canonicalizeReason(reasonText);
       if (!reason || !isValidItemName(itemName)) return;
-      items.push({ name: itemName, reason });
+      items.push({ name: itemName, reason, reasonRaw });
       hits.push({ label: "Refunded item", el: el || null, valueEl: reasonEl || null, value: itemName });
     };
 
     for (const table of document.querySelectorAll("table")) {
+      if (table.closest(`#${mapPanelId}, #${uiPrefix}-btn-bar, #${uiPrefix}-preview`)) continue;
       const rows = table.rows;
       if (!rows || !rows.length) continue;
       const headerCells = rows[0].cells;
@@ -440,7 +2718,38 @@
   }
 
   function defaultUserConditions() {
-    return { locationAliases: [], customerAliases: [], reasonMap: {} };
+    return {
+      locationAliases: [],
+      customerAliases: [],
+      reasonMap: {},
+      disputeThresholdGbp: null,
+      fiveGuysMaxEur: null,
+      videoSubmitted: null,
+      platformLabel: null,
+      conditionTweaks: {},
+    };
+  }
+
+  function normalizeConditionTweaks(raw) {
+    const out = {};
+    if (!raw || typeof raw !== "object") return out;
+    for (const [key, val] of Object.entries(raw)) {
+      if (!val || typeof val !== "object") continue;
+      let reasons = val.reasonForDispute;
+      if (Array.isArray(reasons)) {
+        reasons = reasons.map((r) => normalizeSpace(r)).filter(Boolean);
+      } else if (typeof reasons === "string" && reasons) {
+        reasons = [normalizeSpace(reasons)];
+      } else {
+        reasons = [];
+      }
+      out[key] = {
+        outcome: normalizeSpace(val.outcome || ""),
+        footage: normalizeSpace(val.footage || ""),
+        reasonForDispute: reasons,
+      };
+    }
+    return out;
   }
 
   function loadUserConditions() {
@@ -451,23 +2760,41 @@
     } catch {
       data = null;
     }
+    const thresholdRaw = data && data.disputeThresholdGbp;
+    const thresholdNum = thresholdRaw == null || thresholdRaw === "" ? null : Number(thresholdRaw);
+    const fiveRaw = data && data.fiveGuysMaxEur;
+    const fiveNum = fiveRaw == null || fiveRaw === "" ? null : Number(fiveRaw);
     userConditionsCache = {
       ...defaultUserConditions(),
       ...(data && typeof data === "object" ? data : {}),
       locationAliases: Array.isArray(data && data.locationAliases) ? data.locationAliases : [],
       customerAliases: Array.isArray(data && data.customerAliases) ? data.customerAliases : [],
       reasonMap: data && data.reasonMap && typeof data.reasonMap === "object" ? data.reasonMap : {},
+      disputeThresholdGbp: thresholdNum != null && !Number.isNaN(thresholdNum) ? thresholdNum : null,
+      fiveGuysMaxEur: fiveNum != null && !Number.isNaN(fiveNum) ? fiveNum : null,
+      videoSubmitted: data && data.videoSubmitted ? normalizeSpace(data.videoSubmitted) : null,
+      platformLabel: data && data.platformLabel ? normalizeSpace(data.platformLabel) : null,
+      conditionTweaks: normalizeConditionTweaks(data && data.conditionTweaks),
     };
     return userConditionsCache;
   }
 
   function saveUserConditions(data) {
+    const thresholdRaw = data && data.disputeThresholdGbp;
+    const thresholdNum = thresholdRaw == null || thresholdRaw === "" ? null : Number(thresholdRaw);
+    const fiveRaw = data && data.fiveGuysMaxEur;
+    const fiveNum = fiveRaw == null || fiveRaw === "" ? null : Number(fiveRaw);
     userConditionsCache = {
       ...defaultUserConditions(),
       ...(data || {}),
       locationAliases: Array.isArray(data && data.locationAliases) ? data.locationAliases : [],
       customerAliases: Array.isArray(data && data.customerAliases) ? data.customerAliases : [],
       reasonMap: data && data.reasonMap && typeof data.reasonMap === "object" ? data.reasonMap : {},
+      disputeThresholdGbp: thresholdNum != null && !Number.isNaN(thresholdNum) ? thresholdNum : null,
+      fiveGuysMaxEur: fiveNum != null && !Number.isNaN(fiveNum) ? fiveNum : null,
+      videoSubmitted: data && data.videoSubmitted ? normalizeSpace(data.videoSubmitted) : null,
+      platformLabel: data && data.platformLabel ? normalizeSpace(data.platformLabel) : null,
+      conditionTweaks: normalizeConditionTweaks(data && data.conditionTweaks),
     };
     try {
       if (typeof GM_setValue === "function") GM_setValue(CONDITIONS_KEY, userConditionsCache);
@@ -479,6 +2806,103 @@
     } catch {
       /* ignore */
     }
+  }
+
+  function effectiveDisputeThreshold() {
+    const user = loadUserConditions().disputeThresholdGbp;
+    if (user != null && !Number.isNaN(Number(user))) return Number(user);
+    return workhorse.disputeThresholdGbp || 2;
+  }
+
+  function effectiveFiveGuysMax() {
+    const user = loadUserConditions().fiveGuysMaxEur;
+    if (user != null && !Number.isNaN(Number(user))) return Number(user);
+    return platform.fiveGuysNotDisputedMaxEur;
+  }
+
+  function effectiveVideoSubmitted() {
+    return loadUserConditions().videoSubmitted || workhorse.videoSubmitted || "No";
+  }
+
+  function effectivePlatformLabel() {
+    return loadUserConditions().platformLabel || platform.platform || "Deliveroo";
+  }
+
+  function defaultTweakFor(key) {
+    const o = workhorse.outcomeOptions || {};
+    const f = workhorse.footageStatusOptions || {};
+    const map = {
+      underDisputeThreshold: { outcome: o.notDisputed, footage: f.irrelevant, reasonForDispute: [] },
+      alreadyDisputed: { outcome: o.reviewed, footage: f.disputedByThirdParty, reasonForDispute: [] },
+      fiveGuysUnderMax: { outcome: o.notDisputed, footage: f.irrelevant, reasonForDispute: [] },
+      missingFoodSafety: { outcome: o.awaitingReview, footage: f.irrelevant, reasonForDispute: [] },
+      preparedIncorrect: { outcome: o.pending, footage: f.irrelevant, reasonForDispute: [] },
+    };
+    return map[key] || { outcome: "", footage: "", reasonForDispute: [] };
+  }
+
+  function effectiveTweak(key) {
+    const saved = (loadUserConditions().conditionTweaks || {})[key] || {};
+    const defaults = defaultTweakFor(key);
+    let reasons = saved.reasonForDispute;
+    if (!Array.isArray(reasons)) {
+      reasons = reasons ? [normalizeSpace(reasons)] : defaults.reasonForDispute || [];
+    }
+    return {
+      outcome: saved.outcome || defaults.outcome || "",
+      footage: saved.footage || defaults.footage || "",
+      reasonForDispute: reasons.filter(Boolean),
+    };
+  }
+
+  function withConditionContext(ctx) {
+    return Object.assign({}, ctx || {}, {
+      disputeThreshold: effectiveDisputeThreshold(),
+      fiveGuysMax: effectiveFiveGuysMax(),
+      conditionTweaks: loadUserConditions().conditionTweaks || {},
+    });
+  }
+
+  function outcomeSelectHtml(name, selected) {
+    const opts = Object.values(workhorse.outcomeOptions || {});
+    return `<select data-tweak-outcome="${escapeAttr(name)}" title="Outcome">${opts
+      .map((v) => `<option value="${escapeAttr(v)}" ${v === selected ? "selected" : ""}>${escapeAttr(v)}</option>`)
+      .join("")}</select>`;
+  }
+
+  function footageSelectHtml(name, selected) {
+    const opts = Object.values(workhorse.footageStatusOptions || {});
+    return `<select data-tweak-footage="${escapeAttr(name)}" title="Footage Status">${opts
+      .map((v) => `<option value="${escapeAttr(v)}" ${v === selected ? "selected" : ""}>${escapeAttr(v)}</option>`)
+      .join("")}</select>`;
+  }
+
+  function workhorseDisputeReasonOptions() {
+    const fromMap = Object.values(platform.reasonMap || {});
+    const extras = [
+      "Missing Item",
+      "Incorrect Item",
+      "Incomplete",
+      "Prepared incorrectly",
+      "Food safety complaint",
+      workhorse.reasonForDisputeOtherOption || "Other",
+    ];
+    return [...new Set(fromMap.concat(extras).map((v) => normalizeSpace(v)).filter(Boolean))];
+  }
+
+  function reasonForDisputeCheckboxHtml(name, selected) {
+    const opts = workhorseDisputeReasonOptions();
+    const selectedList = (Array.isArray(selected) ? selected : selected ? [selected] : [])
+      .map((v) => normalizeSpace(v))
+      .filter(Boolean);
+    const selectedKeys = new Set(selectedList.map((v) => normalizeKey(v)));
+    const boxes = opts.map(
+      (v) => `<label class="dcf-cond-check">
+          <input type="checkbox" data-tweak-dispute-reason="${escapeAttr(name)}" value="${escapeAttr(v)}" ${selectedKeys.has(normalizeKey(v)) ? "checked" : ""} />
+          <span>${escapeAttr(v)}</span>
+        </label>`
+    );
+    return `<div class="dcf-cond-check-group" data-dispute-reason-group="${escapeAttr(name)}">${boxes.join("")}</div>`;
   }
 
   function matchAliasList(text, aliases) {
@@ -510,51 +2934,213 @@
       preset;
   }
 
-  function resolveReasonForDispute(refundReason) {
-    const canonical = canonicalizeReason(refundReason) || normalizeKey(refundReason);
+  function resolveReasonForDispute(refundReason, refundReasonRaw) {
     const userMap = loadUserConditions().reasonMap || {};
-    const keys = [normalizeKey(refundReason), canonical, normalizeKey(canonical)].filter(Boolean);
+    const rawKey = normalizeKey(refundReasonRaw || refundReason);
+    const canonical = canonicalizeReason(refundReasonRaw || refundReason) || normalizeKey(refundReason);
+
+    // Incomplete must use incomplete* overrides — never fall through to missing items.
+    if (/incomplete/.test(rawKey)) {
+      for (const key of [rawKey, "incomplete item", "incomplete items", "incomplete"]) {
+        if (userMap[key]) return userMap[key];
+      }
+    }
+
+    // Food safety: prefer explicit override before other maps
+    if (/food\s*safety/.test(rawKey)) {
+      for (const key of [rawKey, "food safety complaint", "foodsafetycomplaint"]) {
+        if (userMap[key]) return userMap[key];
+      }
+    }
+
+    const keys = [rawKey, normalizeKey(refundReason), canonical, normalizeKey(canonical)].filter(Boolean);
+    const seen = new Set();
     for (const key of keys) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      // When raw was incomplete, skip missing* user-map hits
+      if (/incomplete/.test(rawKey) && /^missing/.test(key)) continue;
       if (userMap[key]) return userMap[key];
     }
+
+    if (/incomplete/.test(rawKey)) {
+      // Preset default for incomplete is Missing Item — honor user intent via Incorrect Item
+      // only when no user map; still use preset incomplete keys if present
+      const preset = platform.reasonMap || {};
+      for (const key of [rawKey, "incomplete item", "incomplete items", "incomplete"]) {
+        if (preset[key]) return preset[key];
+      }
+    }
+
     return mapReasonForDispute(canonical);
   }
 
-  function describeBuiltInConditions() {
-    const threshold = workhorse.disputeThresholdGbp || 2;
-    const five = platform.fiveGuysNotDisputedMaxEur;
-    const lines = [
-      `Under £${threshold} dispute amount → Outcome: Not disputed; Footage: irrelevant`,
-      "Already contested / disputed → Outcome: Reviewed; Footage: Disputed by 3rd party",
-    ];
-    if (five != null) {
-      lines.push(`Five Guys and dispute < €${five} → Outcome: Not disputed; Footage: irrelevant`);
+  function pickReasonForDisputeFromChecks(selected, mappedReason, refundReason, refundReasonRaw) {
+    const list = (Array.isArray(selected) ? selected : selected ? [selected] : [])
+      .map((r) => normalizeSpace(r))
+      .filter(Boolean);
+    if (!list.length) return "";
+
+    const raw = normalizeKey(refundReasonRaw || refundReason);
+    const canonical = canonicalizeReason(refundReasonRaw || refundReason) || "";
+    const find = (re) => list.find((r) => re.test(normalizeKey(r)));
+
+    // Incomplete orders: never coerce to Missing Item via multi-select
+    if (/incomplete/.test(raw)) {
+      if (mappedReason && !/^missing(\s*item)?s?$/i.test(mappedReason)) return mappedReason;
+      const hit = find(/incomplete/) || find(/incorrect/);
+      if (hit) return hit;
+      return mappedReason || "";
     }
-    lines.push(
-      "Missing / Incomplete / food safety → Outcome: Awaiting review (if not contested / under threshold)",
-      "Prepared incorrectly / Incorrect item → Outcome: Pending",
-      "Incomplete items → Reason for Dispute: Missing Item",
-      "Food safety complaint → Reason for Dispute: Other + Reason field",
-      "Video Submitted always: No",
-      "Platform always: Deliveroo"
-    );
-    (platform.reasonMap && Object.keys(platform.reasonMap).length
-      ? Object.entries(platform.reasonMap).slice(0, 12)
-      : []
-    ).forEach(([from, to]) => lines.push(`Reason “${from}” → “${to}”`));
-    (platform.locationAliases || []).forEach((a) => {
-      if (a && a.match && a.value) lines.push(`Location preset: /${a.match}/ → “${a.value}”`);
-    });
-    (platform.customerAliases || []).forEach((a) => {
-      if (a && a.match && a.value) lines.push(`Customer preset: /${a.match}/ → “${a.value}”`);
-    });
-    return lines;
+
+    if (mappedReason && list.some((r) => normalizeKey(r) === normalizeKey(mappedReason))) {
+      return mappedReason;
+    }
+
+    if (/food\s*safety|foodsafetycomplaint/.test(raw)) {
+      const hit = find(/food\s*safety|foodsafetycomplaint/) || find(/^other$/);
+      if (hit) return hit;
+    }
+    if (/missing/.test(raw) || (/^missing/.test(canonical) && !/incomplete/.test(raw))) {
+      const hit = find(/missing/);
+      if (hit) return hit;
+    }
+    if (/prepared/.test(raw) || /prepared/.test(canonical)) {
+      const hit = find(/prepared/);
+      if (hit) return hit;
+    }
+    if (/incorrect/.test(raw) || /incorrect/.test(canonical)) {
+      const hit = find(/incorrect/);
+      if (hit) return hit;
+    }
+    return list[0];
+  }
+
+  function describeBuiltInConditions() {
+    /* kept for compatibility — UI uses renderBuiltInConditions */
+    return [];
+  }
+
+  function mergedReasonMapForEditor() {
+    const preset = platform.reasonMap || {};
+    const user = loadUserConditions().reasonMap || {};
+    const keys = [...new Set([...Object.keys(preset), ...Object.keys(user)])];
+    return keys.map((from) => ({
+      from,
+      to: user[from] || preset[from] || "",
+      isUser: Object.prototype.hasOwnProperty.call(user, from),
+    }));
+  }
+
+  function renderBuiltInConditions() {
+    const threshold = effectiveDisputeThreshold();
+    const five = effectiveFiveGuysMax();
+    const under = effectiveTweak("underDisputeThreshold");
+    const contested = effectiveTweak("alreadyDisputed");
+    const fiveTweak = effectiveTweak("fiveGuysUnderMax");
+    const missing = effectiveTweak("missingFoodSafety");
+    const prepared = effectiveTweak("preparedIncorrect");
+    const reasons = mergedReasonMapForEditor();
+    const customerPresets = platform.customerAliases || [];
+
+    const reasonRows = reasons
+      .map(
+        (r) => `<div class="dcf-cond-tweak-row">
+        <code style="flex:0 0 38%">${escapeAttr(r.from)}</code>
+        <span>→</span>
+        <input data-reason-edit="${escapeAttr(r.from)}" value="${escapeAttr(r.to)}" style="flex:1" />
+      </div>`
+      )
+      .join("");
+
+    const customerRows = customerPresets
+      .map(
+        (a, i) => `<div class="dcf-cond-tweak-row">
+        <input data-preset-customer-match="${i}" value="${escapeAttr(a.match || "")}" style="flex:1" />
+        <span>→</span>
+        <input data-preset-customer-value="${i}" value="${escapeAttr(a.value || "")}" style="flex:1" />
+      </div>`
+      )
+      .join("");
+
+    return `
+      <li class="dcf-cond-builtin-editable">
+        <div><strong>Partner refund ≤ £…</strong> → Outcome / Footage</div>
+        <div class="dcf-cond-form dcf-cond-tweak-grid">
+          <label>£</label>
+          <input data-threshold-gbp type="number" min="0" step="0.01" value="${escapeAttr(String(threshold))}" />
+          ${outcomeSelectHtml("underDisputeThreshold", under.outcome)}
+          ${footageSelectHtml("underDisputeThreshold", under.footage)}
+        </div>
+      </li>
+      <li class="dcf-cond-builtin-editable">
+        <div><strong>Already contested / disputed</strong> → Outcome / Footage</div>
+        <div class="dcf-cond-form dcf-cond-tweak-grid">
+          ${outcomeSelectHtml("alreadyDisputed", contested.outcome)}
+          ${footageSelectHtml("alreadyDisputed", contested.footage)}
+        </div>
+      </li>
+      <li class="dcf-cond-builtin-editable">
+        <div><strong>Five Guys and dispute &lt; €…</strong> → Outcome / Footage</div>
+        <div class="dcf-cond-form dcf-cond-tweak-grid">
+          <label>€</label>
+          <input data-fiveguys-max type="number" min="0" step="0.01" value="${escapeAttr(five == null ? "" : String(five))}" placeholder="off" />
+          ${outcomeSelectHtml("fiveGuysUnderMax", fiveTweak.outcome)}
+          ${footageSelectHtml("fiveGuysUnderMax", fiveTweak.footage)}
+        </div>
+      </li>
+      <li class="dcf-cond-builtin-editable">
+        <div><strong>Missing / Incomplete / food safety</strong> → Outcome / Reason for Dispute</div>
+        <div class="dcf-cond-form dcf-cond-tweak-grid">
+          ${outcomeSelectHtml("missingFoodSafety", missing.outcome)}
+        </div>
+        <div class="dcf-map-meta" style="margin-top:6px">Reason for Dispute (multi-select). None checked = use reason map. If several match, the best one for this order is used.</div>
+        ${reasonForDisputeCheckboxHtml("missingFoodSafety", missing.reasonForDispute)}
+      </li>
+      <li class="dcf-cond-builtin-editable">
+        <div><strong>Prepared incorrectly / Incorrect item</strong> (also Incomplete → Incorrect Item) → Outcome / Reason for Dispute</div>
+        <div class="dcf-cond-form dcf-cond-tweak-grid">
+          ${outcomeSelectHtml("preparedIncorrect", prepared.outcome)}
+        </div>
+        <div class="dcf-map-meta" style="margin-top:6px">Reason for Dispute (multi-select). None checked = use reason map.</div>
+        ${reasonForDisputeCheckboxHtml("preparedIncorrect", prepared.reasonForDispute)}
+      </li>
+      <li class="dcf-cond-builtin-editable">
+        <div><strong>Video Submitted</strong> always</div>
+        <div class="dcf-cond-form dcf-cond-tweak-grid">
+          <select data-video-submitted>
+            <option value="No" ${effectiveVideoSubmitted() === "No" ? "selected" : ""}>No</option>
+            <option value="Yes" ${effectiveVideoSubmitted() === "Yes" ? "selected" : ""}>Yes</option>
+          </select>
+        </div>
+      </li>
+      <li class="dcf-cond-builtin-editable">
+        <div><strong>Platform</strong> always</div>
+        <div class="dcf-cond-form dcf-cond-tweak-grid">
+          <input data-platform-label value="${escapeAttr(effectivePlatformLabel())}" />
+        </div>
+      </li>
+      <li class="dcf-cond-builtin-editable">
+        <div><strong>Reason map</strong> (Deliveroo → Workhorse Reason for Dispute)</div>
+        <div class="dcf-cond-tweak-list">${reasonRows || `<div class="dcf-map-meta">No reason rows</div>`}</div>
+      </li>
+      <li class="dcf-cond-builtin-editable">
+        <div><strong>Customer presets</strong> (saved into your customer aliases on Save)</div>
+        <div class="dcf-cond-tweak-list">${customerRows || `<div class="dcf-map-meta">No customer presets</div>`}</div>
+      </li>
+      <li class="dcf-cond-builtin-editable" style="border-style:dashed">
+        <button type="button" class="dcf-cond-add" data-cond-save-builtins style="width:100%">Save built-in condition tweaks</button>
+      </li>
+    `;
   }
 
   function ensureMapStyles() {
-    const styleId = `${uiPrefix}-map-style-v3`;
+    const styleId = `${uiPrefix}-map-style-v6`;
     if (document.getElementById(styleId)) return;
     document.getElementById(`${uiPrefix}-map-style`)?.remove();
+    document.getElementById(`${uiPrefix}-map-style-v3`)?.remove();
+    document.getElementById(`${uiPrefix}-map-style-v4`)?.remove();
+    document.getElementById(`${uiPrefix}-map-style-v5`)?.remove();
     const style = document.createElement("style");
     style.id = styleId;
     style.textContent = `
@@ -567,7 +3153,7 @@
       #${mapBtnId}:hover { background: #111827; color: #fff; }
       #${mapPanelId} {
         position: fixed; top: 64px; left: 18px; z-index: 2147483646;
-        width: 400px; max-height: 75vh; overflow: auto;
+        width: 460px; max-height: 75vh; overflow: auto;
         background: #0f172a; color: #f8fafc; border-radius: 12px;
         padding: 0 14px 14px; box-shadow: 0 12px 40px rgba(0,0,0,.4);
         font: 13px/1.4 Segoe UI, system-ui, sans-serif;
@@ -627,6 +3213,32 @@
         margin: 0; padding-left: 16px; color: #94a3b8; font-size: 11px;
       }
       #${mapPanelId} .dcf-cond-builtin li { margin: 3px 0; }
+      #${mapPanelId} .dcf-cond-builtin-editable {
+        list-style: none; margin: 6px 0 6px -16px; padding: 8px; border-radius: 8px;
+        background: #1e293b; border: 1px solid #334155; color: #cbd5e1; font-size: 12px;
+      }
+      #${mapPanelId} .dcf-cond-builtin-editable .dcf-cond-form label { align-self: center; }
+      #${mapPanelId} .dcf-cond-tweak-grid {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 6px; margin-top: 6px;
+      }
+      #${mapPanelId} .dcf-cond-tweak-grid select,
+      #${mapPanelId} .dcf-cond-tweak-grid input,
+      #${mapPanelId} .dcf-cond-tweak-list input {
+        width: 100%; border: 0; border-radius: 6px; padding: 6px 8px;
+        background: #0f172a; color: #f8fafc; font-size: 12px;
+      }
+      #${mapPanelId} .dcf-cond-tweak-list { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+      #${mapPanelId} .dcf-cond-tweak-row { display: flex; gap: 6px; align-items: center; }
+      #${mapPanelId} .dcf-cond-check-group {
+        display: flex; flex-direction: column; gap: 4px; margin-top: 6px;
+      }
+      #${mapPanelId} .dcf-cond-check {
+        display: flex; align-items: center; gap: 8px; cursor: pointer;
+        color: #e2e8f0; font-size: 12px; user-select: none;
+      }
+      #${mapPanelId} .dcf-cond-check input {
+        width: 14px; height: 14px; accent-color: #00ccbc; flex: 0 0 auto;
+      }
       body.dcf-map-picking, body.dcf-map-picking * { cursor: crosshair !important; }
       .dcf-map-flash { outline: 3px solid #fbbf24 !important; outline-offset: 2px; }
     `;
@@ -831,12 +3443,23 @@
         if (n != null) out.disputeAmount = n.toFixed(2);
       } else if (key === "refundReason") {
         const reasonText = REASON_ROW_RE.test(raw) ? raw : fixedMapping.sampleValue || raw;
+        out.refundReasonRaw = normalizeSpace(reasonText);
         out.refundReason = canonicalizeReason(reasonText) || reasonText;
-        out.reasonForDispute = resolveReasonForDispute(out.refundReason);
+        out.reasonForDispute = resolveReasonForDispute(out.refundReason, out.refundReasonRaw);
       } else if (key === "otherReason") {
         const item = firstItemNameLine(raw) || raw;
         // Ignore accidental brand/location
         if (looksLikeBrandLocation(item) && /shake|jollibee|popeyes|five\s*guys/i.test(item)) {
+          continue;
+        }
+        // Ignore menu categories (e.g. clicking "Fries" / "Sauces" instead of the item)
+        if (isCategoryName(item)) continue;
+        const refundedNames = itemNamesFrom(out.items || []);
+        // If auto-extract already found refunded item(s), don't replace with an unrelated click
+        if (
+          refundedNames.length &&
+          !refundedNames.some((n) => normalizeKey(n) === normalizeKey(item) || normalizeKey(item).includes(normalizeKey(n)))
+        ) {
           continue;
         }
         out.otherReason = item;
@@ -844,19 +3467,48 @@
       }
     }
 
+    // Keep Other reason aligned with refunded items when a stale map left garbage
+    const refundedNames = itemNamesFrom(out.items || []);
+    if (refundedNames.length) {
+      const otherFirst = firstItemNameLine(out.otherReason);
+      const otherIsBad =
+        !otherFirst ||
+        isCategoryName(otherFirst) ||
+        (out.wrongFoodItem &&
+          normalizeKey(otherFirst) !== normalizeKey(out.wrongFoodItem) &&
+          !refundedNames.some((n) => normalizeKey(n) === normalizeKey(otherFirst)));
+      if (otherIsBad) {
+        out.otherReason = out.wrongFoodItem || refundedNames.join("\n");
+      }
+    }
+
     out.customer = resolveCustomerName(out.customer);
     out.location = resolveLocationName(out.location);
-    out.reasonForDispute = resolveReasonForDispute(out.refundReason);
+    out.reasonForDispute = resolveReasonForDispute(out.refundReason, out.refundReasonRaw);
     const amount = parseMoney(out.disputeAmount);
     const ruleCtx = {
       disputeAmount: amount,
       alreadyDisputed: out.alreadyDisputed,
       refundReason: out.refundReason,
+      refundReasonRaw: out.refundReasonRaw,
+      reasonForDispute: out.reasonForDispute,
       customer: out.customer,
       location: out.location,
     };
-    out.outcome = computeOutcome(ruleCtx);
-    out.footageStatus = computeFootageStatus(ruleCtx);
+    const ctx = withConditionContext(ruleCtx);
+    const outcomeMatch =
+      typeof resolveOutcomeMatch === "function"
+        ? resolveOutcomeMatch(ctx)
+        : { outcome: computeOutcome(ctx), reasonForDispute: [] };
+    out.outcome = outcomeMatch.outcome || computeOutcome(ctx);
+    const pickedReason = pickReasonForDisputeFromChecks(
+      outcomeMatch.reasonForDispute,
+      out.reasonForDispute,
+      out.refundReason,
+      out.refundReasonRaw
+    );
+    if (pickedReason) out.reasonForDispute = pickedReason;
+    out.footageStatus = computeFootageStatus(ctx);
     return out;
   }
 
@@ -1021,9 +3673,7 @@
       </div>`;
     }).join("");
 
-    const builtin = describeBuiltInConditions()
-      .map((line) => `<li>${escapeAttr(line)}</li>`)
-      .join("");
+    const builtin = renderBuiltInConditions();
 
     const fieldsBody = `
       <p>Pick a field, then click the matching text on the refund page. Saved in this browser.</p>
@@ -1068,7 +3718,8 @@
       </div>
 
       <div class="dcf-cond-section">
-        <h4>Built-in conditions (from presets)</h4>
+        <h4>Built-in conditions</h4>
+        <div class="dcf-map-meta" style="margin-bottom:8px">Tweak outcomes, footage, thresholds, reasons, and defaults. Click <strong>Save built-in condition tweaks</strong> at the bottom.</div>
         <ul class="dcf-cond-builtin">${builtin}</ul>
       </div>
 
@@ -1103,6 +3754,74 @@
     panel.querySelector('[data-map-action="clear-conditions"]')?.addEventListener("click", () => {
       saveUserConditions(defaultUserConditions());
       toast("Cleared your custom conditions.", "success", 3500);
+      renderMapPanel();
+    });
+    panel.querySelector("[data-cond-save-builtins]")?.addEventListener("click", () => {
+      const next = loadUserConditions();
+      const thresholdRaw = panel.querySelector("[data-threshold-gbp]")?.value;
+      const thresholdNum = thresholdRaw === "" || thresholdRaw == null ? null : Number(thresholdRaw);
+      if (thresholdNum != null && (Number.isNaN(thresholdNum) || thresholdNum < 0)) {
+        toast("Enter a valid £ threshold (0 or more).", "error");
+        return;
+      }
+      const fiveRaw = panel.querySelector("[data-fiveguys-max]")?.value;
+      const fiveNum = fiveRaw === "" || fiveRaw == null ? null : Number(fiveRaw);
+      if (fiveNum != null && (Number.isNaN(fiveNum) || fiveNum < 0)) {
+        toast("Enter a valid Five Guys € max (0 or more), or leave blank.", "error");
+        return;
+      }
+
+      const tweaks = { ...(next.conditionTweaks || {}) };
+      panel.querySelectorAll("[data-tweak-outcome]").forEach((el) => {
+        const key = el.getAttribute("data-tweak-outcome");
+        tweaks[key] = Object.assign({}, tweaks[key] || {}, { outcome: el.value });
+      });
+      panel.querySelectorAll("[data-tweak-footage]").forEach((el) => {
+        const key = el.getAttribute("data-tweak-footage");
+        tweaks[key] = Object.assign({}, tweaks[key] || {}, { footage: el.value });
+      });
+      const disputeGroups = new Set(
+        [...panel.querySelectorAll("[data-tweak-dispute-reason]")].map((el) => el.getAttribute("data-tweak-dispute-reason"))
+      );
+      disputeGroups.forEach((key) => {
+        if (!key) return;
+        const checked = [...panel.querySelectorAll(`[data-tweak-dispute-reason="${key}"]`)]
+          .filter((el) => el.checked)
+          .map((el) => normalizeSpace(el.value))
+          .filter(Boolean);
+        tweaks[key] = Object.assign({}, tweaks[key] || {}, {
+          reasonForDispute: checked,
+        });
+      });
+
+      const reasonMap = { ...(next.reasonMap || {}) };
+      panel.querySelectorAll("[data-reason-edit]").forEach((el) => {
+        const from = el.getAttribute("data-reason-edit");
+        const to = normalizeSpace(el.value);
+        if (from && to) reasonMap[from] = to;
+      });
+
+      const customerAliases = [...(next.customerAliases || [])];
+      panel.querySelectorAll("[data-preset-customer-match]").forEach((el) => {
+        const i = Number(el.getAttribute("data-preset-customer-match"));
+        const match = normalizeSpace(el.value);
+        const value = normalizeSpace(panel.querySelector(`[data-preset-customer-value="${i}"]`)?.value || "");
+        if (!match || !value) return;
+        const existing = customerAliases.findIndex((a) => normalizeKey(a.match) === normalizeKey(match));
+        const row = { match, value };
+        if (existing >= 0) customerAliases[existing] = row;
+        else customerAliases.push(row);
+      });
+
+      next.disputeThresholdGbp = thresholdNum;
+      next.fiveGuysMaxEur = fiveNum;
+      next.conditionTweaks = tweaks;
+      next.reasonMap = reasonMap;
+      next.customerAliases = customerAliases;
+      next.videoSubmitted = panel.querySelector("[data-video-submitted]")?.value || "No";
+      next.platformLabel = normalizeSpace(panel.querySelector("[data-platform-label]")?.value) || platform.platform;
+      saveUserConditions(next);
+      toast("Saved built-in condition tweaks.", "success", 4000);
       renderMapPanel();
     });
     panel.querySelector('[data-map-action="close"]')?.addEventListener("click", () => {
@@ -1197,13 +3916,25 @@
     let disputeAmount = parseMoney(pickBestLabeledValue("Partner refund value", "", true) || "");
 
     const items = extractRefundedItems();
-    const reasonValues = valuesAfterLabel("Refund reason");
-    const reasonRaw = [...reasonValues].reverse().find((v) => canonicalizeReason(v)) || "";
-    const itemReason = (items.find((item) => item && item.reason) || {}).reason || "";
-    let refundReason = canonicalizeReason(reasonRaw) || itemReason || "";
+    const reasonValues = valuesAfterLabel("Refund reason").filter(
+      (v) => REASON_ROW_RE.test(v) || /incomplete|missing|incorrect|prepared|food\s*safety/i.test(v)
+    );
+    const reasonFromLabel = [...reasonValues].reverse().find((v) => canonicalizeReason(v)) || "";
+    const itemWithReason = items.find((item) => item && (item.reasonRaw || item.reason)) || {};
+    const reasonFromItem = itemWithReason.reasonRaw || "";
+    // Prefer item-row wording when label text was canonicalized away or polluted
+    let refundReasonRaw = normalizeSpace(reasonFromItem || reasonFromLabel);
+    if (reasonFromItem && /incomplete/i.test(reasonFromItem) && !/incomplete/i.test(reasonFromLabel || "")) {
+      refundReasonRaw = normalizeSpace(reasonFromItem);
+    }
+    if (reasonFromLabel && /incomplete/i.test(reasonFromLabel)) {
+      refundReasonRaw = normalizeSpace(reasonFromLabel);
+    }
+    let refundReason = canonicalizeReason(refundReasonRaw) || canonicalizeReason(itemWithReason.reason) || "";
     if (!refundReason) {
       const fromPage = lines.find((line) => REASON_ROW_RE.test(line) && canonicalizeReason(line));
-      refundReason = canonicalizeReason(fromPage || "") || "";
+      refundReasonRaw = normalizeSpace(fromPage || "");
+      refundReason = canonicalizeReason(refundReasonRaw) || "";
     }
 
     const alreadyDisputed = detectAlreadyDisputed(lines);
@@ -1222,15 +3953,16 @@
       orderTime,
       customer,
       location: storeLocation,
-      platform: platform.platform,
+      platform: effectivePlatformLabel(),
       orderNumber,
       orderValue: orderValue == null ? "" : orderValue.toFixed(2),
       disputeAmount: disputeAmount == null ? "" : disputeAmount.toFixed(2),
       refundReason,
+      refundReasonRaw,
       alreadyDisputed,
       outcome: "",
-      videoSubmitted: workhorse.videoSubmitted || "No",
-      reasonForDispute: resolveReasonForDispute(refundReason),
+      videoSubmitted: effectiveVideoSubmitted(),
+      reasonForDispute: resolveReasonForDispute(refundReason, refundReasonRaw),
       footageStatus: "",
       wrongFoodItem: disputeFields.wrongFoodItem,
       preparedIncorrectlyWhy: disputeFields.preparedIncorrectlyWhy,

@@ -2,7 +2,7 @@
 
 Tampermonkey userscripts that read order/refund data from **Deliveroo** or **Uber Eats**, then fill the **OpSpot Claims** (Workhorse) form. You always click **Save** yourself — the scripts never submit the form.
 
-Field mappings, reason maps, outcome rules, and OpSpot fill order live in a **shared presets file** used by both platforms.
+Each `.user.js` file is **self-contained** (presets + core inlined). Edit shared logic in `claims-presets.js` / `claims-core.js`, then run `node build-static.js` and re-paste the userscripts.
 
 ---
 
@@ -10,28 +10,29 @@ Field mappings, reason maps, outcome rules, and OpSpot fill order live in a **sh
 
 | File | Role |
 |------|------|
-| [`claims-presets.js`](claims-presets.js) | **Edit here** — Workhorse labels/fill order + Deliveroo & Uber Eats presets (reason maps, outcome/footage rules, sheet tabs) |
+| [`claims-presets.js`](claims-presets.js) | **Edit here** — Workhorse labels/fill order + Deliveroo & Uber Eats presets |
 | [`claims-core.js`](claims-core.js) | Shared OpSpot fill engine, rules, transfer, UI, sheet helpers |
-| [`deliveroo-claims-autofill.user.js`](deliveroo-claims-autofill.user.js) | Deliveroo page extractors + buttons (v2.0.0) |
-| [`ubereats-claims-autofill.user.js`](ubereats-claims-autofill.user.js) | Uber Eats page extractors + buttons (v2.0.0) |
+| [`build-static.js`](build-static.js) | Inlines presets + core into both `.user.js` files |
+| [`deliveroo-claims-autofill.user.js`](deliveroo-claims-autofill.user.js) | Deliveroo userscript (static — paste into Tampermonkey) |
+| [`ubereats-claims-autofill.user.js`](ubereats-claims-autofill.user.js) | Uber Eats userscript (static — paste into Tampermonkey) |
 
 ```mermaid
 flowchart LR
   Presets[claims-presets.js]
   Core[claims-core.js]
+  Build[build-static.js]
   Deliveroo[deliveroo userscript]
   Uber[ubereats userscript]
   OpSpot[OpSpot Claims]
   Sheets[Google Sheets]
 
-  Deliveroo -->|"@require"| Presets
-  Deliveroo -->|"@require"| Core
-  Uber -->|"@require"| Presets
-  Uber -->|"@require"| Core
-  Deliveroo -->|extract| Core
-  Uber -->|extract| Core
-  Core -->|fill from workhorse.fills| OpSpot
-  Deliveroo -->|sheet preset| Sheets
+  Presets --> Build
+  Core --> Build
+  Build -->|inline| Deliveroo
+  Build -->|inline| Uber
+  Deliveroo -->|extract + fill| OpSpot
+  Uber -->|extract + fill| OpSpot
+  Deliveroo -->|sheet| Sheets
 ```
 
 ---
@@ -40,23 +41,15 @@ flowchart LR
 
 1. Install **[Tampermonkey](https://www.tampermonkey.net/)** in Chrome (or Edge/Firefox).
 2. In Chrome → `chrome://extensions` → Tampermonkey → enable **Allow User Scripts**.
-3. Install the userscripts from this repo (paste or import):
+3. Paste / import the full userscript (no external `@require`):
    - [`deliveroo-claims-autofill.user.js`](https://github.com/nachtalia/automation/blob/main/deliveroo-claims-autofill.user.js)
    - [`ubereats-claims-autofill.user.js`](https://github.com/nachtalia/automation/blob/main/ubereats-claims-autofill.user.js) (if you use Uber)
-4. Each script `@require`s shared files from GitHub automatically:
-   ```
-   // @require https://raw.githubusercontent.com/nachtalia/automation/main/claims-presets.js
-   // @require https://raw.githubusercontent.com/nachtalia/automation/main/claims-core.js
-   ```
-   You do **not** need a local copy of presets/core for day-to-day use.
-5. Enable the scripts, then refresh Deliveroo / Uber / OpSpot tabs.
+4. Enable the scripts, then refresh Deliveroo / Uber / OpSpot tabs.
 
 ### Share with a teammate
 
 Send them this repo: **https://github.com/nachtalia/automation**  
-They install Tampermonkey, paste the two `.user.js` files from `main`, and refresh. No folder path setup.
-
-If the repo is **private**, add them as a GitHub collaborator (raw `@require` needs access to the files). For private repos, a simpler option is: they clone the repo and temporarily switch `@require` to their local `file:///` paths.
+They install Tampermonkey, paste the `.user.js` file(s) from `main`, and refresh.
 
 ### OpSpot page
 
@@ -74,16 +67,22 @@ Open [`claims-presets.js`](claims-presets.js).
 |----------------|--------|
 | OpSpot field labels | `workhorse.labels` |
 | Fill order / which payload key → which OpSpot field | `workhorse.fills` |
-| Default video / £2 threshold | `workhorse.videoSubmitted`, `workhorse.disputeThresholdGbp` |
+| Default video / Not disputed threshold (£) | `workhorse.videoSubmitted`, `workhorse.disputeThresholdGbp` (Partner refund ≤ amount → Not disputed). Override in Deliveroo **Map & conditions → Conditions**. |
 | Deliveroo reason → Workhorse Reason for Dispute | `platforms.deliveroo.reasonMap` (includes Incomplete → Missing Item) |
 | Uber reason → Workhorse | `platforms.ubereats.reasonMap` |
 | Canonicalize patterns | `platforms.*.canonicalizeRules` |
 | Outcome / footage rules | `platforms.*.outcomeRules` / `footageRules` |
 | Customer aliases (e.g. Popeyes France) | `platforms.*.customerAliases` |
 | Google Sheet columns / brand tabs | `platforms.deliveroo.sheet` |
-| Sheet wording “Missing Items” | `platforms.deliveroo.sheet.refundReasonOverrides` |
+| Sheet wording for Refund Reason | `platforms.deliveroo.sheet.refundReasonOverrides` (follows Workhorse reason map, e.g. incomplete → Incorrect Item) |
 
-After editing presets or core **and pushing to `main`**, refresh the platform/OpSpot tabs so Tampermonkey reloads `@require` from GitHub.
+After editing presets or core:
+
+```bash
+node build-static.js
+```
+
+Then re-paste the updated `.user.js` into Tampermonkey and refresh the tabs.
 
 ---
 
@@ -143,7 +142,7 @@ Brand → tab (from presets): Shake Shack, Jollibee UK, Popeyes.
 - Extract on the platform tab first, then Fill on OpSpot.
 - After **Save and Add New**, the script can refill if a new order was already extracted.
 - Teal buttons = Deliveroo (`dcf-`); green = Uber Eats (`ucf-`).
-- If the console says presets/core are missing, check network access to `raw.githubusercontent.com` and that the files exist on `main`.
+- If the console says presets/core are missing, re-run `node build-static.js` and re-paste the full `.user.js`.
 
 ---
 
@@ -153,8 +152,8 @@ Brand → tab (from presets): Shake Shack, Jollibee UK, Popeyes.
 |---------|-------------|
 | Button doesn’t appear | Script enabled? Refresh? URL match? Console error about ClaimsPresets? |
 | “No stored order” on OpSpot | Extract on the platform tab first |
-| Wrong / missing fields | Re-extract; check preview `NOT FOUND`; adjust `reasonMap` / `fills` in presets |
-| `@require` fails | Open the raw GitHub URLs in a browser; confirm files are on `main`; check Tampermonkey can fetch external scripts |
+| Wrong / missing fields | Re-extract; check preview `NOT FOUND`; adjust `reasonMap` / `fills` in presets, then rebuild |
+| Fill does nothing | Re-paste latest static `.user.js` (v2.2.4+); open Add New first |
 | Platform dropdown wrong | OpSpot options must be exactly **Deliveroo** / **Uber Eats** |
 
 ---

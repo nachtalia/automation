@@ -9,7 +9,7 @@
   const workhorse = {
     claimsFormUrl: "https://opspot.workhorselive.com/sysTable.php?sys_module_id=10000&sys_data_entity_id=10000",
     videoSubmitted: "No",
-    disputeThresholdGbp: 2,
+    disputeThresholdGbp: 2, // Partner refund ≤ this (£) → Outcome: Not disputed
     fastFill: true,
     modalCacheMs: 800,
     debug: false,
@@ -162,9 +162,13 @@
           { match: "popeyes", tab: "Popeyes" },
         ],
         defaultSheetTab: "",
-        /** Override Workhorse "Missing Item" → sheet wording */
+        /** Map Workhorse Reason for Dispute → sheet “Refund Reason” wording */
         refundReasonOverrides: [
-          { test: "missing item|incomplete", value: "Missing Items" },
+          { test: "^missing\\s*items?$", value: "Missing Items" },
+          { test: "^incorrect\\s*items?$", value: "Incorrect Item" },
+          { test: "^incomplete\\s*items?$", value: "Incorrect Item" },
+          { test: "prepared incorrectly", value: "Prepared incorrectly" },
+          { test: "food safety", value: "Food safety complaint" },
         ],
       },
 

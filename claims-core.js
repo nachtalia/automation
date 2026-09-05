@@ -273,12 +273,34 @@
       return /five\s*guys/i.test([customer, storeLocation].filter(Boolean).join(" "));
     }
 
+    function reasonKeyForOutcomeRules(ctx) {
+      const dispute = normalizeKey(ctx && ctx.reasonForDispute);
+      if (/incorrect/.test(dispute)) return "incorrect item";
+      if (/prepared/.test(dispute)) return "prepared incorrectly";
+      if (/missing/.test(dispute)) return "missing items";
+      if (/food\s*safety|other/.test(dispute) && /food\s*safety/.test(normalizeKey(ctx.refundReasonRaw || ""))) {
+        return "food safety complaint";
+      }
+      if (/food\s*safety/.test(dispute)) return "food safety complaint";
+
+      const raw = normalizeKey((ctx && ctx.refundReasonRaw) || "");
+      // Incomplete mapped to Incorrect Item should use the incorrect-item outcome path
+      if (/incomplete/.test(raw)) {
+        if (/incorrect/.test(dispute) || !dispute) return "incorrect item";
+      }
+      return canonicalizeReason((ctx && (ctx.refundReasonRaw || ctx.refundReason)) || "") ||
+        canonicalizeReason(ctx && ctx.refundReason);
+    }
+
     function matchRule(rule, ctx) {
       const amount = disputeAmountNum(ctx);
-      const reason = canonicalizeReason(ctx.refundReason);
+      const reason = reasonKeyForOutcomeRules(ctx);
       switch (rule.type) {
         case "fiveGuysUnderMax": {
-          const max = platform.fiveGuysNotDisputedMaxEur;
+          const max =
+            ctx.fiveGuysMax != null && !Number.isNaN(Number(ctx.fiveGuysMax))
+              ? Number(ctx.fiveGuysMax)
+              : platform.fiveGuysNotDisputedMaxEur;
           if (max == null) return false;
           return (
             isFiveGuys(ctx.customer, ctx.location) &&
@@ -288,8 +310,13 @@
         }
         case "alreadyDisputed":
           return !!ctx.alreadyDisputed;
-        case "underDisputeThreshold":
-          return amount != null && amount < (workhorse.disputeThresholdGbp || 2);
+        case "underDisputeThreshold": {
+          const threshold =
+            ctx.disputeThreshold != null && !Number.isNaN(Number(ctx.disputeThreshold))
+              ? Number(ctx.disputeThreshold)
+              : workhorse.disputeThresholdGbp || 2;
+          return amount != null && amount <= threshold;
+        }
         case "reasonIn":
           return Array.isArray(rule.reasons) && rule.reasons.includes(reason);
         default:
@@ -297,18 +324,49 @@
       }
     }
 
-    function computeOutcome(ctx) {
-      const opts = workhorse.outcomeOptions || {};
-      for (const rule of platform.outcomeRules || []) {
-        if (matchRule(rule, ctx)) return opts[rule.outcomeKey] || "";
+    function conditionRuleKey(rule) {
+      if (!rule || !rule.type) return "";
+      if (rule.type === "reasonIn") {
+        const reasons = (rule.reasons || []).slice().sort().join("|");
+        if (/food safety/.test(reasons) && /missing items/.test(reasons)) return "missingFoodSafety";
+        if (/prepared incorrectly/.test(reasons) || /incorrect item/.test(reasons)) return "preparedIncorrect";
+        return `reasonIn:${reasons}`;
       }
-      return "";
+      return rule.type;
+    }
+
+    function resolveOutcomeMatch(ctx) {
+      const opts = workhorse.outcomeOptions || {};
+      const tweaks = (ctx && ctx.conditionTweaks) || {};
+      for (const rule of platform.outcomeRules || []) {
+        if (!matchRule(rule, ctx)) continue;
+        const key = conditionRuleKey(rule);
+        const tweak = tweaks[key] || {};
+        return {
+          key,
+          outcome: tweak.outcome || opts[rule.outcomeKey] || "",
+          reasonForDispute: Array.isArray(tweak.reasonForDispute)
+            ? tweak.reasonForDispute
+            : tweak.reasonForDispute
+              ? [tweak.reasonForDispute]
+              : [],
+        };
+      }
+      return { key: "", outcome: "", reasonForDispute: [] };
+    }
+
+    function computeOutcome(ctx) {
+      return resolveOutcomeMatch(ctx).outcome;
     }
 
     function computeFootageStatus(ctx) {
       const opts = workhorse.footageStatusOptions || {};
+      const tweaks = (ctx && ctx.conditionTweaks) || {};
       for (const rule of platform.footageRules || []) {
-        if (matchRule(rule, ctx)) return opts[rule.footageKey] || "";
+        if (!matchRule(rule, ctx)) continue;
+        const key = conditionRuleKey(rule);
+        if (tweaks[key] && tweaks[key].footage) return tweaks[key].footage;
+        return opts[rule.footageKey] || "";
       }
       return "";
     }
@@ -373,6 +431,8 @@
         disputeAmount: amount,
         alreadyDisputed: p.alreadyDisputed,
         refundReason: p.refundReason,
+        refundReasonRaw: p.refundReasonRaw,
+        reasonForDispute: p.reasonForDispute,
         customer: p.customer,
         location: p.location,
       };
@@ -1585,19 +1645,27 @@
     }
 
     function sheetRefundReason(payload) {
-      const mapped =
+      // Prefer resolved Workhorse reason (includes user incomplete → Incorrect Item maps)
+      const mapped = normalizeSpace(
         payload.reasonForDispute ||
-        mapReasonForDispute(canonicalizeReason(payload.refundReason || "")) ||
-        mapReasonForDispute(normalizeKey(payload.refundReason || "")) ||
-        "";
+          mapReasonForDispute(canonicalizeReason(payload.refundReasonRaw || payload.refundReason || "")) ||
+          mapReasonForDispute(normalizeKey(payload.refundReasonRaw || payload.refundReason || "")) ||
+          ""
+      );
+
       const overrides = (platform.sheet && platform.sheet.refundReasonOverrides) || [];
       for (const rule of overrides) {
         const re = compiledRegex(ruleRegexCache, rule.test, "i");
-        if (re && (re.test(mapped) || re.test(String(payload.refundReason || "")))) {
-          return rule.value;
-        }
+        // Only rewrite from the resolved Workhorse reason — never re-apply raw
+        // Deliveroo "incomplete" → Missing Items after the user mapped it to Incorrect Item.
+        if (re && mapped && re.test(mapped)) return rule.value;
       }
-      return mapped || payload.refundReason || "";
+
+      if (mapped) return mapped;
+
+      const raw = normalizeSpace(payload.refundReasonRaw || payload.refundReason || "");
+      if (/incomplete/i.test(raw)) return "Incorrect Item";
+      return raw;
     }
 
     function buildGoogleSheetRow(payload) {
@@ -1745,7 +1813,7 @@
         showPreview(payload);
         const entries = Object.entries(results || {});
         if (!entries.length) {
-          toast("Fill ran but no fields were processed. Update claims-core / refresh Tampermonkey @require cache.", "error", 9000);
+          toast("Fill ran but no fields were processed. Re-paste the latest userscript (run node build-static.js if you edit shared files).", "error", 9000);
           return;
         }
         const failed = entries
@@ -1821,6 +1889,8 @@
       mapReasonForDispute,
       normalizeCustomerName,
       normalizeLocationName,
+      conditionRuleKey,
+      resolveOutcomeMatch,
       computeOutcome,
       computeFootageStatus,
       buildDisputeFieldValues,

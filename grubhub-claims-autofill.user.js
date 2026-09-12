@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grubhub Sheet → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      1.0.7
+// @version      1.0.9
 // @description  Read a selected Google Sheet row (Grubhub adjustments) and fill OpSpot Claims.
 // @author       Claims Ops
 // @match        https://docs.google.com/spreadsheets/*
@@ -286,7 +286,7 @@
       buttonFill: "Fill from Grubhub",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "1.0.7",
+      versionLabel: "1.0.9",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: [
         { match: "joe\\s*&\\s*the\\s*juice|joe\\s*and\\s*the\\s*juice", value: "Joe & the Juice UK" },
@@ -2600,6 +2600,8 @@
     }
     if (totals.length) out["restaurant total"] = totals[totals.length - 1] || totals[0];
     if (subtotals.length) out.subtotal = subtotals[subtotals.length - 1] || subtotals[0];
+    out.__headers = headers.slice();
+    out.__cells = cells.slice();
     out.__totals = totals;
     out.__subtotals = subtotals;
     return out;
@@ -2654,10 +2656,27 @@
   }
 
   const CONDITIONS_KEY = "grubhub_user_conditions_v1";
+  const FIELD_MAP_KEY = "grubhub_user_field_map_v1";
   const condBtnId = `${uiPrefix}-cond-btn`;
   const condPanelId = `${uiPrefix}-cond-panel`;
   let userConditionsCache = null;
-  let condPanelPos = { top: 64, left: 18 };
+  let userFieldMapCache = null;
+  let mapPanelTab = "fields";
+  let condPanelPos = { top: 72, left: 18 };
+
+  const MAPPABLE_FIELDS = [
+    { key: "claimDate", label: "Claim Date", defaults: ["Date"], kind: "date" },
+    { key: "orderTime", label: "Order Time", defaults: ["Time"], kind: "time" },
+    { key: "restaurant", label: "Restaurant → Customer + Location", defaults: ["Restaurant", "Full Restaurant Name", "Restaurant Name"], kind: "split" },
+    { key: "customer", label: "Customer (column override)", defaults: [], kind: "text" },
+    { key: "location", label: "Location (column override)", defaults: [], kind: "text" },
+    { key: "orderNumber", label: "Order Number", defaults: ["ID", "Order ID", "Order Number"], kind: "text" },
+    { key: "fulfillment", label: "Platform (Fulfillment Type)", defaults: ["Fulfillment Type", "Fulfillment"], kind: "platform" },
+    { key: "description", label: "Reason / Description", defaults: ["Description", "Reason", "Adjustment Reason"], kind: "reason" },
+    { key: "orderValue", label: "Order Value", defaults: ["Subtotal"], kind: "money" },
+    { key: "disputeAmount", label: "Dispute Amount", defaults: ["Restaurant Total"], kind: "money" },
+    { key: "otherReason", label: "Other reason", defaults: [], kind: "text" },
+  ];
 
   function persistGm(key, value) {
     try {
@@ -2765,6 +2784,69 @@
   function saveUserConditions(data) {
     userConditionsCache = coerceConditions(data);
     persistGm(CONDITIONS_KEY, userConditionsCache);
+  }
+
+  function defaultUserFieldMap() {
+    return { columns: {}, headers: [] };
+  }
+
+  function loadUserFieldMap() {
+    if (userFieldMapCache) return userFieldMapCache;
+    let data = readGm(FIELD_MAP_KEY);
+    if (typeof data === "string") {
+      try {
+        data = JSON.parse(data);
+      } catch {
+        data = null;
+      }
+    }
+    userFieldMapCache = {
+      columns: data && data.columns && typeof data.columns === "object" ? data.columns : {},
+      headers: Array.isArray(data && data.headers) ? data.headers.map((h) => normalizeSpace(h)).filter(Boolean) : [],
+    };
+    return userFieldMapCache;
+  }
+
+  function saveUserFieldMap(data) {
+    userFieldMapCache = {
+      columns: data && data.columns && typeof data.columns === "object" ? { ...data.columns } : {},
+      headers: Array.isArray(data && data.headers) ? data.headers.map((h) => normalizeSpace(h)).filter(Boolean) : [],
+    };
+    persistGm(FIELD_MAP_KEY, userFieldMapCache);
+  }
+
+  function rememberSheetHeaders(headers) {
+    const list = (headers || []).map((h) => normalizeSpace(h)).filter(Boolean);
+    if (list.length < 2) return;
+    const current = loadUserFieldMap();
+    current.headers = list;
+    saveUserFieldMap(current);
+  }
+
+  function mappedColumn(fieldKey) {
+    return normalizeSpace((loadUserFieldMap().columns || {})[fieldKey] || "");
+  }
+
+  function valueByHeaderName(obj, name) {
+    const want = headerKey(name);
+    if (!want || !obj) return "";
+    const headers = obj.__headers || [];
+    const cells = obj.__cells || [];
+    let found = "";
+    for (let i = 0; i < Math.max(headers.length, cells.length); i++) {
+      if (headerKey(headers[i]) !== want) continue;
+      if (normalizeSpace(cells[i])) found = cells[i];
+    }
+    if (found) return found;
+    const keyed = obj[want];
+    return keyed && typeof keyed !== "object" ? keyed : "";
+  }
+
+  function cellFor(obj, fieldKey, defaults) {
+    const chosen = mappedColumn(fieldKey);
+    // A saved map must win. Falling back to the default column is why a remap looked like it did nothing.
+    if (chosen) return valueByHeaderName(obj, chosen);
+    return pickField(obj, defaults || []);
   }
 
   function effectiveDisputeThreshold() {
@@ -3069,24 +3151,40 @@
   }
 
   function ensureCondStyles() {
-    const styleId = `${uiPrefix}-cond-style`;
+    const styleId = `${uiPrefix}-cond-style-v2`;
     if (document.getElementById(styleId)) return;
+    document.getElementById(`${uiPrefix}-cond-style`)?.remove();
     const style = document.createElement("style");
     style.id = styleId;
     style.textContent = `
-      #${condBtnId} { background: #9a3412 !important; color: #ffedd5 !important; }
-      #${condPanelId} {
-        position: fixed; z-index: 2147483646; width: min(480px, 94vw); max-height: 78vh; overflow: auto;
-        background: #1c1917; color: #ffedd5; border-radius: 12px; padding: 0 14px 14px;
-        box-shadow: 0 12px 40px rgba(0,0,0,.45); font: 13px/1.4 Segoe UI, system-ui, sans-serif;
+      #${condBtnId} {
+        background: #9a3412 !important; color: #ffedd5 !important; border: 0 !important;
+        cursor: pointer !important; border-radius: 999px !important; padding: 12px 22px !important;
+        box-shadow: 0 10px 30px rgba(0,0,0,.35) !important;
+        font: 700 15px/1.2 Segoe UI, system-ui, sans-serif !important;
       }
+      #${condPanelId} {
+        position: fixed !important; inset: auto !important; margin: 0 !important;
+        z-index: 2147483647 !important; display: block !important; visibility: visible !important;
+        width: min(500px, 94vw) !important; max-height: 78vh !important; overflow: auto !important;
+        background: #1c1917 !important; color: #ffedd5 !important; border-radius: 12px !important;
+        padding: 0 14px 14px !important; box-shadow: 0 16px 48px rgba(0,0,0,.55) !important;
+        font: 13px/1.4 Segoe UI, system-ui, sans-serif !important;
+      }
+      #${condPanelId} * { box-sizing: border-box; }
       #${condPanelId} .${uiPrefix}-cond-drag {
         display: flex; align-items: center; gap: 8px; margin: 0 -14px 10px; padding: 12px 14px 8px;
         cursor: grab; user-select: none; border-bottom: 1px solid #44403c; position: sticky; top: 0;
-        background: #1c1917; z-index: 1;
+        background: #1c1917; z-index: 2;
       }
       #${condPanelId} .${uiPrefix}-cond-drag:active { cursor: grabbing; }
       #${condPanelId} .${uiPrefix}-cond-drag h3 { margin: 0; font-size: 15px; color: #fff; flex: 1; }
+      #${condPanelId} .${uiPrefix}-cond-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+      #${condPanelId} .${uiPrefix}-cond-tabs button {
+        flex: 1; border: 0; border-radius: 8px; padding: 8px; cursor: pointer;
+        background: #292524; color: #fdba74; font-weight: 700;
+      }
+      #${condPanelId} .${uiPrefix}-cond-tabs button.active { background: #ff8000; color: #1c1917; }
       #${condPanelId} p { margin: 0 0 10px; color: #fdba74; font-size: 12px; }
       #${condPanelId} code { color: #fed7aa; }
       #${condPanelId} .${uiPrefix}-cond-section { margin-top: 12px; padding-top: 8px; border-top: 1px solid #44403c; }
@@ -3094,7 +3192,7 @@
       #${condPanelId} .${uiPrefix}-cond-form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; margin-bottom: 8px; }
       #${condPanelId} input, #${condPanelId} select {
         border: 1px solid #78716c; border-radius: 6px; padding: 6px 8px;
-        background: #0c0a09; color: #fff; font-size: 12px; box-sizing: border-box;
+        background: #0c0a09; color: #fff; font-size: 12px; width: 100%;
       }
       #${condPanelId} .${uiPrefix}-cond-add, #${condPanelId} .${uiPrefix}-cond-actions button {
         border: 0; border-radius: 8px; padding: 8px 10px; cursor: pointer; font-weight: 700;
@@ -3105,7 +3203,8 @@
       #${condPanelId} .${uiPrefix}-cond-item {
         display: flex; gap: 8px; align-items: center; padding: 4px 0; font-size: 12px;
       }
-      #${condPanelId} .${uiPrefix}-cond-item button {
+      #${condPanelId} .${uiPrefix}-cond-item button,
+      #${condPanelId} .${uiPrefix}-map-clear {
         border: 0; border-radius: 6px; padding: 4px 8px; cursor: pointer; background: #7f1d1d; color: #fff; font-size: 11px;
       }
       #${condPanelId} .${uiPrefix}-cond-meta { color: #fdba74; font-size: 11px; margin-top: 4px; }
@@ -3121,14 +3220,36 @@
       #${condPanelId} .${uiPrefix}-cond-tweak-row input { flex: 1; }
       #${condPanelId} .${uiPrefix}-cond-check { display: flex; align-items: center; gap: 8px; margin-top: 4px; cursor: pointer; }
       #${condPanelId} .${uiPrefix}-cond-check input { width: 14px; height: 14px; accent-color: #ff8000; }
+      #${condPanelId} .${uiPrefix}-map-row {
+        display: grid; grid-template-columns: 1fr; gap: 4px;
+        padding: 8px 0; border-top: 1px solid #44403c;
+      }
+      #${condPanelId} .${uiPrefix}-map-row-top { display: flex; gap: 8px; align-items: center; }
+      #${condPanelId} .${uiPrefix}-map-controls { display: grid; grid-template-columns: 1fr auto; gap: 6px; }
     `;
-    document.documentElement.appendChild(style);
+    (document.documentElement || document.head).appendChild(style);
+  }
+
+  function pinPanel(panel) {
+    if (!panel) return;
+    panel.style.setProperty("position", "fixed", "important");
+    panel.style.setProperty("inset", "auto", "important");
+    panel.style.setProperty("margin", "0", "important");
+    panel.style.setProperty("left", `${condPanelPos.left}px`, "important");
+    panel.style.setProperty("top", `${condPanelPos.top}px`, "important");
+    panel.style.setProperty("right", "auto", "important");
+    panel.style.setProperty("bottom", "auto", "important");
+    panel.style.setProperty("transform", "none", "important");
+    panel.style.setProperty("z-index", "2147483647", "important");
+    panel.style.setProperty("display", "block", "important");
+    panel.style.setProperty("visibility", "visible", "important");
+    panel.style.setProperty("opacity", "1", "important");
   }
 
   function clampCondPanel(left, top, panel) {
-    const width = panel.offsetWidth || 480;
+    const width = panel.offsetWidth || 500;
     const maxLeft = Math.max(8, window.innerWidth - width - 8);
-    const maxTop = Math.max(8, window.innerHeight - 80);
+    const maxTop = Math.max(8, window.innerHeight - 72);
     return {
       left: Math.min(maxLeft, Math.max(8, left)),
       top: Math.min(maxTop, Math.max(8, top)),
@@ -3138,8 +3259,7 @@
   function applyCondPanelPos(panel) {
     const pos = clampCondPanel(condPanelPos.left, condPanelPos.top, panel);
     condPanelPos = pos;
-    panel.style.left = `${pos.left}px`;
-    panel.style.top = `${pos.top}px`;
+    pinPanel(panel);
   }
 
   function enableCondDrag(panel) {
@@ -3152,47 +3272,127 @@
     let originTop = 0;
     const onMove = (event) => {
       if (!dragging) return;
-      condPanelPos = clampCondPanel(originLeft + (event.clientX - startX), originTop + (event.clientY - startY), panel);
-      panel.style.left = `${condPanelPos.left}px`;
-      panel.style.top = `${condPanelPos.top}px`;
+      condPanelPos = clampCondPanel(
+        originLeft + (event.clientX - startX),
+        originTop + (event.clientY - startY),
+        panel
+      );
+      pinPanel(panel);
+      event.preventDefault();
     };
     const onUp = () => {
+      if (!dragging) return;
       dragging = false;
       document.removeEventListener("pointermove", onMove, true);
       document.removeEventListener("pointerup", onUp, true);
+      document.removeEventListener("mousemove", onMove, true);
+      document.removeEventListener("mouseup", onUp, true);
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
     };
-    panel.addEventListener("pointerdown", (event) => {
+    const onDown = (event) => {
       const handle = event.target.closest(`.${uiPrefix}-cond-drag`);
       if (!handle || event.target.closest("button")) return;
       if (event.button != null && event.button !== 0) return;
       dragging = true;
       startX = event.clientX;
       startY = event.clientY;
-      originLeft = panel.offsetLeft;
-      originTop = panel.offsetTop;
+      originLeft = panel.offsetLeft || condPanelPos.left;
+      originTop = panel.offsetTop || condPanelPos.top;
       event.preventDefault();
       document.addEventListener("pointermove", onMove, true);
       document.addEventListener("pointerup", onUp, true);
-    });
+      document.addEventListener("mousemove", onMove, true);
+      document.addEventListener("mouseup", onUp, true);
+      window.addEventListener("pointermove", onMove, true);
+      window.addEventListener("pointerup", onUp, true);
+    };
+    panel.addEventListener("pointerdown", onDown, true);
+    panel.addEventListener("mousedown", onDown, true);
+  }
+
+  const KNOWN_SHEET_COLUMNS = [
+    "Date",
+    "Time",
+    "Restaurant",
+    "Fulfillment Type",
+    "ID",
+    "Type",
+    "Description",
+    "Restaurant Total",
+    "Subtotal",
+    "Tax",
+  ];
+
+  function columnChoices(current) {
+    const saved = loadUserFieldMap().headers || [];
+    const values = [];
+    const seen = new Set();
+    for (const h of [...saved, ...KNOWN_SHEET_COLUMNS]) {
+      const key = headerKey(h);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      values.push(normalizeSpace(h));
+    }
+    if (current && !seen.has(headerKey(current))) values.unshift(current);
+    return values;
+  }
+
+  function renderFieldMapBody() {
+    const map = loadUserFieldMap();
+    const rows = MAPPABLE_FIELDS.map((field) => {
+      const current = normalizeSpace((map.columns || {})[field.key] || "");
+      const options = columnChoices(current)
+        .map((h) => `<option value="${escapeAttr(h)}" ${headerKey(h) === headerKey(current) ? "selected" : ""}>${escapeAttr(h)}</option>`)
+        .join("");
+      const fallback = field.defaults.length ? `Default: ${field.defaults[0]}` : "Blank = leave automatic";
+      return `<div class="${uiPrefix}-map-row">
+        <div class="${uiPrefix}-map-row-top">
+          <strong style="flex:1">${escapeAttr(field.label)}</strong>
+          ${current ? `<button type="button" class="${uiPrefix}-map-clear" data-map-clear="${escapeAttr(field.key)}">Clear</button>` : ""}
+        </div>
+        <div class="${uiPrefix}-map-controls">
+          <input data-map-column="${escapeAttr(field.key)}" list="${uiPrefix}-col-list" value="${escapeAttr(current)}" placeholder="${escapeAttr(field.defaults[0] || "Column header")}" />
+          <select data-map-select="${escapeAttr(field.key)}">
+            <option value="">${options ? "Pick column" : "Load columns"}</option>
+            ${options}
+          </select>
+        </div>
+        <div class="${uiPrefix}-cond-meta">${escapeAttr(current ? `Mapped to “${current}”` : fallback)}</div>
+      </div>`;
+    }).join("");
+    const datalist = `<datalist id="${uiPrefix}-col-list">${(map.headers || [])
+      .map((h) => `<option value="${escapeAttr(h)}"></option>`)
+      .join("")}</datalist>`;
+    return `
+      <p>Pick a sheet column for each field. Changing a dropdown applies it to the stored row immediately. Drag the title bar to move this panel.</p>
+      ${datalist}
+      <div class="${uiPrefix}-cond-actions" style="margin-top:0">
+        <button type="button" class="${uiPrefix}-cond-add" data-map-action="load-columns">Load columns from clipboard</button>
+      </div>
+      ${rows}
+      <div class="${uiPrefix}-cond-actions">
+        <button type="button" class="${uiPrefix}-cond-add" data-map-action="save">Apply column maps</button>
+        <button type="button" data-map-action="clear">Clear maps</button>
+      </div>
+    `;
   }
 
   function renderConditionsPanel() {
     ensureCondStyles();
     let panel = document.getElementById(condPanelId);
-    if (!panel) {
+    if (!panel || !panel.isConnected) {
       panel = document.createElement("div");
       panel.id = condPanelId;
-      document.body.appendChild(panel);
+      panel.setAttribute("popover", "manual");
+      (document.documentElement || document.body).appendChild(panel);
       enableCondDrag(panel);
     }
-    applyCondPanelPos(panel);
+    pinPanel(panel);
     const conditions = loadUserConditions();
-    panel.innerHTML = `
-      <div class="${uiPrefix}-cond-drag" title="Drag to move">
-        <span style="color:#a8a29e;letter-spacing:2px">⋮⋮</span>
-        <h3>Grubhub conditions</h3>
-      </div>
-      <p>Sheet text → Workhorse. Regex is allowed in the “from” box. Re-extract a row after saving.</p>
+    const fieldsBody = renderFieldMapBody();
+    const conditionsBody = `
+      <p>Sheet text → Workhorse. Regex is allowed in the “from” box. Re-extract a row after saving. Drag the title bar to move.</p>
       <div class="${uiPrefix}-cond-section">
         <h4>Customer aliases</h4>
         ${renderAliasList("customerAliases", conditions.customerAliases)}
@@ -3234,8 +3434,31 @@
         <button type="button" data-cond-action="close">Close</button>
       </div>
     `;
+    panel.innerHTML = `
+      <div class="${uiPrefix}-cond-drag" title="Drag to move">
+        <span style="color:#a8a29e;letter-spacing:2px">⋮⋮</span>
+        <h3>Grubhub map &amp; conditions</h3>
+        <button type="button" data-cond-action="close" style="background:#44403c;color:#fff;border:0;border-radius:8px;padding:6px 10px;cursor:pointer;font-weight:700">Close</button>
+      </div>
+      <div class="${uiPrefix}-cond-tabs">
+        <button type="button" data-map-tab="fields" class="${mapPanelTab === "fields" ? "active" : ""}">Field maps</button>
+        <button type="button" data-map-tab="conditions" class="${mapPanelTab === "conditions" ? "active" : ""}">Conditions</button>
+      </div>
+      ${mapPanelTab === "conditions" ? conditionsBody : fieldsBody}
+    `;
+    applyCondPanelPos(panel);
+    showCondPanel(panel);
 
-    panel.querySelector('[data-cond-action="close"]')?.addEventListener("click", () => panel.remove());
+    panel.querySelectorAll("[data-map-tab]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        mapPanelTab = btn.getAttribute("data-map-tab") || "fields";
+        renderConditionsPanel();
+      });
+    });
+    bindFieldMapActions(panel);
+    panel.querySelectorAll('[data-cond-action="close"]').forEach((btn) => {
+      btn.addEventListener("click", () => hideCondPanel(panel));
+    });
     panel.querySelector('[data-cond-action="clear"]')?.addEventListener("click", () => {
       saveUserConditions(defaultUserConditions());
       toast("Cleared your Grubhub conditions.", "success", 3500);
@@ -3351,33 +3574,168 @@
     });
   }
 
-  function toggleConditionsPanel() {
-    ensureCondStyles();
-    const existing = document.getElementById(condPanelId);
-    if (existing) {
-      existing.remove();
-      return;
+  function collectedFieldMap(panel) {
+    const columns = { ...(loadUserFieldMap().columns || {}) };
+    panel.querySelectorAll("[data-map-column]").forEach((el) => {
+      const key = el.getAttribute("data-map-column");
+      const select = panel.querySelector(`[data-map-select="${key}"]`);
+      const value = normalizeSpace((select && select.value) || el.value);
+      if (!key) return;
+      if (value) columns[key] = value;
+      else delete columns[key];
+    });
+    return columns;
+  }
+
+  function payloadFromStoredRow(payload) {
+    if (!payload || !Array.isArray(payload.sheetCells) || !payload.sheetCells.length) return null;
+    const headers =
+      Array.isArray(payload.sheetHeaders) && payload.sheetHeaders.length
+        ? payload.sheetHeaders
+        : guessHeadersForDataRow(payload.sheetCells);
+    const next = buildPayloadFromRowObject(rowToObject(headers, payload.sheetCells));
+    next.sheetHeaders = headers.slice();
+    next.sheetCells = payload.sheetCells.slice();
+    return next;
+  }
+
+  async function refreshPayloadWithMaps(payload) {
+    const rebuilt = payloadFromStoredRow(payload);
+    if (!rebuilt) return payload;
+    savePayload(rebuilt);
+    return rebuilt;
+  }
+
+  async function applyMapsNow(panel) {
+    const current = loadUserFieldMap();
+    if (panel) current.columns = collectedFieldMap(panel);
+    saveUserFieldMap(current);
+    let payload = null;
+    try {
+      payload = await loadPayload();
+    } catch (err) {
+      console.warn("[Grubhub Claims] loadPayload failed", err);
     }
-    renderConditionsPanel();
+    if (!payload || !payload.sheetCells) {
+      const text = await readClipboardText();
+      if (normalizeSpace(text) && !String(text).trim().startsWith("{") && !String(text).startsWith(platform.clipPrefix || "GCF1:")) {
+        try {
+          payload = parseClipboardToPayload(text);
+        } catch (err) {
+          console.warn("[Grubhub Claims] clipboard remap failed", err);
+        }
+      }
+    }
+    const rebuilt = payloadFromStoredRow(payload) || payload;
+    if (rebuilt && rebuilt.orderNumber && rebuilt.sheetCells) {
+      savePayload(rebuilt);
+      const summary = `Order value ${rebuilt.orderValue || "blank"} · dispute ${rebuilt.disputeAmount || "blank"}`;
+      if (isOpSpotPage()) {
+        await applyPayloadToClaims(rebuilt, { force: true });
+        toast(`Maps applied. ${summary}.`, "success", 5000);
+      } else {
+        showPreview(rebuilt);
+        toast(`Maps saved. ${summary}. Click Fill from Grubhub.`, "success", 5000);
+      }
+    } else {
+      toast("Maps saved. Copy the data row and click Extract once, then Fill uses these columns.", "info", 6000);
+    }
+    if (document.getElementById(condPanelId)) renderConditionsPanel();
+  }
+
+  function bindFieldMapActions(panel) {
+    panel.querySelectorAll("[data-map-select]").forEach((sel) => {
+      const key = sel.getAttribute("data-map-select");
+      const input = panel.querySelector(`[data-map-column="${key}"]`);
+      if (input && input.value) sel.value = input.value;
+      sel.addEventListener("change", () => {
+        if (input) input.value = sel.value;
+        applyMapsNow(panel);
+      });
+    });
+    panel.querySelectorAll("[data-map-column]").forEach((input) => {
+      input.addEventListener("change", () => applyMapsNow(panel));
+    });
+    panel.querySelectorAll("[data-map-clear]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const key = btn.getAttribute("data-map-clear");
+        const current = loadUserFieldMap();
+        delete current.columns[key];
+        saveUserFieldMap(current);
+        applyMapsNow(null);
+      });
+    });
+    panel.querySelector('[data-map-action="save"]')?.addEventListener("click", () => applyMapsNow(panel));
+    panel.querySelector('[data-map-action="clear"]')?.addEventListener("click", () => {
+      const current = loadUserFieldMap();
+      current.columns = {};
+      saveUserFieldMap(current);
+      applyMapsNow(null);
+    });
+    panel.querySelector('[data-map-action="load-columns"]')?.addEventListener("click", async () => {
+      const text = await readClipboardText();
+      const matrix = parseTsvMatrix(text);
+      if (!matrix.length || !looksLikeHeaderRow(matrix[0])) {
+        toast("Copy the header row first (Date, Time, Restaurant…), then Load columns.", "error", 6000);
+        return;
+      }
+      rememberSheetHeaders(matrix[0]);
+      toast(`Loaded ${matrix[0].filter(Boolean).length} columns. Pick them in the dropdowns, then Save.`, "success", 5000);
+      renderConditionsPanel();
+    });
+  }
+
+  function showCondPanel(panel) {
+    if (!panel.isConnected) (document.documentElement || document.body).appendChild(panel);
+    document.documentElement.appendChild(panel);
+    pinPanel(panel);
+    if (typeof panel.showPopover === "function") {
+      try {
+        if (!panel.matches(":popover-open")) panel.showPopover();
+      } catch (err) {
+        console.warn("[Grubhub Claims] showPopover failed", err);
+      }
+    }
+    pinPanel(panel);
+    panel.hidden = false;
+  }
+
+  function hideCondPanel(panel) {
+    if (!panel) return;
+    try {
+      if (typeof panel.hidePopover === "function") panel.hidePopover();
+    } catch {
+      /* ignore */
+    }
+    panel.remove();
+  }
+
+  function toggleConditionsPanel() {
+    try {
+      ensureCondStyles();
+      const existing = document.getElementById(condPanelId);
+      if (existing && existing.isConnected) {
+        hideCondPanel(existing);
+        return;
+      }
+      renderConditionsPanel();
+    } catch (err) {
+      console.error("[Grubhub Claims] conditions panel failed", err);
+      toast(`Could not open map panel: ${err.message || err}`, "error", 8000);
+    }
   }
 
   function buildPayloadFromRowObject(obj) {
     const cols = platform.sheetColumns || {};
-    const dateRaw = pickField(obj, cols.date || ["Date"]);
-    const timeRaw = pickField(obj, cols.time || ["Time"]);
-    // Restaurant → Customer + Location
+    const dateRaw = cellFor(obj, "claimDate", cols.date || ["Date"]);
+    const timeRaw = cellFor(obj, "orderTime", cols.time || ["Time"]);
     const restaurant =
+      cellFor(obj, "restaurant", cols.restaurant || ["Restaurant", "Full Restaurant Name", "Restaurant Name"]) ||
       obj[headerKey("Restaurant")] ||
-      pickField(obj, cols.restaurant || ["Restaurant"]);
-    // ID → Order Number
-    const orderId =
-      obj[headerKey("ID")] ||
-      pickField(obj, cols.orderId || ["ID", "Order ID", "Order Number"]);
-    // Description → Reason for Dispute (fallback: scan row for MISSING_ITEM etc.)
-    let description =
-      obj[headerKey("Description")] ||
-      pickField(obj, cols.description || ["Description", "Reason"]);
-    if (!description || /^adjustment\s+of\b/i.test(description) || description === orderId) {
+      "";
+    const orderId = cellFor(obj, "orderNumber", cols.orderId || ["ID", "Order ID", "Order Number"]);
+    let description = cellFor(obj, "description", cols.description || ["Description", "Reason", "Adjustment Reason"]);
+    if (!mappedColumn("description") && (!description || /^adjustment\s+of\b/i.test(description) || description === orderId)) {
       const reasonHit = Object.values(obj).find(
         (v) =>
           typeof v === "string" &&
@@ -3385,30 +3743,33 @@
       );
       if (reasonHit) description = reasonHit;
     }
-    // Fulfillment Type → Platform
-    const fulfillment =
-      obj[headerKey("Fulfillment Type")] ||
-      pickField(obj, cols.fulfillment || ["Fulfillment Type"]);
+    const fulfillment = cellFor(obj, "fulfillment", cols.fulfillment || ["Fulfillment Type", "Fulfillment"]);
     const platformLabel = mapFulfillmentToPlatform(fulfillment);
 
     const totals = obj.__totals || [];
     const subtotals = obj.__subtotals || [];
-    let disputeAmount = absMoney(pickField(obj, cols.restaurantTotal || ["Restaurant Total"]));
-    let orderValue = absMoney(pickField(obj, cols.subtotal || ["Subtotal"]));
-    for (const t of totals) {
-      const n = absMoney(t);
-      if (n != null && n > 0) disputeAmount = n;
+    let disputeAmount = absMoney(cellFor(obj, "disputeAmount", cols.restaurantTotal || ["Restaurant Total"]));
+    let orderValue = absMoney(cellFor(obj, "orderValue", cols.subtotal || ["Subtotal"]));
+    if (!mappedColumn("disputeAmount")) {
+      for (const t of totals) {
+        const n = absMoney(t);
+        if (n != null && n > 0) disputeAmount = n;
+      }
     }
-    for (const s of subtotals) {
-      const n = absMoney(s);
-      if (n != null && n > 0) orderValue = n;
+    if (!mappedColumn("orderValue")) {
+      for (const s of subtotals) {
+        const n = absMoney(s);
+        if (n != null && n > 0) orderValue = n;
+      }
     }
-    if (orderValue == null) orderValue = disputeAmount;
-    if (disputeAmount == null) disputeAmount = orderValue;
+    if (!mappedColumn("orderValue") && orderValue == null) orderValue = disputeAmount;
+    if (!mappedColumn("disputeAmount") && disputeAmount == null) disputeAmount = orderValue;
 
     const { customer: rawCustomer, location: rawLocation } = splitRestaurant(restaurant);
-    const customer = resolveCustomerName(rawCustomer) || rawCustomer;
-    const storeLocation = resolveLocationName(rawLocation) || rawLocation;
+    const customerOverride = cellFor(obj, "customer", []);
+    const locationOverride = cellFor(obj, "location", []);
+    const customer = resolveCustomerName(customerOverride || rawCustomer) || customerOverride || rawCustomer;
+    const storeLocation = resolveLocationName(locationOverride || rawLocation) || locationOverride || rawLocation;
     const claimDate = parseSheetDate(dateRaw);
     const orderTime = parseSheetTime(timeRaw);
     const refundReason = mapDescriptionToReason(description);
@@ -3419,7 +3780,8 @@
 
     const items = [];
     const disputeFields = buildDisputeFieldValues(items, refundReason, customer, storeLocation);
-    disputeFields.otherReason = [description, restaurant].filter(Boolean).join("\n");
+    const otherOverride = cellFor(obj, "otherReason", []);
+    disputeFields.otherReason = otherOverride || [description, restaurant].filter(Boolean).join("\n");
 
     let payload = {
       extractedAt: new Date().toISOString(),
@@ -3467,6 +3829,8 @@
     if (!payload.disputeAmount) errors.push("Restaurant Total");
     if (!payload.reasonForDispute) errors.push("Description → Reason for Dispute");
     payload.errors = errors;
+    if (Array.isArray(obj.__headers)) payload.sheetHeaders = obj.__headers.slice();
+    if (Array.isArray(obj.__cells)) payload.sheetCells = obj.__cells.slice();
     return payload;
   }
 
@@ -3489,6 +3853,7 @@
     }
 
     const obj = rowToObject(headers, dataRow);
+    rememberSheetHeaders(headers);
     return buildPayloadFromRowObject(obj);
   }
 
@@ -3704,14 +4069,16 @@
       toast("No Grubhub row stored. On the sheet: copy the row, click Extract, then Fill from Grubhub.", "error", 8000);
       return;
     }
+    payload = (await refreshPayloadWithMaps(payload)) || payload;
     await applyPayloadToClaims(payload, { force: true });
   }
 
   function mountSheet() {
     ensureStyles();
+    ensureCondStyles();
     ensureButtonBar();
     injectButton(btnId, platform.buttonExtract || "Extract sheet row → OpSpot", onExtractClick);
-    injectButton(condBtnId, "Conditions", toggleConditionsPanel);
+    injectButton(condBtnId, "Map & conditions", toggleConditionsPanel);
     if (!document.getElementById(`${uiPrefix}-tip`)) {
       const tip = document.createElement("div");
       tip.id = `${uiPrefix}-tip`;
@@ -3724,7 +4091,7 @@
     try {
       if (typeof GM_registerMenuCommand === "function") {
         GM_registerMenuCommand("Extract Grubhub sheet row", onExtractClick);
-        GM_registerMenuCommand("Grubhub conditions", toggleConditionsPanel);
+        GM_registerMenuCommand("Grubhub map & conditions", toggleConditionsPanel);
       }
     } catch {
       /* ignore */
@@ -3733,9 +4100,10 @@
 
   async function mountOpSpot() {
     ensureStyles();
+    ensureCondStyles();
     ensureButtonBar();
     injectButton(btnId, platform.buttonFill || "Fill from Grubhub", onFillClick);
-    injectButton(condBtnId, "Conditions", toggleConditionsPanel);
+    injectButton(condBtnId, "Map & conditions", toggleConditionsPanel);
     setupOpSpotSaveHooks(async () => {
       const p = await loadPayload();
       if (p && p.orderNumber) applyPayloadToClaims(p, { force: true, fast: true });
@@ -3749,7 +4117,7 @@
     try {
       if (typeof GM_registerMenuCommand === "function") {
         GM_registerMenuCommand("Fill OpSpot from Grubhub", onFillClick);
-        GM_registerMenuCommand("Grubhub conditions", toggleConditionsPanel);
+        GM_registerMenuCommand("Grubhub map & conditions", toggleConditionsPanel);
       }
     } catch {
       /* ignore */

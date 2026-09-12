@@ -152,7 +152,7 @@ Sheet: [Grubhub adjustments](https://docs.google.com/spreadsheets/d/1fLAWWmj_ZBI
 1. Open the sheet and click the **row number** (selects the whole row).
 2. **Ctrl+C** to copy.
 3. Click **Extract sheet row → OpSpot** (orange button).
-4. *(Optional)* Click **Conditions** to tweak customer/location aliases, reason maps, outcome, footage, video, and the £ threshold. Saved in this browser — re-extract after a change.
+4. *(Optional)* Click **Map & conditions** (draggable). Map sheet columns to Workhorse fields, or tweak aliases, reasons, and outcomes. Re-extract after a change.
 5. OpSpot Claims → **Add New** → **Fill from Grubhub**.
 6. Review, then **Save**.
 

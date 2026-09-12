@@ -3,7 +3,7 @@
  * Usage: node build-static.js
  *
  * Keeps claims-presets.js + claims-core.js as the editable sources,
- * then inlines them into both .user.js files.
+ * then inlines them into platform .user.js files.
  */
 const fs = require("fs");
 const path = require("path");
@@ -11,6 +11,12 @@ const path = require("path");
 const root = __dirname;
 const BEGIN = "/* ==== BEGIN INLINED SHARED (from claims-presets.js + claims-core.js) ==== */";
 const END = "/* ==== END INLINED SHARED ==== */";
+
+const USER_SCRIPTS = [
+  "deliveroo-claims-autofill.user.js",
+  "ubereats-claims-autofill.user.js",
+  "grubhub-claims-autofill.user.js",
+];
 
 function read(name) {
   return fs.readFileSync(path.join(root, name), "utf8");
@@ -24,6 +30,7 @@ function stripRequireLines(headerBlock) {
 }
 
 function bumpVersion(headerBlock, version) {
+  // Only bump if file uses shared 2.x line; grubhub keeps its own @version unless FORCE
   return headerBlock.replace(/^(\/\/\s*@version\s+).+$/m, `$1${version}`);
 }
 
@@ -65,7 +72,12 @@ function updateDocComment(body, note) {
 function buildOne(userFile, version) {
   const raw = read(userFile);
   let header = stripRequireLines(extractHeader(raw));
-  header = bumpVersion(header, version);
+  // Grubhub is 1.x; keep its header version unless it already has shared inline
+  if (!/grubhub/i.test(userFile)) {
+    header = bumpVersion(header, version);
+  } else {
+    header = bumpVersion(header, "1.0.7");
+  }
   let body = extractPlatformBody(raw);
   body = updateDocComment(
     body,
@@ -77,7 +89,7 @@ function buildOne(userFile, version) {
     "Inlined into platform userscripts by build-static.js."
   );
   const core = read("claims-core.js").replace(
-    /Not a userscript\. Load via Tampermonkey @require after claims-presets\.js\./,
+    /Not a userscript\. Load via Tampermonkey @require after claims-presets\.js[^\n]*/,
     "Inlined into platform userscripts by build-static.js (after claims-presets)."
   );
 
@@ -93,13 +105,16 @@ function buildOne(userFile, version) {
     body.replace(/^\uFEFF/, "").trimStart(),
   ].join("\n");
 
-  fs.writeFileSync(path.join(root, userFile), out.replace(/\n/g, "\r\n").includes("\r") ? out : out);
-  // normalize to LF
   fs.writeFileSync(path.join(root, userFile), out.replace(/\r\n/g, "\n"));
-  console.log(`Built ${userFile} (v${version})`);
+  console.log(`Built ${userFile}`);
 }
 
-const VERSION = "2.3.7";
-buildOne("deliveroo-claims-autofill.user.js", VERSION);
-buildOne("ubereats-claims-autofill.user.js", VERSION);
+const VERSION = "2.3.8";
+for (const file of USER_SCRIPTS) {
+  if (!fs.existsSync(path.join(root, file))) {
+    console.warn(`Skip missing ${file}`);
+    continue;
+  }
+  buildOne(file, VERSION);
+}
 console.log("Done. Paste the .user.js files into Tampermonkey (no @require needed).");

@@ -1,6 +1,6 @@
 # Claims Auto-Fill Scripts
 
-Tampermonkey userscripts that read order/refund data from **Deliveroo** or **Uber Eats**, then fill the **OpSpot Claims** (Workhorse) form. You always click **Save** yourself — the scripts never submit the form.
+Tampermonkey userscripts that read order/refund data from **Deliveroo**, **Uber Eats**, or a **Grubhub Google Sheet**, then fill the **OpSpot Claims** (Workhorse) form. You always click **Save** yourself — the scripts never submit the form.
 
 Each `.user.js` file is **self-contained** (presets + core inlined). Edit shared logic in `claims-presets.js` / `claims-core.js`, then run `node build-static.js` and re-paste the userscripts.
 
@@ -10,11 +10,12 @@ Each `.user.js` file is **self-contained** (presets + core inlined). Edit shared
 
 | File | Role |
 |------|------|
-| [`claims-presets.js`](claims-presets.js) | **Edit here** — Workhorse labels/fill order + Deliveroo & Uber Eats presets |
+| [`claims-presets.js`](claims-presets.js) | **Edit here** — Workhorse labels/fill order + platform presets |
 | [`claims-core.js`](claims-core.js) | Shared OpSpot fill engine, rules, transfer, UI, sheet helpers |
-| [`build-static.js`](build-static.js) | Inlines presets + core into both `.user.js` files |
-| [`deliveroo-claims-autofill.user.js`](deliveroo-claims-autofill.user.js) | Deliveroo userscript (static — paste into Tampermonkey) |
-| [`ubereats-claims-autofill.user.js`](ubereats-claims-autofill.user.js) | Uber Eats userscript (static — paste into Tampermonkey) |
+| [`build-static.js`](build-static.js) | Inlines presets + core into `.user.js` files |
+| [`deliveroo-claims-autofill.user.js`](deliveroo-claims-autofill.user.js) | Deliveroo userscript |
+| [`ubereats-claims-autofill.user.js`](ubereats-claims-autofill.user.js) | Uber Eats userscript |
+| [`grubhub-claims-autofill.user.js`](grubhub-claims-autofill.user.js) | Grubhub Google Sheet → OpSpot |
 
 ```mermaid
 flowchart LR
@@ -23,6 +24,7 @@ flowchart LR
   Build[build-static.js]
   Deliveroo[deliveroo userscript]
   Uber[ubereats userscript]
+  Grubhub[grubhub userscript]
   OpSpot[OpSpot Claims]
   Sheets[Google Sheets]
 
@@ -30,9 +32,12 @@ flowchart LR
   Core --> Build
   Build -->|inline| Deliveroo
   Build -->|inline| Uber
+  Build -->|inline| Grubhub
   Deliveroo -->|extract + fill| OpSpot
   Uber -->|extract + fill| OpSpot
+  Grubhub -->|sheet row + fill| OpSpot
   Deliveroo -->|sheet| Sheets
+  Sheets -->|copy row| Grubhub
 ```
 
 ---
@@ -44,7 +49,12 @@ flowchart LR
 3. Paste / import the full userscript (no external `@require`):
    - [`deliveroo-claims-autofill.user.js`](https://github.com/nachtalia/automation/blob/main/deliveroo-claims-autofill.user.js)
    - [`ubereats-claims-autofill.user.js`](https://github.com/nachtalia/automation/blob/main/ubereats-claims-autofill.user.js) (if you use Uber)
-4. Enable the scripts, then refresh Deliveroo / Uber / OpSpot tabs.
+   - [`grubhub-claims-autofill.user.js`](https://github.com/nachtalia/automation/blob/main/grubhub-claims-autofill.user.js) (Grubhub sheet)
+4. Enable the scripts, then refresh the matching tabs.
+
+### OpSpot Platform dropdown
+
+Confirm **Platform** includes **Deliveroo**, **Uber Eats**, and **Grubhub** (exact spelling).
 
 ### Share with a teammate
 
@@ -54,8 +64,6 @@ They install Tampermonkey, paste the `.user.js` file(s) from `main`, and refresh
 ### OpSpot page
 
 `https://opspot.workhorselive.com/sysTable.php?sys_module_id=10000&sys_data_entity_id=10000#`
-
-Confirm the **Platform** dropdown includes **Deliveroo** and **Uber Eats**.
 
 ---
 
@@ -137,11 +145,35 @@ Brand → tab (from presets): Shake Shack, Jollibee UK, Popeyes.
 
 ---
 
+## Grubhub sheet workflow
+
+Sheet: [Grubhub adjustments](https://docs.google.com/spreadsheets/d/1fLAWWmj_ZBIUQ-AJirNrY_yw6r03JwnsPvPb1Qcae1o/edit?gid=1584984751#gid=1584984751)
+
+1. Open the sheet and click the **row number** (selects the whole row).
+2. **Ctrl+C** to copy.
+3. Click **Extract sheet row → OpSpot** (orange button).
+4. *(Optional)* Click **Conditions** to tweak customer/location aliases, reason maps, outcome, footage, video, and the £ threshold. Saved in this browser — re-extract after a change.
+5. OpSpot Claims → **Add New** → **Fill from Grubhub**.
+6. Review, then **Save**.
+
+| OpSpot field | Sheet column |
+|--------------|----------------|
+| Claim Date / Order Time | Date / Time |
+| Customer / Location | Restaurant Name (`Brand - Location`) |
+| Platform | Grubhub |
+| Order Number | Order ID |
+| Order Value | Subtotal (absolute) |
+| Dispute Amount | Restaurant Total (absolute) |
+| Reason for Dispute | Reason / Description (`MISSING_ITEM` → Missing Item, `INCORRECT_ITEM` → Incorrect Item) |
+| Other reason | Reason text (+ restaurant) |
+
+---
+
 ## Tips
 
-- Extract on the platform tab first, then Fill on OpSpot.
+- Extract on the platform/sheet tab first, then Fill on OpSpot.
 - After **Save and Add New**, the script can refill if a new order was already extracted.
-- Teal buttons = Deliveroo (`dcf-`); green = Uber Eats (`ucf-`).
+- Teal = Deliveroo (`dcf-`); green = Uber Eats (`ucf-`); orange = Grubhub (`gcf-`).
 - If the console says presets/core are missing, re-run `node build-static.js` and re-paste the full `.user.js`.
 
 ---
@@ -154,7 +186,8 @@ Brand → tab (from presets): Shake Shack, Jollibee UK, Popeyes.
 | “No stored order” on OpSpot | Extract on the platform tab first |
 | Wrong / missing fields | Re-extract; check preview `NOT FOUND`; adjust `reasonMap` / `fills` in presets, then rebuild |
 | Fill does nothing | Re-paste latest static `.user.js` (v2.2.4+); open Add New first |
-| Platform dropdown wrong | OpSpot options must be exactly **Deliveroo** / **Uber Eats** |
+| Platform dropdown wrong | OpSpot options must be exactly **Deliveroo** / **Uber Eats** / **Grubhub** |
+| Grubhub extract fails | Click the **row number** (not one cell), Ctrl+C, then Extract; allow clipboard if prompted |
 
 ---
 

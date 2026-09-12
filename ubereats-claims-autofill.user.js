@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Eats Order → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.3.7
+// @version      2.3.8
 // @description  Read Uber Eats Manager orders/issues and fill OpSpot Claims (preset-driven Workhorse fills).
 // @author       Claims Ops
 // @match        https://merchants.ubereats.com/*
@@ -271,6 +271,88 @@
 
       otherReasonIncludesCustomerLocation: true,
     },
+
+    grubhub: {
+      id: "grubhub",
+      platform: "Grubhub",
+      hostHint: "docs.google.com/spreadsheets",
+      storageKey: "grubhub_claim_payload_v1",
+      sheetStorageKey: "",
+      clipPrefix: "GCF1:",
+      uiPrefix: "gcf",
+      hitColor: "#ff8000",
+      buttonExtract: "Extract sheet row → OpSpot",
+      buttonFill: "Fill from Grubhub",
+      buttonSheetCopy: "",
+      buttonSheetPaste: "",
+      versionLabel: "1.0.7",
+      fiveGuysNotDisputedMaxEur: null,
+      customerAliases: [
+        { match: "joe\\s*&\\s*the\\s*juice|joe\\s*and\\s*the\\s*juice", value: "Joe & the Juice UK" },
+      ],
+      locationAliases: [],
+
+      /** Google Sheet column headers (row 1) → payload fields */
+      sheetColumns: {
+        date: ["Date"],
+        time: ["Time"],
+        /** Split on " - " → Customer + Location */
+        restaurant: ["Restaurant", "Full Restaurant Name", "Restaurant Name"],
+        /** e.g. "Grubhub Delivery" → Platform Grubhub */
+        fulfillment: ["Fulfillment Type", "Fulfillment"],
+        /** Sheet "ID" column = OpSpot Order Number */
+        orderId: ["ID", "Order ID", "Order Number"],
+        type: ["Type"],
+        /** Sheet "Description" = reason → Reason for Dispute */
+        description: ["Description", "Reason", "Adjustment Reason"],
+        restaurantTotal: ["Restaurant Total"],
+        subtotal: ["Subtotal"],
+        tax: ["Tax"],
+      },
+      /** Normalize fulfillment text → Workhorse Platform dropdown */
+      platformFromFulfillment: [
+        { test: "grubhub", value: "Grubhub" },
+        { test: "uber", value: "Uber Eats" },
+        { test: "deliveroo", value: "Deliveroo" },
+      ],
+      preferAbsoluteTotals: true,
+
+      reasonMap: {
+        missing: "Missing Item",
+        "missing item": "Missing Item",
+        "missing items": "Missing Item",
+        missing_item: "Missing Item",
+        incorrect: "Incorrect Item",
+        "incorrect item": "Incorrect Item",
+        "incorrect items": "Incorrect Item",
+        incorrect_item: "Incorrect Item",
+        "prepared incorrectly": "Prepared incorrectly",
+        "food safety complaint": "Other",
+        "food safety": "Other",
+      },
+
+      canonicalizeRules: [
+        { test: "missing[_\\s-]*item|missing_item|refund due to a missing", canonical: "missing items" },
+        { test: "incorrect[_\\s-]*item|incorrect_item", canonical: "incorrect item" },
+        { test: "prepared incorrectly", canonical: "prepared incorrectly" },
+        { test: "food\\s*safety", canonical: "food safety complaint" },
+      ],
+
+      outcomeRules: [
+        { type: "underDisputeThreshold", outcomeKey: "notDisputed" },
+        { type: "reasonIn", reasons: ["missing items", "food safety complaint"], outcomeKey: "awaitingReview" },
+        { type: "reasonIn", reasons: ["prepared incorrectly", "incorrect item"], outcomeKey: "pending" },
+      ],
+
+      footageRules: [
+        { type: "underDisputeThreshold", footageKey: "irrelevant" },
+        { type: "reasonIn", reasons: ["missing items", "food safety complaint"], footageKey: "irrelevant" },
+        { type: "reasonIn", reasons: ["prepared incorrectly", "incorrect item"], footageKey: "irrelevant" },
+      ],
+
+      sheet: { enabled: false },
+      otherReasonIncludesCustomerLocation: false,
+    },
   };
 
   root.ClaimsPresets = {
@@ -280,18 +362,36 @@
       return platforms[id] || null;
     },
   };
-})(typeof unsafeWindow !== "undefined" ? unsafeWindow : typeof window !== "undefined" ? window : globalThis);
+  if (typeof globalThis !== "undefined" && root !== globalThis) {
+    try {
+      globalThis.ClaimsPresets = root.ClaimsPresets;
+    } catch {
+      /* ignore */
+    }
+  }
+})(typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : this);
 
 /**
- * ClaimsCore — shared OpSpot fill / rules / transfer helpers for Deliveroo & Uber Eats.
+ * ClaimsCore — shared OpSpot fill / rules / transfer helpers for Deliveroo, Uber Eats & Grubhub.
  * Inlined into platform userscripts by build-static.js (after claims-presets).
  *
- *   const core = ClaimsCore.create("deliveroo"); // or "ubereats"
+ *   const core = ClaimsCore.create("deliveroo"); // or "ubereats" | "grubhub"
  */
 (function (root) {
   "use strict";
 
   const HEADER_WORDS = /^(quantity|qty|price|item|items|name|category|total|refund reason|refund details)$/i;
+
+  // Capture GM APIs in the userscript sandbox. Do not look them up later via
+  // unsafeWindow — Google Sheets can run page-world code where GM_* is missing,
+  // which made Extract look successful (in-memory preview) while OpSpot saw nothing.
+  const gmSetValue = typeof GM_setValue === "function" ? GM_setValue : null;
+  const gmGetValue = typeof GM_getValue === "function" ? GM_getValue : null;
+  const gmSetValueAsync =
+    typeof GM !== "undefined" && GM && typeof GM.setValue === "function" ? GM.setValue.bind(GM) : null;
+  const gmGetValueAsync =
+    typeof GM !== "undefined" && GM && typeof GM.getValue === "function" ? GM.getValue.bind(GM) : null;
+  const gmSetClipboard = typeof GM_setClipboard === "function" ? GM_setClipboard : null;
 
   function ClaimsCoreCreate(platformId) {
     const presets = root.ClaimsPresets || (typeof globalThis !== "undefined" && globalThis.ClaimsPresets);
@@ -302,7 +402,7 @@
     const workhorse = presets.workhorse;
     const platform = presets.getPlatform(platformId);
     if (!platform) {
-      throw new Error(`ClaimsCore: unknown platformId "${platformId}". Expected "deliveroo" or "ubereats".`);
+      throw new Error(`ClaimsCore: unknown platformId "${platformId}". Expected "deliveroo", "ubereats", or "grubhub".`);
     }
     if (!workhorse) {
       throw new Error("ClaimsCore: ClaimsPresets.workhorse is missing.");
@@ -1800,6 +1900,10 @@
       if (existing) existing.remove();
       const el = document.createElement("div");
       el.id = id;
+      const title = document.createElement("h3");
+      title.textContent = "Read from screen";
+      el.appendChild(title);
+      const table = document.createElement("table");
       const rows = [
         ["Claim Date", payload.claimDate],
         ["Order Time", payload.orderTime],
@@ -1818,10 +1922,19 @@
         ["Wrong, Missing or Incorrect Food Item", payload.wrongFoodItem],
         ["Other reason", payload.otherReason],
         ["Contested / Disputed", payload.alreadyDisputed ? "Yes" : "No"],
-      ]
-        .map(([k, v]) => `<tr><td>${k}</td><td class="${v ? "" : "missing"}">${escapeHtml(v || "NOT FOUND")}</td></tr>`)
-        .join("");
-      el.innerHTML = `<h3>Read from screen</h3><table>${rows}</table>`;
+      ];
+      for (const [k, v] of rows) {
+        const tr = document.createElement("tr");
+        const tdK = document.createElement("td");
+        tdK.textContent = k;
+        const tdV = document.createElement("td");
+        tdV.textContent = v || "NOT FOUND";
+        if (!v) tdV.className = "missing";
+        tr.appendChild(tdK);
+        tr.appendChild(tdV);
+        table.appendChild(tr);
+      }
+      el.appendChild(table);
       document.body.appendChild(el);
       setTimeout(() => el.remove(), 12000);
     }
@@ -1852,50 +1965,103 @@
       return btn;
     }
 
+    function coercePayload(raw) {
+      if (raw == null || raw === "") return null;
+      let value = raw;
+      if (typeof value === "string") {
+        const prefix = platform.clipPrefix || "";
+        let text = value;
+        if (prefix && text.startsWith(prefix)) text = text.slice(prefix.length);
+        const trimmed = text.trim();
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
+        try {
+          value = JSON.parse(trimmed);
+        } catch {
+          return null;
+        }
+      }
+      if (!value || typeof value !== "object") return null;
+      if (value.payload && value.payload.orderNumber) return value.payload;
+      if (value.orderNumber) return value;
+      return null;
+    }
+
+    async function readStoredValue(key) {
+      let value = null;
+      try {
+        if (gmGetValue) value = gmGetValue(key, null);
+      } catch (err) {
+        log("GM_getValue failed", err);
+      }
+      if (value && typeof value.then === "function") {
+        try {
+          value = await value;
+        } catch (err) {
+          log("GM_getValue promise failed", err);
+          value = null;
+        }
+      }
+      if (value != null && value !== "") return value;
+      try {
+        if (gmGetValueAsync) value = await gmGetValueAsync(key, null);
+      } catch (err) {
+        log("GM.getValue failed", err);
+      }
+      return value != null && value !== "" ? value : null;
+    }
+
     function savePayload(payload) {
       const key = platform.storageKey;
       const prefix = platform.clipPrefix || "";
+      let plain = payload;
       try {
-        if (typeof GM_setValue === "function") GM_setValue(key, payload);
+        plain = JSON.parse(JSON.stringify(payload));
       } catch (err) {
-        log("GM_setValue failed", err);
+        log("payload serialize failed", err);
       }
+      let json = "";
       try {
-        if (typeof GM !== "undefined" && GM.setValue) GM.setValue(key, payload);
+        json = JSON.stringify(plain);
       } catch (err) {
-        log("GM.setValue failed", err);
+        log("payload stringify failed", err);
       }
-      try {
-        if (typeof GM_setClipboard === "function") GM_setClipboard(prefix + JSON.stringify(payload));
-      } catch (err) {
-        log("clipboard failed", err);
+      const write = (storeKey, value) => {
+        try {
+          if (gmSetValue) gmSetValue(storeKey, value);
+        } catch (err) {
+          log("GM_setValue failed", err);
+        }
+        try {
+          if (gmSetValueAsync) {
+            Promise.resolve(gmSetValueAsync(storeKey, value)).catch((err) => log("GM.setValue failed", err));
+          }
+        } catch (err) {
+          log("GM.setValue failed", err);
+        }
+      };
+      write(key, plain);
+      if (json) write(`${key}__json`, json);
+      if (json) {
+        try {
+          if (gmSetClipboard) gmSetClipboard(prefix + json);
+        } catch (err) {
+          log("clipboard failed", err);
+        }
       }
     }
 
     async function loadPayload() {
       const key = platform.storageKey;
       const prefix = platform.clipPrefix || "";
-      let payload = null;
-      try {
-        if (typeof GM_getValue === "function") payload = GM_getValue(key, null);
-      } catch (err) {
-        log("GM_getValue failed", err);
-      }
-      if (payload && payload.orderNumber) return payload;
-      try {
-        if (typeof GM !== "undefined" && GM.getValue) payload = await GM.getValue(key, null);
-      } catch (err) {
-        log("GM.getValue failed", err);
-      }
-      if (payload && payload.orderNumber) return payload;
+      const fromStore =
+        coercePayload(await readStoredValue(key)) ||
+        coercePayload(await readStoredValue(`${key}__json`));
+      if (fromStore) return fromStore;
       try {
         const text = await navigator.clipboard.readText();
         if (!text) return null;
-        if (prefix && text.startsWith(prefix)) return JSON.parse(text.slice(prefix.length));
-        if (text.trim().startsWith("{")) {
-          const parsed = JSON.parse(text);
-          if (parsed.orderNumber) return parsed;
-        }
+        if (prefix && text.startsWith(prefix)) return coercePayload(text.slice(prefix.length));
+        return coercePayload(text);
       } catch (err) {
         log("clipboard read failed", err);
       }
@@ -1983,13 +2149,21 @@
     function saveSheetTransfer(transfer) {
       const key = platform.sheetStorageKey;
       if (!key) return;
+      let plain = transfer;
       try {
-        if (typeof GM_setValue === "function") GM_setValue(key, transfer);
+        plain = JSON.parse(JSON.stringify(transfer));
+      } catch (err) {
+        log("sheet serialize failed", err);
+      }
+      try {
+        if (gmSetValue) gmSetValue(key, plain);
       } catch (err) {
         log("sheet GM_setValue failed", err);
       }
       try {
-        if (typeof GM !== "undefined" && GM.setValue) GM.setValue(key, transfer);
+        if (gmSetValueAsync) {
+          Promise.resolve(gmSetValueAsync(key, plain)).catch((err) => log("sheet GM.setValue failed", err));
+        }
       } catch (err) {
         log("sheet GM.setValue failed", err);
       }
@@ -1998,18 +2172,7 @@
     async function loadSheetTransfer() {
       const key = platform.sheetStorageKey;
       if (!key) return null;
-      let transfer = null;
-      try {
-        if (typeof GM_getValue === "function") transfer = GM_getValue(key, null);
-      } catch (err) {
-        log("sheet GM_getValue failed", err);
-      }
-      if (transfer && transfer.row) return transfer;
-      try {
-        if (typeof GM !== "undefined" && GM.getValue) transfer = await GM.getValue(key, null);
-      } catch (err) {
-        log("sheet GM.getValue failed", err);
-      }
+      const transfer = await readStoredValue(key);
       return transfer && transfer.row ? transfer : null;
     }
 
@@ -2049,8 +2212,8 @@
 
     function copyTextToClipboard(text) {
       try {
-        if (typeof GM_setClipboard === "function") {
-          GM_setClipboard(text);
+        if (gmSetClipboard) {
+          gmSetClipboard(text);
           return true;
         }
       } catch (err) {
@@ -2069,7 +2232,7 @@
 
     async function applyPayloadToClaims(payload, options = {}) {
       if (!payload || !payload.orderNumber) {
-        toast("No order payload to fill. Run Auto-Fill on Deliveroo first.", "error", 7000);
+        toast(`No order payload to fill. Click ${platform.buttonExtract || "Extract"} first.`, "error", 7000);
         return;
       }
       if (claimsFillInFlight) {
@@ -2090,7 +2253,7 @@
       try {
         const modalReady = await waitUntil(() => getClaimsModal(true), 5000, 30);
         if (!modalReady) {
-          throw new Error("Claims form not found. Click Add New, then Fill from Deliveroo.");
+          throw new Error(`Claims form not found. Click Add New, then ${platform.buttonFill || "Fill"}.`);
         }
         const results = await fillClaimsForm(payload, { ...options, fast: true });
         lastFilledOrder = payload.orderNumber;
@@ -2243,7 +2406,7 @@
       /* ignore */
     }
   }
-})(typeof unsafeWindow !== "undefined" ? unsafeWindow : typeof window !== "undefined" ? window : globalThis);
+})(typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : this);
 /* ==== END INLINED SHARED ==== */
 
 /**
@@ -2258,7 +2421,11 @@
 (function () {
   "use strict";
 
-  const root = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+  const root =
+    (typeof globalThis !== "undefined" && globalThis.ClaimsCore && globalThis) ||
+    (typeof window !== "undefined" && window.ClaimsCore && window) ||
+    (typeof unsafeWindow !== "undefined" && unsafeWindow.ClaimsCore && unsafeWindow) ||
+    (typeof globalThis !== "undefined" ? globalThis : window);
   if (!root.ClaimsCore || !root.ClaimsPresets) {
     console.error("[Uber Claims] Shared claims-presets/core failed to load (re-run node build-static.js and re-paste this userscript).");
     return;
@@ -3161,8 +3328,17 @@
     if (typeof GM_addValueChangeListener === "function") {
       GM_addValueChangeListener(platform.storageKey, (_n, _o, value, remote) => {
         if (remote && isOpSpotPage() && value) {
+          let payload = value;
+          if (typeof payload === "string") {
+            try {
+              payload = JSON.parse(payload);
+            } catch {
+              return;
+            }
+          }
+          if (!payload || !payload.orderNumber) return;
           resetFillGuards();
-          applyPayloadToClaims(value, { force: true });
+          applyPayloadToClaims(payload, { force: true });
         }
       });
     }

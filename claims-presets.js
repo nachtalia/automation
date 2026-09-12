@@ -246,6 +246,88 @@
 
       otherReasonIncludesCustomerLocation: true,
     },
+
+    grubhub: {
+      id: "grubhub",
+      platform: "Grubhub",
+      hostHint: "docs.google.com/spreadsheets",
+      storageKey: "grubhub_claim_payload_v1",
+      sheetStorageKey: "",
+      clipPrefix: "GCF1:",
+      uiPrefix: "gcf",
+      hitColor: "#ff8000",
+      buttonExtract: "Extract sheet row → OpSpot",
+      buttonFill: "Fill from Grubhub",
+      buttonSheetCopy: "",
+      buttonSheetPaste: "",
+      versionLabel: "1.0.7",
+      fiveGuysNotDisputedMaxEur: null,
+      customerAliases: [
+        { match: "joe\\s*&\\s*the\\s*juice|joe\\s*and\\s*the\\s*juice", value: "Joe & the Juice UK" },
+      ],
+      locationAliases: [],
+
+      /** Google Sheet column headers (row 1) → payload fields */
+      sheetColumns: {
+        date: ["Date"],
+        time: ["Time"],
+        /** Split on " - " → Customer + Location */
+        restaurant: ["Restaurant", "Full Restaurant Name", "Restaurant Name"],
+        /** e.g. "Grubhub Delivery" → Platform Grubhub */
+        fulfillment: ["Fulfillment Type", "Fulfillment"],
+        /** Sheet "ID" column = OpSpot Order Number */
+        orderId: ["ID", "Order ID", "Order Number"],
+        type: ["Type"],
+        /** Sheet "Description" = reason → Reason for Dispute */
+        description: ["Description", "Reason", "Adjustment Reason"],
+        restaurantTotal: ["Restaurant Total"],
+        subtotal: ["Subtotal"],
+        tax: ["Tax"],
+      },
+      /** Normalize fulfillment text → Workhorse Platform dropdown */
+      platformFromFulfillment: [
+        { test: "grubhub", value: "Grubhub" },
+        { test: "uber", value: "Uber Eats" },
+        { test: "deliveroo", value: "Deliveroo" },
+      ],
+      preferAbsoluteTotals: true,
+
+      reasonMap: {
+        missing: "Missing Item",
+        "missing item": "Missing Item",
+        "missing items": "Missing Item",
+        missing_item: "Missing Item",
+        incorrect: "Incorrect Item",
+        "incorrect item": "Incorrect Item",
+        "incorrect items": "Incorrect Item",
+        incorrect_item: "Incorrect Item",
+        "prepared incorrectly": "Prepared incorrectly",
+        "food safety complaint": "Other",
+        "food safety": "Other",
+      },
+
+      canonicalizeRules: [
+        { test: "missing[_\\s-]*item|missing_item|refund due to a missing", canonical: "missing items" },
+        { test: "incorrect[_\\s-]*item|incorrect_item", canonical: "incorrect item" },
+        { test: "prepared incorrectly", canonical: "prepared incorrectly" },
+        { test: "food\\s*safety", canonical: "food safety complaint" },
+      ],
+
+      outcomeRules: [
+        { type: "underDisputeThreshold", outcomeKey: "notDisputed" },
+        { type: "reasonIn", reasons: ["missing items", "food safety complaint"], outcomeKey: "awaitingReview" },
+        { type: "reasonIn", reasons: ["prepared incorrectly", "incorrect item"], outcomeKey: "pending" },
+      ],
+
+      footageRules: [
+        { type: "underDisputeThreshold", footageKey: "irrelevant" },
+        { type: "reasonIn", reasons: ["missing items", "food safety complaint"], footageKey: "irrelevant" },
+        { type: "reasonIn", reasons: ["prepared incorrectly", "incorrect item"], footageKey: "irrelevant" },
+      ],
+
+      sheet: { enabled: false },
+      otherReasonIncludesCustomerLocation: false,
+    },
   };
 
   root.ClaimsPresets = {
@@ -255,4 +337,11 @@
       return platforms[id] || null;
     },
   };
-})(typeof unsafeWindow !== "undefined" ? unsafeWindow : typeof window !== "undefined" ? window : globalThis);
+  if (typeof globalThis !== "undefined" && root !== globalThis) {
+    try {
+      globalThis.ClaimsPresets = root.ClaimsPresets;
+    } catch {
+      /* ignore */
+    }
+  }
+})(typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : this);

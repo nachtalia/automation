@@ -109,7 +109,7 @@ function buildOne(userFile, version) {
   console.log(`Built ${userFile}`);
 }
 
-const VERSION = "2.3.8";
+const VERSION = "2.4.0";
 for (const file of USER_SCRIPTS) {
   if (!fs.existsSync(path.join(root, file))) {
     console.warn(`Skip missing ${file}`);

@@ -149,13 +149,17 @@
         enabled: true,
         columns: [
           "Date",
+          "Restaurant",
           "Location",
           "# Order Number",
           "Refund Reason",
           "With Video?",
           "Footage Status",
+          "Work Type",
           "Comments",
         ],
+        /** Default for the sheet “Work Type” dropdown */
+        workType: "Deliveroo",
         branchSheetTabs: [
           { match: "shake\\s*shack", tab: "Shake Shack" },
           { match: "jollibee", tab: "Jollibee UK" },

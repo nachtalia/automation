@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Eats Order → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.3.8
+// @version      2.4.0
 // @description  Read Uber Eats Manager orders/issues and fill OpSpot Claims (preset-driven Workhorse fills).
 // @author       Claims Ops
 // @match        https://merchants.ubereats.com/*
@@ -174,13 +174,17 @@
         enabled: true,
         columns: [
           "Date",
+          "Restaurant",
           "Location",
           "# Order Number",
           "Refund Reason",
           "With Video?",
           "Footage Status",
+          "Work Type",
           "Comments",
         ],
+        /** Default for the sheet “Work Type” dropdown */
+        workType: "Deliveroo",
         branchSheetTabs: [
           { match: "shake\\s*shack", tab: "Shake Shack" },
           { match: "jollibee", tab: "Jollibee UK" },
@@ -2124,14 +2128,18 @@
       const date = toDayMonthYear(payload);
       const row = {
         Date: date ? `'${date}` : "",
+        Restaurant: payload.customer || "",
         Location: payload.location || "",
         "# Order Number": payload.orderNumber || "",
+        "Order Number": payload.orderNumber || "",
+        "#": "",
         "Refund Reason": sheetRefundReason(payload),
-        "With Video?": payload.videoSubmitted || workhorse.videoSubmitted || "No",
+        "With Video?": "",
         "Footage Status": payload.footageStatus || "",
+        "Work Type": sheet.workType || platform.platform || "",
         Comments: "",
       };
-      return sheet.columns.map((header) => sheetCell(row[header])).join("\t");
+      return sheet.columns.map((header) => sheetCell(row[header] != null ? row[header] : "")).join("\t");
     }
 
     function buildSheetTransfer(payload) {

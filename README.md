@@ -116,11 +116,13 @@ Brand → tab (from presets): Shake Shack, Jollibee UK, Popeyes.
 | Sheet column | Value |
 |--------------|--------|
 | Date | `DD-MM-YYYY` (forced as text) |
+| Restaurant | Brand / customer |
 | Location | Branch only |
 | # Order Number | Order number |
 | Refund Reason | e.g. Missing Items / Incorrect Item / Prepared incorrectly |
-| With Video? | No |
+| With Video? | (blank) |
 | Footage Status | From footage rules |
+| Work Type | Deliveroo |
 | Comments | (blank) |
 
 ---

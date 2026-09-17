@@ -1751,14 +1751,18 @@
       const date = toDayMonthYear(payload);
       const row = {
         Date: date ? `'${date}` : "",
+        Restaurant: payload.customer || "",
         Location: payload.location || "",
         "# Order Number": payload.orderNumber || "",
+        "Order Number": payload.orderNumber || "",
+        "#": "",
         "Refund Reason": sheetRefundReason(payload),
-        "With Video?": payload.videoSubmitted || workhorse.videoSubmitted || "No",
+        "With Video?": "",
         "Footage Status": payload.footageStatus || "",
+        "Work Type": sheet.workType || platform.platform || "",
         Comments: "",
       };
-      return sheet.columns.map((header) => sheetCell(row[header])).join("\t");
+      return sheet.columns.map((header) => sheetCell(row[header] != null ? row[header] : "")).join("\t");
     }
 
     function buildSheetTransfer(payload) {

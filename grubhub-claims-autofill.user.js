@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grubhub Sheet → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      1.0.10
+// @version      1.0.11
 // @description  Read a selected Google Sheet row (Grubhub adjustments) and fill OpSpot Claims.
 // @author       Claims Ops
 // @match        https://docs.google.com/spreadsheets/*
@@ -291,7 +291,7 @@
       buttonFill: "Fill from Grubhub",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "1.0.10",
+      versionLabel: "1.0.11",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: [
         { match: "joe\\s*&\\s*the\\s*juice|joe\\s*and\\s*the\\s*juice", value: "Joe & the Juice UK" },
@@ -358,6 +358,8 @@
 
       sheet: { enabled: false },
       otherReasonIncludesCustomerLocation: false,
+      /** Do not fill OpSpot “Other reason” for Grubhub sheet rows */
+      skipFillKeys: ["otherReason"],
     },
   };
 
@@ -1747,7 +1749,9 @@
         { key: "reason", labelKey: "reason", from: "reason", when: "hasReason" },
         { key: "otherReason", labelKey: "otherReason", from: "otherReason" },
       ];
-      const fillList = Array.isArray(workhorse.fills) && workhorse.fills.length ? workhorse.fills : defaultFills;
+      const fillList = (Array.isArray(workhorse.fills) && workhorse.fills.length ? workhorse.fills : defaultFills).filter(
+        (item) => !(Array.isArray(platform.skipFillKeys) && platform.skipFillKeys.includes(item.key))
+      );
 
       const defaultLabels = {
         claimDate: "Claim Date",
@@ -2684,7 +2688,6 @@
     { key: "description", label: "Reason / Description", defaults: ["Description", "Reason", "Adjustment Reason"], kind: "reason" },
     { key: "orderValue", label: "Order Value", defaults: ["Subtotal"], kind: "money" },
     { key: "disputeAmount", label: "Dispute Amount", defaults: ["Restaurant Total"], kind: "money" },
-    { key: "otherReason", label: "Other reason", defaults: [], kind: "text" },
   ];
 
   function persistGm(key, value) {
@@ -3789,8 +3792,7 @@
 
     const items = [];
     const disputeFields = buildDisputeFieldValues(items, refundReason, customer, storeLocation);
-    const otherOverride = cellFor(obj, "otherReason", []);
-    disputeFields.otherReason = otherOverride || [description, restaurant].filter(Boolean).join("\n");
+    disputeFields.otherReason = "";
 
     let payload = {
       extractedAt: new Date().toISOString(),

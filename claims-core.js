@@ -1368,7 +1368,9 @@
         { key: "reason", labelKey: "reason", from: "reason", when: "hasReason" },
         { key: "otherReason", labelKey: "otherReason", from: "otherReason" },
       ];
-      const fillList = Array.isArray(workhorse.fills) && workhorse.fills.length ? workhorse.fills : defaultFills;
+      const fillList = (Array.isArray(workhorse.fills) && workhorse.fills.length ? workhorse.fills : defaultFills).filter(
+        (item) => !(Array.isArray(platform.skipFillKeys) && platform.skipFillKeys.includes(item.key))
+      );
 
       const defaultLabels = {
         claimDate: "Claim Date",

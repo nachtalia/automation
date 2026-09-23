@@ -290,7 +290,7 @@
       buttonFill: "Fill from Grubhub",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "1.0.10",
+      versionLabel: "1.0.11",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: [
         { match: "joe\\s*&\\s*the\\s*juice|joe\\s*and\\s*the\\s*juice", value: "Joe & the Juice UK" },
@@ -357,6 +357,8 @@
 
       sheet: { enabled: false },
       otherReasonIncludesCustomerLocation: false,
+      /** Do not fill OpSpot “Other reason” for Grubhub sheet rows */
+      skipFillKeys: ["otherReason"],
     },
   };
 
@@ -1746,7 +1748,9 @@
         { key: "reason", labelKey: "reason", from: "reason", when: "hasReason" },
         { key: "otherReason", labelKey: "otherReason", from: "otherReason" },
       ];
-      const fillList = Array.isArray(workhorse.fills) && workhorse.fills.length ? workhorse.fills : defaultFills;
+      const fillList = (Array.isArray(workhorse.fills) && workhorse.fills.length ? workhorse.fills : defaultFills).filter(
+        (item) => !(Array.isArray(platform.skipFillKeys) && platform.skipFillKeys.includes(item.key))
+      );
 
       const defaultLabels = {
         claimDate: "Claim Date",

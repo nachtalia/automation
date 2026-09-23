@@ -265,7 +265,7 @@
       buttonFill: "Fill from Grubhub",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "1.0.10",
+      versionLabel: "1.0.11",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: [
         { match: "joe\\s*&\\s*the\\s*juice|joe\\s*and\\s*the\\s*juice", value: "Joe & the Juice UK" },
@@ -332,6 +332,8 @@
 
       sheet: { enabled: false },
       otherReasonIncludesCustomerLocation: false,
+      /** Do not fill OpSpot “Other reason” for Grubhub sheet rows */
+      skipFillKeys: ["otherReason"],
     },
   };
 

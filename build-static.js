@@ -76,7 +76,7 @@ function buildOne(userFile, version) {
   if (!/grubhub/i.test(userFile)) {
     header = bumpVersion(header, version);
   } else {
-    header = bumpVersion(header, "1.0.9");
+    header = bumpVersion(header, "1.0.10");
   }
   let body = extractPlatformBody(raw);
   body = updateDocComment(

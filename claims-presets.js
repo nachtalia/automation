@@ -66,6 +66,7 @@
     footageStatusOptions: {
       disputedByThirdParty: "Disputed by 3rd party",
       irrelevant: "Footage status irrelevant for this claim",
+      noCamera: "No Camera",
     },
 
     fieldCaptions: [
@@ -264,7 +265,7 @@
       buttonFill: "Fill from Grubhub",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "1.0.9",
+      versionLabel: "1.0.10",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: [
         { match: "joe\\s*&\\s*the\\s*juice|joe\\s*and\\s*the\\s*juice", value: "Joe & the Juice UK" },

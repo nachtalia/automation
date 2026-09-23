@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grubhub Sheet → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      1.0.9
+// @version      1.0.10
 // @description  Read a selected Google Sheet row (Grubhub adjustments) and fill OpSpot Claims.
 // @author       Claims Ops
 // @match        https://docs.google.com/spreadsheets/*
@@ -92,6 +92,7 @@
     footageStatusOptions: {
       disputedByThirdParty: "Disputed by 3rd party",
       irrelevant: "Footage status irrelevant for this claim",
+      noCamera: "No Camera",
     },
 
     fieldCaptions: [
@@ -290,7 +291,7 @@
       buttonFill: "Fill from Grubhub",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "1.0.9",
+      versionLabel: "1.0.10",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: [
         { match: "joe\\s*&\\s*the\\s*juice|joe\\s*and\\s*the\\s*juice", value: "Joe & the Juice UK" },

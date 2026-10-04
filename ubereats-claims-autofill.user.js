@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Eats Order → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.4.0
+// @version      2.4.13
 // @description  Read Uber Eats Manager orders/issues and fill OpSpot Claims (preset-driven Workhorse fills).
 // @author       Claims Ops
 // @match        https://merchants.ubereats.com/*
@@ -218,7 +218,7 @@
       buttonFill: "Fill from Uber Eats",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "2.2.0",
+      versionLabel: "2.4.13",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: sharedCustomerAliases,
       locationAliases: [],
@@ -234,6 +234,8 @@
         "food safety complaint": "Other",
         "wrong order": "Incorrect Item",
         "wrong item": "Incorrect Item",
+        "item reported wrong": "Incorrect Item",
+        "reported wrong": "Incorrect Item",
         "poor food quality": "Prepared incorrectly",
         "food quality": "Prepared incorrectly",
         "customization missing": "Missing Item",
@@ -246,7 +248,7 @@
         { test: "customization\\s*(reported\\s*)?missing|item\\s*reported\\s*missing|reported\\s*missing|^missing$|missing item", canonical: "missing items" },
         { test: "prepared incorrectly|poor food quality|food quality", canonical: "prepared incorrectly" },
         { test: "food safety", canonical: "food safety complaint" },
-        { test: "wrong order|wrong item|incorrect", canonical: "incorrect item" },
+        { test: "item\\s+reported\\s+wrong|reported\\s+wrong|wrong order|wrong item|incorrect", canonical: "incorrect item" },
       ],
 
       outcomeRules: [
@@ -259,11 +261,8 @@
       footageRules: [
         { type: "alreadyDisputed", footageKey: "disputedByThirdParty" },
         { type: "underDisputeThreshold", footageKey: "irrelevant" },
-        {
-          type: "reasonIn",
-          reasons: ["missing items", "prepared incorrectly", "incorrect item", "food safety complaint"],
-          footageKey: "irrelevant",
-        },
+        { type: "reasonIn", reasons: ["missing items", "food safety complaint"], footageKey: "irrelevant" },
+        { type: "reasonIn", reasons: ["prepared incorrectly", "incorrect item"], footageKey: "irrelevant" },
       ],
 
       sheet: { enabled: false },
@@ -271,10 +270,10 @@
       /** Labels the Uber extractor prefers for dispute amount / order value */
       extractHints: {
         disputeAmountLabels: ["Chargeback Amount", "Marketplace Fee", "Refund", "Adjustment"],
-        orderValueLabels: ["Sales (incl. GST)", "Sales", "Subtotal", "Net payout"],
+        orderValueLabels: ["Sales (incl. VAT)", "Sales (incl. GST)", "Sales", "Subtotal"],
       },
 
-      otherReasonIncludesCustomerLocation: true,
+      otherReasonIncludesCustomerLocation: false,
     },
 
     grubhub: {
@@ -2448,10 +2447,11 @@
     normalizeSpace, normalizeKey, visible, ownText, debounce,
     parseMoney, parseClaimDate,
     isOpSpotPage,
-    canonicalizeReason, normalizeCustomerName,
+    canonicalizeReason, normalizeCustomerName, mapReasonForDispute,
+    resolveOutcomeMatch, computeFootageStatus,
     buildDisputeFieldValues, enrichPayload,
     savePayload, loadPayload, toast, showPreview, ensureStyles, injectButton, ensureButtonBar,
-    applyPayloadToClaims, setupOpSpotSaveHooks, resetFillGuards,
+    applyPayloadToClaims, setupOpSpotSaveHooks, resetFillGuards, copyTextToClipboard,
     clearHits, highlightHits, hits, platform, version,
   } = core;
 
@@ -2462,6 +2462,7 @@
 
   const uiPrefix = platform.uiPrefix || "ucf";
   const btnId = `${uiPrefix}-btn`;
+  const sheetBtnId = `${uiPrefix}-sheet-btn`;
   const workhorse = core.workhorse;
 
   let pageLinesCache = null;
@@ -2569,7 +2570,7 @@
   function isLikelyOrderCode(code) {
     const text = String(code || "").toUpperCase();
     if (!/^[A-Z0-9]{4,6}$/.test(text)) return false;
-    if (!/[A-Z]/.test(text) || !/\d/.test(text)) return false;
+    if (!/\d/.test(text)) return false;
     if (/^(19|20)\d{2}$/.test(text)) return false;
     if (MONTH_ABBR.test(text)) return false;
     if (INVALID_ORDER_CODES.has(text)) return false;
@@ -2605,6 +2606,20 @@
     return m ? normalizeSpace(m[1]) : value;
   }
 
+  function stripTrailingAddress(text) {
+    const value = normalizeSpace(text);
+    const trailing = value.match(/^(.*?)\s*\(([^()]*)\)\s*$/);
+    if (trailing && looksLikeAddress(trailing[2])) return normalizeSpace(trailing[1]);
+    return value;
+  }
+
+  function splitBrandDash(text) {
+    const head = stripTrailingAddress(text);
+    const parts = head.split(/\s+[–—−-]\s+/).map((part) => stripTrailingAddress(part)).filter(Boolean);
+    if (parts.length < 2) return null;
+    return { customer: parts[0], location: parts.slice(1).join(" - ") };
+  }
+
   function parseBrandLocation(text) {
     const line = normalizeSpace(text);
 
@@ -2613,6 +2628,10 @@
     if (dual && looksLikeAddress(dual[2])) {
       return { customer: normalizeSpace(dual[1]), location: normalizeSpace(dual[2]) };
     }
+
+    // KFC - Consett (Hermiston Retail Park, ...) → customer KFC, location Consett
+    const dashed = splitBrandDash(line);
+    if (dashed) return dashed;
 
     // Legacy: Brand (Store area) when the paren is not a street address
     const paren = line.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
@@ -2624,10 +2643,6 @@
       return { customer: line, location: "" };
     }
 
-    if (line.includes(" - ")) {
-      const parts = line.split(" - ").map(normalizeSpace);
-      return { customer: parts[0] || "", location: parts.slice(1).join(" - ") || "" };
-    }
     return { customer: line, location: "" };
   }
 
@@ -2636,6 +2651,16 @@
     const dateRe = /[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2},?\s+[A-Za-z]{3,9},?\s+\d{4}/;
 
     const tryPair = (customerText, locationText, el) => {
+      const dashed = splitBrandDash(customerText);
+      if (dashed) {
+        hits.push({
+          label: "Customer / Location",
+          el: el || null,
+          valueEl: el || null,
+          value: `${dashed.customer} | ${dashed.location}`,
+        });
+        return dashed;
+      }
       const customer = normalizeSpace(customerText);
       let storeLocation = stripOuterParens(locationText);
       if (!customer || customer.length > 90) return null;
@@ -2892,45 +2917,228 @@
     return best;
   }
 
+  function isSectionHeader(line) {
+    const text = normalizeSpace(line);
+    if (!text) return true;
+    if (ITEM_COMPONENT_RE.test(text)) return true;
+    if (/^choose your\b/i.test(text)) return true;
+    if (/^(hot wings|tender|tenders|fries|drinks?|sides?|burgers?)$/i.test(text)) return true;
+    return false;
+  }
+
+  function isMoneyLabel(text) {
+    return /sales|incl\.?\s*vat|incl\.?\s*gst|chargeback|net payout|marketplace/i.test(text);
+  }
+
+  function isStoreHeaderLine(line) {
+    const text = normalizeSpace(line);
+    if (!text) return false;
+    if (looksLikeAddress(text)) return true;
+    if (/\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b/i.test(text)) return true;
+    if (/.+\s-\s.+\s-\s/.test(text)) return true;
+    return false;
+  }
+
+  function isSkippableItemLine(line) {
+    const text = normalizeSpace(line);
+    if (!text) return true;
+    if (isSectionHeader(text) || isStoreHeaderLine(text) || looksLikeIssueBanner(text)) return true;
+    if (/^\d+$/.test(text)) return true;
+    if (/\b\d{1,2}:\d{2}\b/.test(text)) return true;
+    if (/^(order|courier|net payout|sales|marketplace|chargeback)\b/i.test(text)) return true;
+    return false;
+  }
+
+  function findOpenOrderPanel() {
+    const nodes = document.querySelectorAll("[role='dialog'], aside, section, div");
+    let seed = null;
+    let seedLen = Infinity;
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      if (!visible(el)) continue;
+      const text = el.innerText || "";
+      if (text.length < 120 || text.length >= seedLen) continue;
+      if (!/sales\s*\(\s*incl/i.test(text)) continue;
+      if (!/chargeback amount|net payout/i.test(text)) continue;
+      if (!/item reported missing|customization reported missing|order placed/i.test(text)) continue;
+      if (/showing\s+\d+\s+results/i.test(text)) continue;
+      seed = el;
+      seedLen = text.length;
+    }
+    if (!seed) return null;
+
+    let node = seed;
+    let best = seed;
+    for (let depth = 0; depth < 10 && node; depth++) {
+      if (node === document.body || node === document.documentElement) break;
+      const text = node.innerText || "";
+      if (/showing\s+\d+\s+results/i.test(text)) break;
+      best = node;
+      const hasOrder = /\bOrder\s+#?\s*[A-Z0-9]{4,6}\b/i.test(text);
+      const hasDate = /[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}/.test(text);
+      const hasPlaced = /order placed/i.test(text);
+      if (hasOrder && hasDate && hasPlaced) break;
+      node = node.parentElement;
+    }
+    return best;
+  }
+
   function getExtractionRoot() {
-    const heading = findActiveOrderHeading();
-    if (heading && heading.panel) return heading.panel;
-    return getActiveOrderRoot() || document.body;
+    return findOpenOrderPanel() || getActiveOrderRoot() || document.body;
+  }
+
+  function isCompactPostcode(token) {
+    return /^[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2}$/i.test(String(token || ""));
+  }
+
+  function firstOrderCode(text) {
+    const tokens = String(text || "").match(/\b[A-Z0-9]{4,6}\b/g) || [];
+    for (let i = 0; i < tokens.length; i++) {
+      if (isCompactPostcode(tokens[i])) continue;
+      const code = normalizeOrderCodeToken(tokens[i]);
+      if (code && !isCompactPostcode(code)) return code;
+    }
+    return "";
+  }
+
+  function orderCodeFromOpenLink() {
+    const path = location.pathname || "";
+    const uuid = (path.match(/\/orders\/([a-f0-9-]{8,})/i) || [])[1];
+    if (!uuid) return "";
+    const nodes = document.querySelectorAll("a, tr, li, [role='row'], [role='link']");
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      const href = el.getAttribute("href") || "";
+      const snippet = (el.outerHTML || "").slice(0, 1800);
+      if (!href.includes(uuid) && !snippet.includes(uuid)) continue;
+      let node = el;
+      for (let depth = 0; depth < 7 && node; depth++) {
+        const text = node.innerText || node.textContent || "";
+        if (text.length > 900) break;
+        const code = firstOrderCode(text);
+        if (code) return code;
+        node = node.parentElement;
+      }
+    }
+    return "";
+  }
+
+  function orderCodeNearPanelTop(root) {
+    if (!root || !root.querySelectorAll) return "";
+    const top = root.getBoundingClientRect().top;
+    const nodes = root.querySelectorAll("h1, h2, h3, span, div, p, strong, button");
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      if (!visible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.top > top + 160) continue;
+      const own = ownText(el);
+      if (!own || own.length > 8) continue;
+      if (isCompactPostcode(own.replace(/\s+/g, ""))) continue;
+      const code = normalizeOrderCodeToken(own);
+      if (code) return code;
+    }
+    return "";
+  }
+
+  function orderCodeInPanel(root) {
+    const text = (root && root.innerText) || "";
+    const lines = text.split(/\n+/).map(normalizeSpace).filter(Boolean);
+    for (let i = 0; i < lines.length; i++) {
+      const same = lines[i].match(/^Order\s+#?\s*([A-Z0-9]{4,6})\b/i);
+      if (same) {
+        const code = normalizeOrderCodeToken(same[1]);
+        if (code) return code;
+      }
+      if (/^Order\s*#?$/i.test(lines[i])) {
+        for (let j = i + 1; j < Math.min(lines.length, i + 5); j++) {
+          if (/\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b/i.test(lines[j])) continue;
+          const code = normalizeOrderCodeToken(lines[j]);
+          if (code) return code;
+        }
+      }
+    }
+    const re = /\bOrder\s+#?\s*([A-Z0-9]{4,6})\b/gi;
+    let match;
+    while ((match = re.exec(text))) {
+      const code = normalizeOrderCodeToken(match[1]);
+      if (code) return code;
+    }
+    return "";
+  }
+
+  function orderCodeFromHeading(root) {
+    if (!root || !root.querySelectorAll) return "";
+    const nodes = root.querySelectorAll("h1, h2, h3, span, div, p, strong");
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      const own = ownText(el);
+      if (!/^Order\s*#?$/i.test(own)) continue;
+      let sib = el.nextElementSibling;
+      for (let n = 0; n < 4 && sib; n++) {
+        const text = ownText(sib) || normalizeSpace((sib.innerText || "").split("\n")[0]);
+        if (!/\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b/i.test(text)) {
+          const code = normalizeOrderCodeToken(text);
+          if (code) return code;
+        }
+        sib = sib.nextElementSibling;
+      }
+      const parentText = normalizeSpace((el.parentElement && el.parentElement.innerText) || "");
+      const inline = parentText.match(/\bOrder\s+#?\s*([A-Z0-9]{4,6})\b/i);
+      if (inline) {
+        const code = normalizeOrderCodeToken(inline[1]);
+        if (code) return code;
+      }
+    }
+    return "";
+  }
+
+  function orderCodeFromSelectedRow(customer) {
+    const hint = normalizeSpace(customer).toLowerCase();
+    const rows = document.querySelectorAll("tr, [role='row'], a[href*='/orders/']");
+    const found = [];
+    for (let i = 0; i < rows.length; i++) {
+      const el = rows[i];
+      if (!visible(el)) continue;
+      const text = normalizeSpace(el.innerText || "");
+      if (!text || text.length > 220) continue;
+      if (hint && hint.length >= 3 && !text.toLowerCase().includes(hint.slice(0, Math.min(hint.length, 12)))) continue;
+      const tokens = text.match(/\b[A-Z0-9]{4,6}\b/g) || [];
+      let code = "";
+      for (let t = 0; t < tokens.length; t++) {
+        const parsed = normalizeOrderCodeToken(tokens[t]);
+        if (parsed) {
+          code = parsed;
+          break;
+        }
+      }
+      if (!code) continue;
+      const selected = el.getAttribute("aria-selected") === "true" || !!el.getAttribute("aria-current") || /selected|active/i.test(String(el.className || ""));
+      found.push({ code, selected });
+    }
+    const picked = found.find((row) => row.selected);
+    if (picked) return picked.code;
+    if (found.length === 1) return found[0].code;
+    return "";
   }
 
   function extractOrderNumber() {
-    const heading = findActiveOrderHeading();
-    if (heading && heading.code) {
-      hits.push({ label: "Order Number", el: heading.el, valueEl: heading.el, value: heading.code });
-      return heading.code;
+    const root = getExtractionRoot();
+    const fromPanel = orderCodeFromOpenLink() || orderCodeNearPanelTop(root) || orderCodeFromHeading(root) || orderCodeInPanel(root);
+    const fromTitle = normalizeOrderCodeToken(((document.title || "").match(/\bOrder\s+#?\s*([A-Z0-9]{4,6})\b/i) || [])[1]);
+    const { customer: rawCustomer } = extractBrandAndLocation();
+    const fromList = orderCodeFromSelectedRow(isMoneyLabel(rawCustomer) ? "" : rawCustomer);
+    const code = fromPanel || fromTitle || fromList;
+    if (code) {
+      hits.push({ label: "Order Number", el: root, valueEl: root, value: code });
+      return code;
     }
-
-    const orderRoot = getActiveOrderRoot();
-    if (orderRoot) {
-      const nodes = orderRoot.querySelectorAll("h1, h2, h3, h4, p, span, div, strong, button");
-      for (let i = 0; i < nodes.length; i++) {
-        const el = nodes[i];
-        if (!visible(el)) continue;
-        const code = parseOrderHeadingText(normalizeSpace(el.textContent));
-        if (code) {
-          hits.push({ label: "Order Number", el, valueEl: el, value: code });
-          return code;
-        }
-      }
-      const fromPanel = findOrderNumberInText(orderRoot.innerText || "");
-      if (fromPanel) return fromPanel;
-    }
-
-    const uuid = location.pathname.match(/\/orders\/([a-f0-9-]+)/i);
-    if (uuid) {
-      const tail = uuid[1].replace(/-/g, "").slice(-5).toUpperCase();
-      if (isLikelyOrderCode(tail)) return tail;
-    }
-    return findOrderNumberInText((document.body && document.body.innerText) || "");
+    return "";
   }
 
   function extractClaimDateRaw() {
-    const monthDate = (document.body.innerText || "").match(
+    const source = (getExtractionRoot().innerText || "");
+    const monthDate = source.match(
       /([A-Za-z]{3,9})\s+\d{1,2},?\s+\d{4}|\d{1,2},?\s+[A-Za-z]{3,9},?\s+\d{4}/
     );
     if (monthDate) return monthDate[0];
@@ -2941,14 +3149,14 @@
   function extractOrderPlacedTime() {
     const lines = pageLines();
     for (let i = 0; i < lines.length; i++) {
-      if (!/order placed by customer/i.test(lines[i])) continue;
+      if (!/order placed/i.test(lines[i])) continue;
       const time = extractTime(lines[i]) || extractTime(lines[i - 1] || "") || extractTime(lines[i + 1] || "");
       if (time) {
         hits.push({ label: "Order Time", el: null, valueEl: null, value: time });
         return time;
       }
     }
-    return extractTime(document.body.innerText);
+    return "";
   }
 
   function readLabeledMoneyFromLines(lines, labels) {
@@ -2962,8 +3170,9 @@
       const wanted = normalizeKey(label);
       for (let i = 0; i < lines.length - 1; i++) {
         const key = lineKey(lines[i]);
-        if (key !== wanted && !key.startsWith(wanted)) continue;
-        const amount = parseMoney(lines[i + 1]) ?? parseMoney(lines[i]);
+        if (key !== wanted && !key.startsWith(`${wanted} `) && !key.startsWith(`${wanted}(`)) continue;
+        const onLabelLine = key === wanted ? null : parseMoney(lines[i]);
+        const amount = onLabelLine != null ? onLabelLine : (parseMoney(lines[i + 1]) ?? parseMoney(lines[i]));
         if (amount != null) return amount;
       }
       const inline = lines.find((line) => {
@@ -3026,8 +3235,26 @@
     return null;
   }
 
+  function cleanIssueLine(line) {
+    return normalizeSpace(line).replace(/^[^a-z0-9]+/i, "");
+  }
+
+  function subtitleIssue(line) {
+    const text = cleanIssueLine(line);
+    if (/^item\s+reported\s+missing$/i.test(text)) return "item reported missing";
+    if (/^item\s+reported\s+wrong$/i.test(text)) return "item reported wrong";
+    if (/^customization\s+reported\s+missing$/i.test(text)) return "customization reported missing";
+    if (/^customization\s+reported\s+wrong$/i.test(text)) return "customization reported wrong";
+    return "";
+  }
+
+  function looksLikeIssueBanner(line) {
+    return /items?\s+reported\s+missing|deducted from net payout|customer reported|dispute access|authorized users/i.test(line);
+  }
+
   function isIssueMarkerLine(line) {
     return (
+      !!subtitleIssue(line) ||
       ISSUE_ITEM_MISSING_RE.test(line) ||
       ISSUE_CUSTOMIZATION_MISSING_RE.test(line) ||
       ISSUE_N_CUSTOMIZATIONS_RE.test(line)
@@ -3049,59 +3276,87 @@
     return isValidItemName(name) ? name : "";
   }
 
-  function findIssueItemNameBefore(lines, fromIndex, kind) {
-    for (let i = fromIndex - 1; i >= Math.max(0, fromIndex - 20); i--) {
+  function findIssueItemNameBefore(lines, fromIndex) {
+    for (let i = fromIndex - 1; i >= Math.max(0, fromIndex - 12); i--) {
       const line = lines[i];
-      if (isIssueMarkerLine(line)) break;
-      if (isComponentLine(line)) continue;
-
-      const pricedName = parsePricedItemName(line);
-      if (pricedName) {
-        if (kind === "item") return pricedName;
-        if (kind === "customization" && /value meal|meal|combo|regular/i.test(pricedName)) return pricedName;
-      }
-
-      if (/(?:NZ\$|\$|£|€)\s*\d/.test(line) && i > 0) {
-        const prev = normalizeSpace(lines[i - 1]);
-        if (isValidItemName(prev)) {
-          if (kind === "item") return prev;
-          if (kind === "customization" && /value meal|meal|combo|regular/i.test(prev)) return prev;
-        }
-      }
-
-      const name = normalizeSpace(line);
-      if (!isValidItemName(name)) continue;
-
-      if (kind === "customization") {
-        if (/value meal|meal|combo|regular/i.test(name)) return name;
-        const next = lines[i + 1] || "";
-        if (!/(?:NZ\$|\$|£|€)\s*\d/.test(next) && !ISSUE_CUSTOMIZATION_MISSING_RE.test(next)) return name;
+      if (isIssueMarkerLine(line)) continue;
+      if (looksLikeIssueBanner(line) || isSkippableItemLine(line)) {
+        if (looksLikeIssueBanner(line) || isStoreHeaderLine(line)) break;
         continue;
       }
 
-      const hasPriceNearby = [lines[i + 1], lines[i + 2]].some((near) => near && /(?:NZ\$|\$|£|€)\s*\d/.test(near));
-      if (hasPriceNearby || pricedName) return name;
+      const pricedName = parsePricedItemName(line);
+      if (pricedName && !isSkippableItemLine(pricedName)) return pricedName;
+
+      if (/(?:NZ\$|\$|£|€)\s*\d/.test(line) && i > 0) {
+        const prev = normalizeSpace(lines[i - 1]);
+        if (isValidItemName(prev) && !isSkippableItemLine(prev)) return prev;
+      }
+
+      const name = normalizeSpace(line);
+      if (/^\d+(\.\d+)?\s*(ml|l|g|kg|oz|pcs?|pc)$/i.test(name)) continue;
+      if (!isValidItemName(name) || isSkippableItemLine(name)) continue;
+      if (name.length <= 80) return name;
     }
     return "";
+  }
+
+  function pushIssueItem(issueItems, name, issue) {
+    const cleanName = normalizeSpace(name);
+    if (!cleanName || !isValidItemName(cleanName) || isSkippableItemLine(cleanName)) return;
+    issueItems.push({
+      name: cleanName,
+      issue,
+      reason: canonicalizeReason(issue),
+    });
+  }
+
+  function extractSubtitledItemsFromDom() {
+    const root = getExtractionRoot();
+    const nodes = root.querySelectorAll("span, div, p, li");
+    const issueItems = [];
+    for (let n = 0; n < nodes.length; n++) {
+      const el = nodes[n];
+      if (!visible(el)) continue;
+      const full = normalizeSpace(el.innerText || el.textContent || "");
+      if (!full || full.length > 60) continue;
+      const issue = subtitleIssue(ownText(el) || full);
+      if (!issue) continue;
+      let name = "";
+      let node = el;
+      for (let depth = 0; depth < 5 && node && !name; depth++) {
+        let prev = node.previousElementSibling;
+        let hops = 0;
+        while (prev && hops < 4 && !name) {
+          const lines = normalizeSpace(prev.innerText || "").split(/\n+/).map(normalizeSpace).filter(Boolean);
+          name = findIssueItemNameBefore(lines.concat(["Item reported missing"]), lines.length);
+          prev = prev.previousElementSibling;
+          hops++;
+        }
+        node = node.parentElement;
+      }
+      if (name) pushIssueItem(issueItems, name, issue);
+    }
+    return uniqueBy(issueItems, (item) => normalizeKey(item.name));
   }
 
   function scanIssueItems(lines, reasonFromPage) {
     const issueItems = [];
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      if (ISSUE_ITEM_MISSING_RE.test(line)) {
-        const name = findIssueItemNameBefore(lines, i, "item");
-        if (name) {
-          issueItems.push({
-            name,
-            issue: "item reported missing",
-            reason: canonicalizeReason("item reported missing"),
-          });
-        }
+      const issue = subtitleIssue(line);
+      if (issue) {
+        const name = findIssueItemNameBefore(lines, i);
+        if (name) pushIssueItem(issueItems, name, issue);
         continue;
       }
-      if (ISSUE_CUSTOMIZATION_MISSING_RE.test(line)) {
-        const name = findIssueItemNameBefore(lines, i, "customization");
+      if (ISSUE_ITEM_MISSING_RE.test(line)) {
+        const name = findIssueItemNameBefore(lines, i);
+        if (name) pushIssueItem(issueItems, name, "item reported missing");
+        continue;
+      }
+      if (issue === "customization reported missing" || ISSUE_CUSTOMIZATION_MISSING_RE.test(line)) {
+        const name = findIssueItemNameBefore(lines, i);
         if (name) {
           issueItems.push({
             name,
@@ -3118,6 +3373,8 @@
   }
 
   function extractIssueItems() {
+    const fromDom = extractSubtitledItemsFromDom();
+    if (fromDom.length) return fromDom;
     const reasonFromPage = extractRefundReasonRaw();
     const fromPanel = scanIssueItems(pageLines(), reasonFromPage);
     if (fromPanel.length) return fromPanel;
@@ -3180,12 +3437,13 @@
   }
 
   function itemsMatchingReason(items, refundReason) {
+    const named = (items || []).filter((item) => item && item.name && isValidItemName(item.name));
+    const subtitled = named.filter((item) => item.issue);
+    const pool = subtitled.length ? subtitled : named;
     const wanted = canonicalizeReason(refundReason);
-    const matched = (items || []).filter(
-      (item) => item && item.name && isValidItemName(item.name) && canonicalizeReason(item.reason) === wanted
-    );
+    const matched = pool.filter((item) => canonicalizeReason(item.reason) === wanted);
     if (matched.length) return matched;
-    return (items || []).filter((item) => item && item.name && isValidItemName(item.name));
+    return pool;
   }
 
   function detectAlreadyDisputed() {
@@ -3204,6 +3462,782 @@
     return false;
   }
 
+  const FIELD_MAP_KEY = "ubereats_user_field_map_v1";
+  const CONDITIONS_KEY = "ubereats_user_conditions_v1";
+  const mapBtnId = `${uiPrefix}-map-btn`;
+  const mapPanelId = `${uiPrefix}-map-panel`;
+  let userFieldMapCache = null;
+  let userConditionsCache = null;
+  let mapPanelTab = "fields";
+  let mapPanelPos = { top: 72, left: 18 };
+  let mapPickKey = null;
+  let mapPickHandler = null;
+
+  const MAPPABLE_FIELDS = [
+    { key: "orderNumber", label: "Order Number" },
+    { key: "customer", label: "Customer" },
+    { key: "location", label: "Location" },
+    { key: "claimDate", label: "Claim Date" },
+    { key: "orderTime", label: "Order Time" },
+    { key: "orderValue", label: "Order Value" },
+    { key: "disputeAmount", label: "Dispute Amount" },
+    { key: "refundReason", label: "Refund Reason → Reason for Dispute" },
+    { key: "otherReason", label: "Other reason" },
+  ];
+
+  function persistGm(key, value) {
+    try {
+      if (typeof GM_setValue === "function") GM_setValue(key, value);
+    } catch (err) {
+      console.warn("[Uber Claims] GM_setValue failed", err);
+    }
+    try {
+      if (typeof GM !== "undefined" && GM.setValue) {
+        Promise.resolve(GM.setValue(key, value)).catch((err) => console.warn("[Uber Claims] GM.setValue failed", err));
+      }
+    } catch (err) {
+      console.warn("[Uber Claims] GM.setValue failed", err);
+    }
+    try {
+      if (typeof GM_setValue === "function") GM_setValue(`${key}__json`, JSON.stringify(value));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function readGm(key) {
+    let value = null;
+    try {
+      if (typeof GM_getValue === "function") value = GM_getValue(key, null);
+    } catch {
+      value = null;
+    }
+    if (value && typeof value.then === "function") value = null;
+    if (value != null && value !== "") return value;
+    try {
+      if (typeof GM_getValue === "function") value = GM_getValue(`${key}__json`, null);
+    } catch {
+      value = null;
+    }
+    if (typeof value === "string" && value.trim().startsWith("{")) {
+      try {
+        return JSON.parse(value);
+      } catch {
+        return null;
+      }
+    }
+    return value != null && value !== "" ? value : null;
+  }
+
+  function loadUserFieldMap() {
+    if (userFieldMapCache) return userFieldMapCache;
+    let map = readGm(FIELD_MAP_KEY);
+    if (typeof map === "string") {
+      try {
+        map = JSON.parse(map);
+      } catch {
+        map = null;
+      }
+    }
+    userFieldMapCache = map && typeof map === "object" && !Array.isArray(map) ? map : {};
+    return userFieldMapCache;
+  }
+
+  function saveUserFieldMap(map) {
+    userFieldMapCache = map && typeof map === "object" ? { ...map } : {};
+    persistGm(FIELD_MAP_KEY, userFieldMapCache);
+  }
+
+  function defaultUserConditions() {
+    return {
+      locationAliases: [],
+      customerAliases: [],
+      reasonMap: {},
+      disputeThresholdGbp: null,
+      videoSubmitted: null,
+      platformLabel: null,
+      conditionTweaks: {},
+    };
+  }
+
+  function normalizeConditionTweaks(raw) {
+    const out = {};
+    if (!raw || typeof raw !== "object") return out;
+    for (const [key, val] of Object.entries(raw)) {
+      if (!val || typeof val !== "object") continue;
+      let reasons = val.reasonForDispute;
+      if (Array.isArray(reasons)) reasons = reasons.map((r) => normalizeSpace(r)).filter(Boolean);
+      else if (typeof reasons === "string" && reasons) reasons = [normalizeSpace(reasons)];
+      else reasons = [];
+      out[key] = {
+        outcome: normalizeSpace(val.outcome || ""),
+        footage: normalizeSpace(val.footage || ""),
+        reasonForDispute: reasons,
+      };
+    }
+    return out;
+  }
+
+  function coerceConditions(data) {
+    if (typeof data === "string") {
+      try {
+        data = JSON.parse(data);
+      } catch {
+        data = null;
+      }
+    }
+    const thresholdRaw = data && data.disputeThresholdGbp;
+    const thresholdNum = thresholdRaw == null || thresholdRaw === "" ? null : Number(thresholdRaw);
+    return {
+      ...defaultUserConditions(),
+      ...(data && typeof data === "object" ? data : {}),
+      locationAliases: Array.isArray(data && data.locationAliases) ? data.locationAliases : [],
+      customerAliases: Array.isArray(data && data.customerAliases) ? data.customerAliases : [],
+      reasonMap: data && data.reasonMap && typeof data.reasonMap === "object" ? data.reasonMap : {},
+      disputeThresholdGbp: thresholdNum != null && !Number.isNaN(thresholdNum) ? thresholdNum : null,
+      videoSubmitted: data && data.videoSubmitted ? normalizeSpace(data.videoSubmitted) : null,
+      platformLabel: data && data.platformLabel ? normalizeSpace(data.platformLabel) : null,
+      conditionTweaks: normalizeConditionTweaks(data && data.conditionTweaks),
+    };
+  }
+
+  function loadUserConditions() {
+    if (userConditionsCache) return userConditionsCache;
+    userConditionsCache = coerceConditions(readGm(CONDITIONS_KEY));
+    return userConditionsCache;
+  }
+
+  function saveUserConditions(data) {
+    userConditionsCache = coerceConditions(data);
+    persistGm(CONDITIONS_KEY, userConditionsCache);
+  }
+
+  function effectiveDisputeThreshold() {
+    const user = loadUserConditions().disputeThresholdGbp;
+    if (user != null && !Number.isNaN(Number(user))) return Number(user);
+    return workhorse.disputeThresholdGbp || 2;
+  }
+
+  function defaultTweakFor(key) {
+    const o = workhorse.outcomeOptions || {};
+    const f = workhorse.footageStatusOptions || {};
+    const map = {
+      underDisputeThreshold: { outcome: o.notDisputed, footage: f.irrelevant, reasonForDispute: [] },
+      alreadyDisputed: { outcome: o.reviewed, footage: f.disputedByThirdParty, reasonForDispute: [] },
+      missingFoodSafety: { outcome: o.awaitingReview, footage: f.irrelevant, reasonForDispute: [] },
+      preparedIncorrect: { outcome: o.pending, footage: f.irrelevant, reasonForDispute: [] },
+    };
+    return map[key] || { outcome: "", footage: "", reasonForDispute: [] };
+  }
+
+  function effectiveTweak(key) {
+    const saved = (loadUserConditions().conditionTweaks || {})[key] || {};
+    const defaults = defaultTweakFor(key);
+    const reasons = Array.isArray(saved.reasonForDispute) ? saved.reasonForDispute : defaults.reasonForDispute || [];
+    return {
+      outcome: saved.outcome || defaults.outcome || "",
+      footage: saved.footage || defaults.footage || "",
+      reasonForDispute: reasons.filter(Boolean),
+    };
+  }
+
+  function withConditionContext(ctx) {
+    return Object.assign({}, ctx || {}, {
+      disputeThreshold: effectiveDisputeThreshold(),
+      conditionTweaks: loadUserConditions().conditionTweaks || {},
+    });
+  }
+
+  function escapeAttr(value) {
+    return String(value || "")
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;");
+  }
+
+  function matchAliasList(text, aliases) {
+    const value = normalizeSpace(text);
+    if (!value || !Array.isArray(aliases)) return "";
+    for (const rule of aliases) {
+      if (!rule || !rule.match || !rule.value) continue;
+      try {
+        if (new RegExp(String(rule.match), "i").test(value)) return normalizeSpace(rule.value);
+      } catch {
+        if (normalizeKey(value) === normalizeKey(rule.match)) return normalizeSpace(rule.value);
+      }
+    }
+    return "";
+  }
+
+  function resolveCustomerName(name) {
+    const preset = normalizeCustomerName(name);
+    return matchAliasList(preset, loadUserConditions().customerAliases) ||
+      matchAliasList(name, loadUserConditions().customerAliases) ||
+      preset;
+  }
+
+  function resolveLocationName(name) {
+    const preset = normalizeLocationName(name);
+    return matchAliasList(preset, loadUserConditions().locationAliases) ||
+      matchAliasList(name, loadUserConditions().locationAliases) ||
+      preset;
+  }
+
+  function resolveReasonForDispute(refundReason, refundReasonRaw) {
+    const userMap = loadUserConditions().reasonMap || {};
+    const rawKey = normalizeKey(refundReasonRaw || refundReason);
+    const canonical = canonicalizeReason(refundReasonRaw || refundReason) || normalizeKey(refundReason);
+    const seen = new Set();
+    for (const key of [rawKey, normalizeKey(refundReason), canonical, normalizeKey(canonical)].filter(Boolean)) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (userMap[key]) return userMap[key];
+    }
+    return mapReasonForDispute(canonical) || mapReasonForDispute(rawKey) || "";
+  }
+
+  function pickReasonForDisputeFromChecks(selected, mappedReason, refundReason, refundReasonRaw) {
+    const list = (Array.isArray(selected) ? selected : []).map((r) => normalizeSpace(r)).filter(Boolean);
+    if (!list.length) return "";
+    if (mappedReason && list.some((r) => normalizeKey(r) === normalizeKey(mappedReason))) return mappedReason;
+    const raw = `${normalizeKey(refundReasonRaw || "")} ${canonicalizeReason(refundReasonRaw || refundReason) || ""}`;
+    const find = (re) => list.find((r) => re.test(normalizeKey(r)));
+    if (/food\s*safety/.test(raw)) return find(/food\s*safety/) || find(/^other$/) || list[0];
+    if (/missing/.test(raw)) return find(/missing/) || list[0];
+    if (/prepared/.test(raw)) return find(/prepared/) || list[0];
+    if (/incorrect|wrong/.test(raw)) return find(/incorrect/) || list[0];
+    return list[0];
+  }
+
+  function applyFieldMaps(base) {
+    const map = loadUserFieldMap();
+    const out = Object.assign({}, base);
+    for (const field of MAPPABLE_FIELDS) {
+      const mapping = map[field.key];
+      if (!mapping) continue;
+      let raw = "";
+      if (mapping.type === "afterLabel" && mapping.label) {
+        const vals = valuesAfterLabel(mapping.label);
+        raw = (mapping.sampleValue && vals.find((v) => normalizeKey(v) === normalizeKey(mapping.sampleValue))) || vals[0] || mapping.sampleValue || "";
+      } else if (mapping.type === "orderNumber") {
+        raw = extractOrderNumber() || mapping.sampleValue || "";
+      } else {
+        raw = mapping.sampleValue || "";
+      }
+      raw = normalizeSpace(raw);
+      if (!raw) continue;
+      if (field.key === "orderNumber") {
+        const code = normalizeOrderCodeToken(raw) || raw;
+        if (code) out.orderNumber = code;
+      } else if (field.key === "customer") out.customer = raw;
+      else if (field.key === "location") out.location = raw;
+      else if (field.key === "claimDate") {
+        const claimDate = parseClaimDate(raw);
+        out.claimDate = claimDate.raw || raw;
+        out.claimDateISO = claimDate.iso;
+        out.claimDateDMY = claimDate.dmy;
+        out.claimDateDash = claimDate.dash;
+      } else if (field.key === "orderTime") out.orderTime = extractTime(raw) || raw;
+      else if (field.key === "orderValue" || field.key === "disputeAmount") {
+        const n = parseMoney(raw);
+        if (n != null) out[field.key] = Math.abs(n).toFixed(2);
+      } else if (field.key === "refundReason") {
+        out.refundReasonRaw = raw;
+        out.refundReason = canonicalizeReason(raw) || raw;
+      } else if (field.key === "otherReason") out.otherReason = raw;
+    }
+    return out;
+  }
+
+  function applyConditions(payload) {
+    const out = Object.assign({}, payload);
+    out.customer = resolveCustomerName(out.customer);
+    out.location = resolveLocationName(out.location);
+    if (loadUserConditions().videoSubmitted) out.videoSubmitted = loadUserConditions().videoSubmitted;
+    if (loadUserConditions().platformLabel) out.platform = loadUserConditions().platformLabel;
+    out.reasonForDispute = resolveReasonForDispute(out.refundReason, out.refundReasonRaw) || out.reasonForDispute;
+    const ctx = withConditionContext({
+      disputeAmount: parseMoney(out.disputeAmount),
+      alreadyDisputed: !!out.alreadyDisputed,
+      refundReason: out.refundReason,
+      refundReasonRaw: out.refundReasonRaw,
+      reasonForDispute: out.reasonForDispute,
+      customer: out.customer,
+      location: out.location,
+    });
+    const outcomeMatch = typeof resolveOutcomeMatch === "function" ? resolveOutcomeMatch(ctx) : { outcome: "", reasonForDispute: [] };
+    if (outcomeMatch.outcome) out.outcome = outcomeMatch.outcome;
+    const picked = pickReasonForDisputeFromChecks(
+      outcomeMatch.reasonForDispute,
+      out.reasonForDispute,
+      out.refundReason,
+      out.refundReasonRaw
+    );
+    if (picked) out.reasonForDispute = picked;
+    if (typeof computeFootageStatus === "function") {
+      const footage = computeFootageStatus(ctx);
+      if (footage) out.footageStatus = footage;
+    }
+    return out;
+  }
+
+  function applyUserOverlay(payload) {
+    const mapped = isUberEatsPage() ? applyFieldMaps(payload) : payload;
+    return applyConditions(mapped);
+  }
+
+  function outcomeSelectHtml(name, selected) {
+    return `<select data-tweak-outcome="${escapeAttr(name)}">${Object.values(workhorse.outcomeOptions || {})
+      .map((v) => `<option value="${escapeAttr(v)}" ${v === selected ? "selected" : ""}>${escapeAttr(v)}</option>`)
+      .join("")}</select>`;
+  }
+
+  function footageSelectHtml(name, selected) {
+    return `<select data-tweak-footage="${escapeAttr(name)}">${Object.values(workhorse.footageStatusOptions || {})
+      .map((v) => `<option value="${escapeAttr(v)}" ${v === selected ? "selected" : ""}>${escapeAttr(v)}</option>`)
+      .join("")}</select>`;
+  }
+
+  function reasonChecksHtml(name, selected) {
+    const selectedKeys = new Set((selected || []).map((v) => normalizeKey(v)));
+    const opts = [...new Set(
+      Object.values(platform.reasonMap || {}).concat([
+        "Missing Item",
+        "Incorrect Item",
+        "Prepared incorrectly",
+        "Food safety complaint",
+        workhorse.reasonForDisputeOtherOption || "Other",
+      ])
+    )];
+    return opts.map((v) => `<label class="${uiPrefix}-cond-check"><input type="checkbox" data-tweak-dispute-reason="${escapeAttr(name)}" value="${escapeAttr(v)}" ${selectedKeys.has(normalizeKey(v)) ? "checked" : ""} /> ${escapeAttr(v)}</label>`).join("");
+  }
+
+  function renderAliasList(kind, aliases) {
+    if (!aliases.length) return `<div class="${uiPrefix}-cond-meta">None yet.</div>`;
+    return aliases.map((rule, index) => `<div class="${uiPrefix}-cond-item"><span style="flex:1"><code>${escapeAttr(rule.match)}</code> → <strong>${escapeAttr(rule.value)}</strong></span><button type="button" data-cond-del="${kind}" data-cond-index="${index}">Remove</button></div>`).join("");
+  }
+
+  function ensureMapStyles() {
+    const styleId = `${uiPrefix}-map-style`;
+    if (document.getElementById(styleId)) return;
+    const style = document.createElement("style");
+    style.id = styleId;
+    style.textContent = `
+      #${mapBtnId} {
+        background: #047857 !important; color: #ecfdf5 !important; border: 0 !important; cursor: pointer !important;
+        border-radius: 999px !important; padding: 12px 22px !important;
+        box-shadow: 0 10px 30px rgba(0,0,0,.35) !important;
+        font: 700 15px/1.2 Segoe UI, system-ui, sans-serif !important;
+      }
+      #${mapPanelId} {
+        position: fixed !important; inset: auto !important; margin: 0 !important;
+        z-index: 2147483647 !important; display: block !important;
+        width: min(480px, 94vw) !important; height: auto !important; max-height: 78vh !important; overflow: auto !important;
+        background: #052e16 !important; color: #ecfdf5 !important; border: 0 !important; border-radius: 12px !important;
+        padding: 0 14px 14px !important; box-shadow: 0 16px 48px rgba(0,0,0,.45) !important;
+        font: 13px/1.4 Segoe UI, system-ui, sans-serif !important;
+        pointer-events: auto !important;
+      }
+      #${mapPanelId}::backdrop { background: transparent !important; pointer-events: none !important; }
+      #${mapPanelId} * { box-sizing: border-box; }
+      #${mapPanelId} input, #${mapPanelId} select, #${mapPanelId} textarea {
+        pointer-events: auto !important; user-select: text !important; -webkit-user-select: text !important;
+        min-width: 0 !important;
+      }
+      #${mapPanelId} .${uiPrefix}-map-drag {
+        display: flex; align-items: center; gap: 8px; margin: 0 -14px 10px; padding: 12px 14px 8px;
+        cursor: grab; user-select: none; position: sticky; top: 0; background: #052e16; z-index: 2;
+        border-bottom: 1px solid #14532d;
+      }
+      #${mapPanelId} .${uiPrefix}-map-drag h3 { margin: 0; flex: 1; font-size: 15px; color: #fff; }
+      #${mapPanelId} .${uiPrefix}-map-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+      #${mapPanelId} .${uiPrefix}-map-tabs button {
+        flex: 1; border: 0; border-radius: 8px; padding: 8px; cursor: pointer; font-weight: 700;
+        background: #14532d; color: #bbf7d0;
+      }
+      #${mapPanelId} .${uiPrefix}-map-tabs button.active { background: #06c167; color: #052e16; }
+      #${mapPanelId} p, #${mapPanelId} .${uiPrefix}-cond-meta { color: #86efac; font-size: 12px; }
+      #${mapPanelId} .${uiPrefix}-map-row { padding: 8px 0; border-top: 1px solid #14532d; }
+      #${mapPanelId} .${uiPrefix}-map-row-top, #${mapPanelId} .${uiPrefix}-cond-item, #${mapPanelId} .${uiPrefix}-cond-row {
+        display: flex; gap: 8px; align-items: center;
+      }
+      #${mapPanelId} button.${uiPrefix}-add, #${mapPanelId} .${uiPrefix}-map-row button {
+        border: 0; border-radius: 8px; padding: 6px 10px; cursor: pointer; font-weight: 700;
+        background: #06c167; color: #052e16;
+      }
+      #${mapPanelId} .${uiPrefix}-map-row button.armed { background: #fbbf24; color: #111; }
+      #${mapPanelId} input, #${mapPanelId} select {
+        width: 100%; border: 1px solid #166534; border-radius: 6px; padding: 6px 8px;
+        background: #022c22; color: #fff; font-size: 12px;
+      }
+      #${mapPanelId} .${uiPrefix}-cond-form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; margin: 6px 0; }
+      #${mapPanelId} .${uiPrefix}-cond-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 6px; margin-top: 6px; }
+      #${mapPanelId} .${uiPrefix}-cond-card { margin: 8px 0; padding: 8px; border-radius: 8px; background: #064e3b; }
+      #${mapPanelId} .${uiPrefix}-cond-actions { display: flex; gap: 8px; margin-top: 12px; }
+      #${mapPanelId} .${uiPrefix}-cond-actions button { flex: 1; border: 0; border-radius: 8px; padding: 8px; cursor: pointer; font-weight: 700; background: #14532d; color: #fff; }
+      #${mapPanelId} .${uiPrefix}-cond-item button { border: 0; border-radius: 6px; padding: 4px 8px; cursor: pointer; background: #7f1d1d; color: #fff; }
+      #${mapPanelId} .${uiPrefix}-cond-check { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+      #${mapPanelId} .${uiPrefix}-close {
+        background: #14532d; color: #fff; border: 0; border-radius: 8px; padding: 6px 10px; cursor: pointer; font-weight: 700;
+      }
+      body.${uiPrefix}-map-picking, body.${uiPrefix}-map-picking * { cursor: crosshair !important; }
+    `;
+    document.documentElement.appendChild(style);
+  }
+
+  function pinMapPanel(panel) {
+    panel.style.setProperty("position", "fixed", "important");
+    panel.style.setProperty("inset", "auto", "important");
+    panel.style.setProperty("margin", "0", "important");
+    panel.style.setProperty("right", "auto", "important");
+    panel.style.setProperty("bottom", "auto", "important");
+    panel.style.setProperty("transform", "none", "important");
+    panel.style.setProperty("border", "0", "important");
+    panel.style.setProperty("width", "min(480px, 94vw)", "important");
+    panel.style.setProperty("height", "auto", "important");
+    panel.style.setProperty("left", `${mapPanelPos.left}px`, "important");
+    panel.style.setProperty("top", `${mapPanelPos.top}px`, "important");
+    panel.style.setProperty("z-index", "2147483647", "important");
+    panel.style.setProperty("pointer-events", "auto", "important");
+    panel.style.setProperty("display", "block", "important");
+  }
+
+  function showMapPanel(panel) {
+    if (!panel.isConnected) document.documentElement.appendChild(panel);
+    panel.setAttribute("popover", "manual");
+    pinMapPanel(panel);
+    if (typeof panel.showPopover === "function") {
+      try {
+        if (!panel.matches(":popover-open")) panel.showPopover();
+      } catch (err) {
+        console.warn("[Uber Claims] showPopover failed", err);
+      }
+    }
+    pinMapPanel(panel);
+  }
+
+  function keepPanelTyping(panel) {
+    if (!panel || panel.dataset.typingBound === "1") return;
+    panel.dataset.typingBound = "1";
+    const stop = (event) => {
+      if (event.target.closest("input, textarea, select")) event.stopPropagation();
+    };
+    ["keydown", "keypress", "keyup", "beforeinput", "input", "paste", "focusin"].forEach((type) => {
+      panel.addEventListener(type, stop, true);
+    });
+  }
+
+  function enableMapDrag(panel) {
+    if (!panel || panel.dataset.dragBound === "1") return;
+    panel.dataset.dragBound = "1";
+    let dragging = false;
+    let startX = 0;
+    let startY = 0;
+    let originLeft = 0;
+    let originTop = 0;
+    const onMove = (event) => {
+      if (!dragging) return;
+      const width = panel.offsetWidth || 480;
+      mapPanelPos = {
+        left: Math.min(Math.max(8, originLeft + event.clientX - startX), Math.max(8, window.innerWidth - width - 8)),
+        top: Math.min(Math.max(8, originTop + event.clientY - startY), Math.max(8, window.innerHeight - 72)),
+      };
+      pinMapPanel(panel);
+    };
+    const onUp = () => {
+      dragging = false;
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
+    };
+    panel.addEventListener("pointerdown", (event) => {
+      if (!event.target.closest(`.${uiPrefix}-map-drag`) || event.target.closest("button")) return;
+      dragging = true;
+      startX = event.clientX;
+      startY = event.clientY;
+      originLeft = panel.offsetLeft || mapPanelPos.left;
+      originTop = panel.offsetTop || mapPanelPos.top;
+      event.preventDefault();
+      window.addEventListener("pointermove", onMove, true);
+      window.addEventListener("pointerup", onUp, true);
+    }, true);
+  }
+
+  function mappingSummary(mapping) {
+    if (!mapping) return "Default (auto)";
+    if (mapping.type === "afterLabel") return `After “${mapping.label}” → ${mapping.sampleValue || ""}`;
+    if (mapping.type === "orderNumber") return `Order code (${mapping.sampleValue || ""})`;
+    return `Clicked text: ${mapping.sampleValue || "?"}`;
+  }
+
+  function stopMapPick() {
+    if (mapPickHandler) {
+      document.removeEventListener("click", mapPickHandler, true);
+      mapPickHandler = null;
+    }
+    mapPickKey = null;
+    document.body && document.body.classList.remove(`${uiPrefix}-map-picking`);
+  }
+
+  function inferMappingFromElement(el, fieldKey) {
+    if (!el || el.closest(`#${mapPanelId}, #${uiPrefix}-btn-bar`)) return null;
+    let node = el.nodeType === 3 ? el.parentElement : el;
+    while (node && node !== document.body && normalizeSpace(node.innerText || "").length > 140) node = node.parentElement;
+    if (!node || node === document.body) return null;
+    const value = normalizeSpace((ownText(node) || node.innerText || "").split("\n")[0]);
+    if (!value || value.length > 120) return null;
+    let label = "";
+    const prev = node.previousElementSibling;
+    if (prev) {
+      const prevText = normalizeSpace((ownText(prev) || prev.innerText || "").split("\n")[0]);
+      if (prevText && prevText.length < 48 && normalizeKey(prevText) !== normalizeKey(value)) label = prevText;
+    }
+    if (!label) {
+      const lines = pageLines();
+      const idx = lines.findIndex((line) => line === value);
+      if (idx > 0 && lines[idx - 1].length < 48) label = lines[idx - 1];
+    }
+    if (fieldKey === "orderNumber") return { type: "orderNumber", sampleValue: value };
+    if (fieldKey === "disputeAmount" && !label) label = "Chargeback Amount";
+    if (fieldKey === "orderValue" && !label) label = "Sales (incl. VAT)";
+    if (label && normalizeKey(label) !== normalizeKey(value)) return { type: "afterLabel", label, sampleValue: value };
+    return { type: "literal", sampleValue: value };
+  }
+
+  function startMapPick(fieldKey) {
+    if (!isUberEatsPage()) {
+      toast("Open the Uber Eats order, then click the value on that page.", "info", 5000);
+      return;
+    }
+    stopMapPick();
+    mapPickKey = fieldKey;
+    document.body.classList.add(`${uiPrefix}-map-picking`);
+    const label = (MAPPABLE_FIELDS.find((f) => f.key === fieldKey) || {}).label || fieldKey;
+    toast(`Click the Uber Eats value for “${label}”.`, "info", 6000);
+    renderMapPanel();
+    mapPickHandler = (event) => {
+      if (event.target.closest(`#${mapPanelId}, #${uiPrefix}-btn-bar`)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const mapping = inferMappingFromElement(event.target, fieldKey);
+      stopMapPick();
+      if (!mapping) {
+        toast("Could not read that click. Try the value text itself.", "error");
+        renderMapPanel();
+        return;
+      }
+      const map = Object.assign({}, loadUserFieldMap(), { [fieldKey]: mapping });
+      saveUserFieldMap(map);
+      toast(`Mapped ${label}. Extract again to use it.`, "success", 4000);
+      renderMapPanel();
+    };
+    document.addEventListener("click", mapPickHandler, true);
+  }
+
+  function renderMapPanel() {
+    ensureMapStyles();
+    let panel = document.getElementById(mapPanelId);
+    if (!panel || !panel.isConnected) {
+      panel = document.createElement("div");
+      panel.id = mapPanelId;
+      panel.setAttribute("popover", "manual");
+      document.documentElement.appendChild(panel);
+      enableMapDrag(panel);
+      keepPanelTyping(panel);
+    }
+    showMapPanel(panel);
+    const map = loadUserFieldMap();
+    const conditions = loadUserConditions();
+    const fieldRows = MAPPABLE_FIELDS.map((field) => {
+      const mapping = map[field.key];
+      const armed = mapPickKey === field.key;
+      return `<div class="${uiPrefix}-map-row">
+        <div class="${uiPrefix}-map-row-top"><strong style="flex:1">${escapeAttr(field.label)}</strong>
+          <button type="button" data-map-key="${field.key}" class="${armed ? "armed" : ""}">${armed ? "Click page…" : "Select on page"}</button>
+          ${mapping ? `<button type="button" data-map-clear="${field.key}" style="background:#7f1d1d;color:#fff">Clear</button>` : ""}
+        </div>
+        <div class="${uiPrefix}-cond-meta">${escapeAttr(mappingSummary(mapping))}</div>
+      </div>`;
+    }).join("");
+    const under = effectiveTweak("underDisputeThreshold");
+    const contested = effectiveTweak("alreadyDisputed");
+    const missing = effectiveTweak("missingFoodSafety");
+    const prepared = effectiveTweak("preparedIncorrect");
+    const presetReasons = Object.keys(platform.reasonMap || {});
+    const reasonKeys = [...new Set(presetReasons.concat(Object.keys(conditions.reasonMap || {})))];
+    const reasonRows = reasonKeys.map((from) => {
+      const to = (conditions.reasonMap || {})[from] || (platform.reasonMap || {})[from] || "";
+      return `<div class="${uiPrefix}-cond-row"><code style="flex:0 0 42%">${escapeAttr(from)}</code><input data-reason-edit="${escapeAttr(from)}" value="${escapeAttr(to)}" /></div>`;
+    }).join("");
+    const fieldsBody = `
+      <p>Pick a field, then click the matching text on the Uber Eats order. Drag the title bar to move this panel.</p>
+      ${fieldRows}
+      <div class="${uiPrefix}-cond-actions"><button type="button" data-map-action="clear-all">Clear maps</button></div>`;
+    const conditionsBody = `
+      <p>Uber Eats text → Workhorse. Re-extract after saving. Footage includes <strong>No Camera</strong>.</p>
+      <h4>Customer aliases</h4>
+      ${renderAliasList("customerAliases", conditions.customerAliases)}
+      <div class="${uiPrefix}-cond-form">
+        <input data-cond-from="customerAliases" placeholder="Uber customer" />
+        <input data-cond-to="customerAliases" placeholder="Workhorse customer" />
+        <button type="button" class="${uiPrefix}-add" data-cond-add="customerAliases">Add</button>
+      </div>
+      <h4>Location aliases</h4>
+      ${renderAliasList("locationAliases", conditions.locationAliases)}
+      <div class="${uiPrefix}-cond-form">
+        <input data-cond-from="locationAliases" placeholder="Uber location" />
+        <input data-cond-to="locationAliases" placeholder="Workhorse location" />
+        <button type="button" class="${uiPrefix}-add" data-cond-add="locationAliases">Add</button>
+      </div>
+      <div class="${uiPrefix}-cond-card"><strong>Chargeback ≤ £…</strong>
+        <div class="${uiPrefix}-cond-grid"><input data-threshold-gbp type="number" min="0" step="0.01" value="${escapeAttr(String(effectiveDisputeThreshold()))}" />${outcomeSelectHtml("underDisputeThreshold", under.outcome)}${footageSelectHtml("underDisputeThreshold", under.footage)}</div>
+      </div>
+      <div class="${uiPrefix}-cond-card"><strong>Already disputed</strong>
+        <div class="${uiPrefix}-cond-grid">${outcomeSelectHtml("alreadyDisputed", contested.outcome)}${footageSelectHtml("alreadyDisputed", contested.footage)}</div>
+      </div>
+      <div class="${uiPrefix}-cond-card"><strong>Missing / food safety</strong>
+        <div class="${uiPrefix}-cond-grid">${outcomeSelectHtml("missingFoodSafety", missing.outcome)}${footageSelectHtml("missingFoodSafety", missing.footage)}</div>
+        ${reasonChecksHtml("missingFoodSafety", missing.reasonForDispute)}
+      </div>
+      <div class="${uiPrefix}-cond-card"><strong>Prepared incorrectly / Incorrect item</strong>
+        <div class="${uiPrefix}-cond-grid">${outcomeSelectHtml("preparedIncorrect", prepared.outcome)}${footageSelectHtml("preparedIncorrect", prepared.footage)}</div>
+        ${reasonChecksHtml("preparedIncorrect", prepared.reasonForDispute)}
+      </div>
+      <div class="${uiPrefix}-cond-card"><strong>Video Submitted</strong>
+        <div class="${uiPrefix}-cond-grid"><select data-video-submitted><option value="No" ${(conditions.videoSubmitted || "No") === "No" ? "selected" : ""}>No</option><option value="Yes" ${conditions.videoSubmitted === "Yes" ? "selected" : ""}>Yes</option></select></div>
+      </div>
+      <div class="${uiPrefix}-cond-card"><strong>Platform override</strong>
+        <div class="${uiPrefix}-cond-grid"><input data-platform-label value="${escapeAttr(conditions.platformLabel || "")}" placeholder="Uber Eats" /></div>
+      </div>
+      <div class="${uiPrefix}-cond-card"><strong>Reason map</strong><div style="display:flex;flex-direction:column;gap:6px;margin-top:6px">${reasonRows}</div></div>
+      <div class="${uiPrefix}-cond-actions">
+        <button type="button" class="${uiPrefix}-add" data-cond-save style="background:#06c167;color:#052e16">Save conditions</button>
+        <button type="button" data-cond-clear>Clear my conditions</button>
+      </div>`;
+    panel.innerHTML = `
+      <div class="${uiPrefix}-map-drag" title="Drag to move"><span style="letter-spacing:2px;color:#86efac">⋮⋮</span><h3>Uber Eats map &amp; conditions</h3><button type="button" class="${uiPrefix}-close" data-map-close>Close</button></div>
+      <div class="${uiPrefix}-map-tabs">
+        <button type="button" data-map-tab="fields" class="${mapPanelTab === "fields" ? "active" : ""}">Field maps</button>
+        <button type="button" data-map-tab="conditions" class="${mapPanelTab === "conditions" ? "active" : ""}">Conditions</button>
+      </div>
+      ${mapPanelTab === "conditions" ? conditionsBody : fieldsBody}`;
+    pinMapPanel(panel);
+    panel.querySelectorAll("[data-map-tab]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        mapPanelTab = btn.getAttribute("data-map-tab") || "fields";
+        renderMapPanel();
+      });
+    });
+    panel.querySelector("[data-map-close]")?.addEventListener("click", () => {
+      stopMapPick();
+      try { panel.hidePopover(); } catch { /* ignore */ }
+      panel.remove();
+    });
+    panel.querySelectorAll("[data-map-key]").forEach((btn) => {
+      btn.addEventListener("click", () => startMapPick(btn.getAttribute("data-map-key")));
+    });
+    panel.querySelectorAll("[data-map-clear]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const next = Object.assign({}, loadUserFieldMap());
+        delete next[btn.getAttribute("data-map-clear")];
+        saveUserFieldMap(next);
+        renderMapPanel();
+      });
+    });
+    panel.querySelector('[data-map-action="clear-all"]')?.addEventListener("click", () => {
+      saveUserFieldMap({});
+      toast("Cleared field maps.", "success", 3000);
+      renderMapPanel();
+    });
+    panel.querySelectorAll("[data-cond-add]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const kind = btn.getAttribute("data-cond-add");
+        const from = panel.querySelector(`[data-cond-from="${kind}"]`)?.value;
+        const to = panel.querySelector(`[data-cond-to="${kind}"]`)?.value;
+        if (!normalizeSpace(from) || !normalizeSpace(to)) {
+          toast("Enter both Uber Eats and Workhorse values.", "error");
+          return;
+        }
+        const next = loadUserConditions();
+        next[kind] = [...(next[kind] || []), { match: normalizeSpace(from), value: normalizeSpace(to) }];
+        saveUserConditions(next);
+        renderMapPanel();
+      });
+    });
+    panel.querySelectorAll("[data-cond-del]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const kind = btn.getAttribute("data-cond-del");
+        const index = Number(btn.getAttribute("data-cond-index"));
+        const next = loadUserConditions();
+        next[kind] = (next[kind] || []).filter((_, i) => i !== index);
+        saveUserConditions(next);
+        renderMapPanel();
+      });
+    });
+    panel.querySelector("[data-cond-clear]")?.addEventListener("click", () => {
+      saveUserConditions(defaultUserConditions());
+      toast("Cleared your Uber Eats conditions.", "success", 3000);
+      renderMapPanel();
+    });
+    panel.querySelector("[data-cond-save]")?.addEventListener("click", () => {
+      const next = loadUserConditions();
+      const thresholdRaw = panel.querySelector("[data-threshold-gbp]")?.value;
+      const thresholdNum = thresholdRaw === "" || thresholdRaw == null ? null : Number(thresholdRaw);
+      if (thresholdNum != null && (Number.isNaN(thresholdNum) || thresholdNum < 0)) {
+        toast("Enter a valid £ threshold.", "error");
+        return;
+      }
+      const tweaks = Object.assign({}, next.conditionTweaks || {});
+      panel.querySelectorAll("[data-tweak-outcome]").forEach((el) => {
+        const key = el.getAttribute("data-tweak-outcome");
+        tweaks[key] = Object.assign({}, tweaks[key] || {}, { outcome: el.value });
+      });
+      panel.querySelectorAll("[data-tweak-footage]").forEach((el) => {
+        const key = el.getAttribute("data-tweak-footage");
+        tweaks[key] = Object.assign({}, tweaks[key] || {}, { footage: el.value });
+      });
+      const groups = new Set([...panel.querySelectorAll("[data-tweak-dispute-reason]")].map((el) => el.getAttribute("data-tweak-dispute-reason")));
+      groups.forEach((key) => {
+        if (!key) return;
+        const checked = [...panel.querySelectorAll(`[data-tweak-dispute-reason="${key}"]`)].filter((el) => el.checked).map((el) => normalizeSpace(el.value)).filter(Boolean);
+        tweaks[key] = Object.assign({}, tweaks[key] || {}, { reasonForDispute: checked });
+      });
+      const reasonMap = Object.assign({}, next.reasonMap || {});
+      panel.querySelectorAll("[data-reason-edit]").forEach((el) => {
+        const from = el.getAttribute("data-reason-edit");
+        const to = normalizeSpace(el.value);
+        const presetTo = (platform.reasonMap || {})[from] || "";
+        if (!from) return;
+        if (!to || (presetTo && normalizeKey(presetTo) === normalizeKey(to))) delete reasonMap[from];
+        else reasonMap[from] = to;
+      });
+      next.disputeThresholdGbp = thresholdNum;
+      next.conditionTweaks = tweaks;
+      next.reasonMap = reasonMap;
+      next.videoSubmitted = panel.querySelector("[data-video-submitted]")?.value || "No";
+      next.platformLabel = normalizeSpace(panel.querySelector("[data-platform-label]")?.value) || null;
+      saveUserConditions(next);
+      toast("Saved Uber Eats conditions. Extract the order again.", "success", 5000);
+      renderMapPanel();
+    });
+  }
+
+  function toggleMapPanel() {
+    try {
+      ensureMapStyles();
+      const existing = document.getElementById(mapPanelId);
+      if (existing && existing.isConnected) {
+        stopMapPick();
+        try { existing.hidePopover(); } catch { /* ignore */ }
+        existing.remove();
+        return;
+      }
+      renderMapPanel();
+    } catch (err) {
+      console.error("[Uber Claims] map panel failed", err);
+      toast(`Could not open map panel: ${err.message || err}`, "error", 8000);
+    }
+  }
+
   function extractRefundPayload() {
     clearHits();
     invalidatePageLines();
@@ -3213,8 +4247,8 @@
     if (!orderNumber) errors.push("Order Number");
 
     const { customer: rawCustomer, location: storeLocationRaw } = extractBrandAndLocation();
-    const customer = normalizeCustomerName(rawCustomer);
-    const storeLocation = normalizeLocationName(storeLocationRaw);
+    const customer = isMoneyLabel(rawCustomer) ? "" : normalizeCustomerName(rawCustomer);
+    const storeLocation = isMoneyLabel(storeLocationRaw) ? "" : normalizeLocationName(storeLocationRaw);
     if (!customer) errors.push("Customer");
     if (!storeLocation) errors.push("Location");
 
@@ -3226,21 +4260,33 @@
     if (!orderTime) errors.push("Order placed time");
 
     const orderValue =
-      readLabeledMoney(["Sales (incl. GST)", "Sales (incl GST)", "Subtotal", "Order total"]) ||
-      readLabeledMoney(["Net payout"]);
+      readLabeledMoney([
+        "Sales (incl. VAT)",
+        "Sales (incl VAT)",
+        "Sales (incl. GST)",
+        "Sales (incl GST)",
+        "Subtotal",
+        "Order total",
+      ]);
     if (orderValue == null) errors.push("Sales total");
 
     const disputeAmount = extractDisputeAmount();
 
     const items = extractOrderItems();
-    const reasonRaw = extractRefundReasonRaw();
+    const subtitledItems = items.filter((item) => item && item.issue);
+    let reasonRaw = extractRefundReasonRaw();
+    if (subtitledItems.some((item) => /reported wrong/i.test(item.issue))) reasonRaw = "Item reported wrong";
+    else if (subtitledItems.some((item) => /item reported missing/i.test(item.issue))) reasonRaw = "Item reported missing";
+    else if (subtitledItems[0]) reasonRaw = subtitledItems[0].issue;
     const itemReason = (items.find((item) => item && item.reason) || {}).reason || "";
     const refundReason = canonicalizeReason(reasonRaw) || itemReason || "";
 
     const alreadyDisputed = detectAlreadyDisputed();
     highlightHits();
 
-    const matchedItems = itemsMatchingReason(items, refundReason);
+    const matchedItems = subtitledItems.length
+      ? subtitledItems
+      : itemsMatchingReason(items, refundReason);
     const disputeFields = buildDisputeFieldValues(matchedItems, refundReason, customer, storeLocation);
 
     const payload = enrichPayload({
@@ -3258,6 +4304,7 @@
       orderValue: orderValue == null ? "" : orderValue.toFixed(2),
       disputeAmount: disputeAmount == null ? "" : disputeAmount.toFixed(2),
       refundReason,
+      refundReasonRaw: reasonRaw,
       alreadyDisputed,
       videoSubmitted: workhorse.videoSubmitted || "No",
       wrongFoodItem: disputeFields.wrongFoodItem,
@@ -3268,7 +4315,145 @@
       errors,
     });
 
-    return payload;
+    return applyUserOverlay(payload);
+  }
+
+  function ensureUberUiStyles() {
+    const id = `${uiPrefix}-bar-fix`;
+    if (document.getElementById(id)) return;
+    const style = document.createElement("style");
+    style.id = id;
+    style.textContent = `
+      #${uiPrefix}-btn-bar {
+        border: 0 !important;
+        background: transparent !important;
+        padding: 0 !important;
+        box-shadow: none !important;
+        overflow: visible !important;
+        color: inherit !important;
+        width: max-content !important;
+        height: auto !important;
+        inset: auto !important;
+        top: auto !important;
+        right: auto !important;
+        bottom: 18px !important;
+        left: 50% !important;
+        transform: translateX(-50%) !important;
+        margin: 0 !important;
+      }
+      #${uiPrefix}-btn-bar::backdrop { background: transparent !important; }
+      #${btnId}, #${mapBtnId}, #${sheetBtnId} {
+        appearance: none !important;
+        border: 0 !important;
+        border-radius: 999px !important;
+        padding: 10px 16px !important;
+        margin: 0 !important;
+        font: 700 14px/1.2 Segoe UI, system-ui, sans-serif !important;
+        box-shadow: 0 8px 20px rgba(0,0,0,.28) !important;
+        cursor: pointer !important;
+      }
+      #${btnId} { background: #06c167 !important; color: #052e16 !important; }
+      #${mapBtnId} { background: #065f46 !important; color: #ecfdf5 !important; }
+      #${sheetBtnId} { background: #0f766e !important; color: #ecfdf5 !important; }
+      #${btnId}:hover, #${mapBtnId}:hover, #${sheetBtnId}:hover { background: #111827 !important; color: #fff !important; }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function liftButtonBar() {
+    ensureUberUiStyles();
+    const bar = ensureButtonBar();
+    if (!bar) return;
+    if (!bar.isConnected) (document.documentElement || document.body).appendChild(bar);
+    bar.setAttribute("popover", "manual");
+    bar.style.setProperty("position", "fixed", "important");
+    bar.style.setProperty("inset", "auto", "important");
+    bar.style.setProperty("top", "auto", "important");
+    bar.style.setProperty("right", "auto", "important");
+    bar.style.setProperty("bottom", "18px", "important");
+    bar.style.setProperty("left", "50%", "important");
+    bar.style.setProperty("transform", "translateX(-50%)", "important");
+    bar.style.setProperty("margin", "0", "important");
+    bar.style.setProperty("border", "0", "important");
+    bar.style.setProperty("background", "transparent", "important");
+    bar.style.setProperty("padding", "0", "important");
+    bar.style.setProperty("box-shadow", "none", "important");
+    bar.style.setProperty("width", "max-content", "important");
+    bar.style.setProperty("height", "auto", "important");
+    bar.style.setProperty("overflow", "visible", "important");
+    bar.style.setProperty("z-index", "2147483647", "important");
+    bar.style.setProperty("display", "flex", "important");
+    bar.style.setProperty("gap", "8px", "important");
+    const modalOpen = !!document.querySelector("dialog[open], [role='dialog'], [aria-modal='true']");
+    try {
+      if (typeof bar.showPopover === "function") {
+        const needsLift = modalOpen && bar.dataset.aboveModal !== "1";
+        if (needsLift && bar.matches(":popover-open")) bar.hidePopover();
+        if (!bar.matches(":popover-open")) bar.showPopover();
+        if (modalOpen) bar.dataset.aboveModal = "1";
+      }
+    } catch (err) {
+      console.warn("[Uber Claims] could not lift button bar", err);
+    }
+    if (!modalOpen) bar.dataset.aboveModal = "";
+    bar.hidden = false;
+  }
+
+  function sheetRestaurant(customer) {
+    const text = normalizeSpace(customer);
+    const brand = text.split(/\s+[–—−-]\s+/)[0] || text;
+    return brand.replace(/\s+adil\s+group$/i, "").trim() || brand;
+  }
+
+  function sheetFootage(status) {
+    const key = normalizeKey(status);
+    if (!key) return "";
+    if (/irrelevant/.test(key)) return "Footage Irrelevant to this claim";
+    if (/third party|3rd party/.test(key)) return "Disputed by 3rd Party";
+    if (/no camera|camera offline/.test(key)) return "Camera Offline";
+    if (/not at fault/.test(key)) return "Restau NOT AT FAULT";
+    if (/at fault/.test(key)) return "Restau AT FAULT";
+    if (/outside camera|packed outside/.test(key)) return "Food Packed Outside Camera Visibility";
+    if (/won without/.test(key)) return "Won Without Footage";
+    return normalizeSpace(status);
+  }
+
+  function sheetLogDate() {
+    const now = new Date();
+    return `${now.getMonth() + 1}/${now.getDate()}/${now.getFullYear()}`;
+  }
+
+  function buildEisSheetRow(payload) {
+    const video = /^yes$/i.test(normalizeSpace(payload.videoSubmitted)) ? "Yes" : "No";
+    const disputed = payload.alreadyDisputed ? "TRUE" : "FALSE";
+    const cells = [
+      sheetLogDate(),
+      "Own",
+      sheetRestaurant(payload.customer),
+      normalizeSpace(payload.location),
+      normalizeSpace(payload.orderNumber),
+      sheetFootage(payload.footageStatus),
+      video,
+      disputed,
+      "",
+    ];
+    return cells.map((cell) => String(cell).replace(/[\t\r\n]+/g, " ").trim()).join("\t");
+  }
+
+  async function onCopySheetClick() {
+    const payload = await loadPayload();
+    if (!payload || !payload.orderNumber) {
+      toast("Extract the order first, then copy the sheet row.", "error", 6000);
+      return;
+    }
+    const row = buildEisSheetRow(payload);
+    const copied = copyTextToClipboard(row);
+    if (!copied) {
+      toast("Could not copy. Select the row from the preview and copy it manually.", "error", 6000);
+      return;
+    }
+    const parts = row.split("\t");
+    toast(`Copied ${parts[4]} for the sheet. Click the next empty row and paste.`, "success", 7000);
   }
 
   function mount() {
@@ -3278,26 +4463,34 @@
       return;
     }
 
-    ensureButtonBar();
+    liftButtonBar();
 
     const existing = document.getElementById(btnId);
-    if (existing && existing.onclick) return;
+    const mapExisting = document.getElementById(mapBtnId);
+    const sheetExisting = document.getElementById(sheetBtnId);
 
     if (isOpSpotPage()) {
+      if (existing && existing.onclick && mapExisting && mapExisting.onclick) return;
       injectButton(btnId, platform.buttonFill || "Fill from Uber Eats", async () => {
         resetFillGuards();
-        const payload = await loadPayload();
+        let payload = await loadPayload();
         if (!payload) {
           toast(`No stored order. Click ${platform.buttonExtract || "Extract Order → OpSpot"} on the Uber Eats tab first, then click here.`, "error", 7000);
           return;
         }
+        payload = applyConditions(payload);
+        savePayload(payload);
         await applyPayloadToClaims(payload, { force: true });
       });
+      injectButton(mapBtnId, "Map & conditions", toggleMapPanel);
       return;
     }
 
     if (isUberEatsPage()) {
+      if (existing && existing.onclick && mapExisting && mapExisting.onclick && sheetExisting && sheetExisting.onclick) return;
       injectButton(btnId, platform.buttonExtract || "Extract Order → OpSpot", onExtractClick);
+      injectButton(mapBtnId, "Map & conditions", toggleMapPanel);
+      injectButton(sheetBtnId, "Copy sheet row", onCopySheetClick);
     }
   }
 
@@ -3307,15 +4500,19 @@
       if (typeof location !== "undefined" && /opspot/i.test(location.host)) {
         GM_registerMenuCommand(platform.buttonFill || "Fill from Uber Eats", async () => {
           resetFillGuards();
-          const payload = await loadPayload();
+          let payload = await loadPayload();
           if (!payload) {
             toast("No stored order. Run Extract Order on the Uber Eats tab first.", "error", 7000);
             return;
           }
+          payload = applyConditions(payload);
+          savePayload(payload);
           await applyPayloadToClaims(payload, { force: true });
         });
+        GM_registerMenuCommand("Map & conditions", toggleMapPanel);
       } else {
         GM_registerMenuCommand(platform.buttonExtract || "Extract Order → OpSpot", onExtractClick);
+        GM_registerMenuCommand("Map & conditions", toggleMapPanel);
       }
     }
     const remount = debounce(mount, 400);
@@ -3335,7 +4532,8 @@
       observerQueued = true;
       requestAnimationFrame(() => {
         observerQueued = false;
-        if (!document.getElementById(btnId)) remount();
+        const needSheet = isUberEatsPage() && !document.getElementById(sheetBtnId);
+        if (!document.getElementById(btnId) || !document.getElementById(mapBtnId) || needSheet) remount();
       });
     }).observe(document.documentElement, { childList: true, subtree: true });
     if (typeof GM_addValueChangeListener === "function") {
@@ -3359,6 +4557,15 @@
       onNeedNextExtractMessage: "Run Extract Order on the Uber Eats order tab first.",
     });
     mount();
+    setInterval(() => {
+      try {
+        if (!document.body) return;
+        if (!isUberEatsPage() && !isOpSpotPage()) return;
+        mount();
+      } catch (err) {
+        console.warn("[Uber Claims] remount failed", err);
+      }
+    }, 1500);
   }
 
   async function onExtractClick() {

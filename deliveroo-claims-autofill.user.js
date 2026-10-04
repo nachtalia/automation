@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Deliveroo Refund → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.4.0
+// @version      2.4.13
 // @description  Read Deliveroo refunds, map fields/conditions (incl. location aliases) to Workhorse, fill OpSpot, copy Sheets.
 // @author       Claims Ops
 // @match        https://partner-hub.deliveroo.com/*
@@ -225,7 +225,7 @@
       buttonFill: "Fill from Uber Eats",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "2.2.0",
+      versionLabel: "2.4.13",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: sharedCustomerAliases,
       locationAliases: [],
@@ -241,6 +241,8 @@
         "food safety complaint": "Other",
         "wrong order": "Incorrect Item",
         "wrong item": "Incorrect Item",
+        "item reported wrong": "Incorrect Item",
+        "reported wrong": "Incorrect Item",
         "poor food quality": "Prepared incorrectly",
         "food quality": "Prepared incorrectly",
         "customization missing": "Missing Item",
@@ -253,7 +255,7 @@
         { test: "customization\\s*(reported\\s*)?missing|item\\s*reported\\s*missing|reported\\s*missing|^missing$|missing item", canonical: "missing items" },
         { test: "prepared incorrectly|poor food quality|food quality", canonical: "prepared incorrectly" },
         { test: "food safety", canonical: "food safety complaint" },
-        { test: "wrong order|wrong item|incorrect", canonical: "incorrect item" },
+        { test: "item\\s+reported\\s+wrong|reported\\s+wrong|wrong order|wrong item|incorrect", canonical: "incorrect item" },
       ],
 
       outcomeRules: [
@@ -266,11 +268,8 @@
       footageRules: [
         { type: "alreadyDisputed", footageKey: "disputedByThirdParty" },
         { type: "underDisputeThreshold", footageKey: "irrelevant" },
-        {
-          type: "reasonIn",
-          reasons: ["missing items", "prepared incorrectly", "incorrect item", "food safety complaint"],
-          footageKey: "irrelevant",
-        },
+        { type: "reasonIn", reasons: ["missing items", "food safety complaint"], footageKey: "irrelevant" },
+        { type: "reasonIn", reasons: ["prepared incorrectly", "incorrect item"], footageKey: "irrelevant" },
       ],
 
       sheet: { enabled: false },
@@ -278,10 +277,10 @@
       /** Labels the Uber extractor prefers for dispute amount / order value */
       extractHints: {
         disputeAmountLabels: ["Chargeback Amount", "Marketplace Fee", "Refund", "Adjustment"],
-        orderValueLabels: ["Sales (incl. GST)", "Sales", "Subtotal", "Net payout"],
+        orderValueLabels: ["Sales (incl. VAT)", "Sales (incl. GST)", "Sales", "Subtotal"],
       },
 
-      otherReasonIncludesCustomerLocation: true,
+      otherReasonIncludesCustomerLocation: false,
     },
 
     grubhub: {

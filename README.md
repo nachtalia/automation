@@ -130,20 +130,21 @@ Brand → tab (from presets): Shake Shack, Jollibee UK, Popeyes.
 ## Uber Eats workflow
 
 1. Open the order on **Uber Eats Manager**.
-2. Click **Extract Order → OpSpot**.
-3. OpSpot → **Add New** → **Fill from Uber Eats**.
-4. Review, then **Save**.
+2. *(Optional)* Click **Map & conditions**. Map a field by clicking its text on the order, or tweak aliases, reasons, outcome, and footage. Re-extract after a change.
+3. Click **Extract Order → OpSpot**.
+4. OpSpot → **Add New** → **Fill from Uber Eats**.
+5. Review, then **Save**.
 
 | OpSpot field | Source |
 |--------------|--------|
 | Order Number | Short order code |
-| Customer / Location | Brand under date / address beside brand |
+| Customer / Location | Brand before the dash / place name after it (`KFC - Consett` → KFC / Consett) |
 | Claim Date / Order Time | Order date / Order placed time |
-| Order Value | Sales (incl. GST) |
+| Order Value | Sales (incl. VAT) |
 | Dispute Amount | Chargeback Amount (absolute) |
 | Platform | Uber Eats |
 
-**Other reason** includes customer, location, and issue item names when configured in the Uber preset.
+**Other reason** lists the item names that have an issue subtitle.
 
 ---
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Eats Order → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.4.13
+// @version      2.4.14
 // @description  Read Uber Eats Manager orders/issues and fill OpSpot Claims (preset-driven Workhorse fills).
 // @author       Claims Ops
 // @match        https://merchants.ubereats.com/*
@@ -218,7 +218,7 @@
       buttonFill: "Fill from Uber Eats",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "2.4.13",
+      versionLabel: "2.4.14",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: sharedCustomerAliases,
       locationAliases: [],
@@ -2620,25 +2620,49 @@
     return { customer: parts[0], location: parts.slice(1).join(" - ") };
   }
 
-  function parseBrandLocation(text) {
-    const line = normalizeSpace(text);
+  function isShortPlaceName(text) {
+    const value = normalizeSpace(text);
+    if (!value || value.length > 40) return false;
+    if (/,/.test(value)) return false;
+    if (/\d{2,}/.test(value)) return false;
+    if (/\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b/i.test(value)) return false;
+    return true;
+  }
 
-    // Burger King (East Tamaki) (68 East Tamaki Road, Papatoetoe, Auckland)
+  function parseBrandLocation(text) {
+    let line = normalizeSpace(text);
+
+    // Hungry Jacks (Cavill Ave) (Hungry Jacks (Cavill Ave)) → use the first copy
     const dual = line.match(/^(.+?\([^)]+\))\s*\((.+)\)\s*$/);
-    if (dual && looksLikeAddress(dual[2])) {
-      return { customer: normalizeSpace(dual[1]), location: normalizeSpace(dual[2]) };
+    if (dual) {
+      const left = normalizeSpace(dual[1]);
+      const right = normalizeSpace(dual[2]);
+      const leftKey = normalizeKey(left);
+      const rightKey = normalizeKey(right);
+      if (leftKey && (leftKey === rightKey || rightKey.includes(leftKey))) {
+        line = left;
+      } else {
+        const inner = left.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
+        if (inner && isShortPlaceName(inner[2])) {
+          return { customer: normalizeSpace(inner[1]), location: normalizeSpace(inner[2]) };
+        }
+        if (looksLikeAddress(right)) {
+          return { customer: left, location: right };
+        }
+      }
     }
 
     // KFC - Consett (Hermiston Retail Park, ...) → customer KFC, location Consett
     const dashed = splitBrandDash(line);
     if (dashed) return dashed;
 
-    // Legacy: Brand (Store area) when the paren is not a street address
+    // Hungry Jacks (Cavill Ave) → customer Hungry Jacks, location Cavill Ave
     const paren = line.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
     if (paren) {
+      const brand = normalizeSpace(paren[1]);
       const inside = normalizeSpace(paren[2]);
-      if (looksLikeAddress(inside)) {
-        return { customer: normalizeSpace(paren[1]), location: inside };
+      if (isShortPlaceName(inside) || looksLikeAddress(inside)) {
+        return { customer: brand, location: inside };
       }
       return { customer: line, location: "" };
     }

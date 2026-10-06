@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Deliveroo Refund → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.4.14
+// @version      2.4.16
 // @description  Read Deliveroo refunds, map fields/conditions (incl. location aliases) to Workhorse, fill OpSpot, copy Sheets.
 // @author       Claims Ops
 // @match        https://partner-hub.deliveroo.com/*
@@ -96,8 +96,16 @@
       disputedByThirdParty: "Disputed by 3rd party",
     },
     footageStatusOptions: {
-      disputedByThirdParty: "Disputed by 3rd party",
-      irrelevant: "Footage status irrelevant for this claim",
+      cameraOffline: "Camera Offline",
+      foodPackedOutside: "Food packed outside camera visibility",
+      cloudStorageUnavailable: "Cloud storage not available",
+      cameraGlitching: "Camera glitching",
+      restaurantAtFault: "Video evidence confirms restaurant is at fault",
+      restaurantNotAtFault: "Video evidence confirms restaurant is not at fault",
+      claimRejectedByAggregator: "Correct claim rejected by the aggregator",
+      irrelevant: "Footage status irrelevant to this claim",
+      disputedByThirdParty: "Disputed by 3rd Party",
+      wonWithoutFootage: "Won without footage",
       noCamera: "No Camera",
     },
 
@@ -171,11 +179,8 @@
         { type: "fiveGuysUnderMax", footageKey: "irrelevant" },
         { type: "alreadyDisputed", footageKey: "disputedByThirdParty" },
         { type: "underDisputeThreshold", footageKey: "irrelevant" },
-        {
-          type: "reasonIn",
-          reasons: ["missing items", "prepared incorrectly", "incorrect item", "food safety complaint"],
-          footageKey: "irrelevant",
-        },
+        { type: "reasonIn", reasons: ["missing items", "food safety complaint"], footageKey: "irrelevant" },
+        { type: "reasonIn", reasons: ["prepared incorrectly", "incorrect item"], footageKey: "irrelevant" },
       ],
 
       sheet: {
@@ -225,7 +230,7 @@
       buttonFill: "Fill from Uber Eats",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "2.4.14",
+      versionLabel: "2.4.16",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: sharedCustomerAliases,
       locationAliases: [],
@@ -3269,17 +3274,19 @@
         </div>
       </li>
       <li class="dcf-cond-builtin-editable">
-        <div><strong>Missing / Incomplete / food safety</strong> → Outcome / Reason for Dispute</div>
+        <div><strong>Missing / Incomplete / food safety</strong> → Outcome / Footage / Reason for Dispute</div>
         <div class="dcf-cond-form dcf-cond-tweak-grid">
           ${outcomeSelectHtml("missingFoodSafety", missing.outcome)}
+          ${footageSelectHtml("missingFoodSafety", missing.footage)}
         </div>
         <div class="dcf-map-meta" style="margin-top:6px">Reason for Dispute (multi-select). None checked = use reason map. If several match, the best one for this order is used.</div>
         ${reasonForDisputeCheckboxHtml("missingFoodSafety", missing.reasonForDispute)}
       </li>
       <li class="dcf-cond-builtin-editable">
-        <div><strong>Prepared incorrectly / Incorrect item</strong> (also Incomplete → Incorrect Item) → Outcome / Reason for Dispute</div>
+        <div><strong>Prepared incorrectly / Incorrect item</strong> (also Incomplete → Incorrect Item) → Outcome / Footage / Reason for Dispute</div>
         <div class="dcf-cond-form dcf-cond-tweak-grid">
           ${outcomeSelectHtml("preparedIncorrect", prepared.outcome)}
+          ${footageSelectHtml("preparedIncorrect", prepared.footage)}
         </div>
         <div class="dcf-map-meta" style="margin-top:6px">Reason for Dispute (multi-select). None checked = use reason map.</div>
         ${reasonForDisputeCheckboxHtml("preparedIncorrect", prepared.reasonForDispute)}

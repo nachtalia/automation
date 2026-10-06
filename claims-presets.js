@@ -64,8 +64,16 @@
       disputedByThirdParty: "Disputed by 3rd party",
     },
     footageStatusOptions: {
-      disputedByThirdParty: "Disputed by 3rd party",
-      irrelevant: "Footage status irrelevant for this claim",
+      cameraOffline: "Camera Offline",
+      foodPackedOutside: "Food packed outside camera visibility",
+      cloudStorageUnavailable: "Cloud storage not available",
+      cameraGlitching: "Camera glitching",
+      restaurantAtFault: "Video evidence confirms restaurant is at fault",
+      restaurantNotAtFault: "Video evidence confirms restaurant is not at fault",
+      claimRejectedByAggregator: "Correct claim rejected by the aggregator",
+      irrelevant: "Footage status irrelevant to this claim",
+      disputedByThirdParty: "Disputed by 3rd Party",
+      wonWithoutFootage: "Won without footage",
       noCamera: "No Camera",
     },
 
@@ -139,11 +147,8 @@
         { type: "fiveGuysUnderMax", footageKey: "irrelevant" },
         { type: "alreadyDisputed", footageKey: "disputedByThirdParty" },
         { type: "underDisputeThreshold", footageKey: "irrelevant" },
-        {
-          type: "reasonIn",
-          reasons: ["missing items", "prepared incorrectly", "incorrect item", "food safety complaint"],
-          footageKey: "irrelevant",
-        },
+        { type: "reasonIn", reasons: ["missing items", "food safety complaint"], footageKey: "irrelevant" },
+        { type: "reasonIn", reasons: ["prepared incorrectly", "incorrect item"], footageKey: "irrelevant" },
       ],
 
       sheet: {
@@ -193,7 +198,7 @@
       buttonFill: "Fill from Uber Eats",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "2.4.14",
+      versionLabel: "2.4.16",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: sharedCustomerAliases,
       locationAliases: [],

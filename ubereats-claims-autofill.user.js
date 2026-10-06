@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Eats Order → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.4.14
+// @version      2.4.16
 // @description  Read Uber Eats Manager orders/issues and fill OpSpot Claims (preset-driven Workhorse fills).
 // @author       Claims Ops
 // @match        https://merchants.ubereats.com/*
@@ -89,8 +89,16 @@
       disputedByThirdParty: "Disputed by 3rd party",
     },
     footageStatusOptions: {
-      disputedByThirdParty: "Disputed by 3rd party",
-      irrelevant: "Footage status irrelevant for this claim",
+      cameraOffline: "Camera Offline",
+      foodPackedOutside: "Food packed outside camera visibility",
+      cloudStorageUnavailable: "Cloud storage not available",
+      cameraGlitching: "Camera glitching",
+      restaurantAtFault: "Video evidence confirms restaurant is at fault",
+      restaurantNotAtFault: "Video evidence confirms restaurant is not at fault",
+      claimRejectedByAggregator: "Correct claim rejected by the aggregator",
+      irrelevant: "Footage status irrelevant to this claim",
+      disputedByThirdParty: "Disputed by 3rd Party",
+      wonWithoutFootage: "Won without footage",
       noCamera: "No Camera",
     },
 
@@ -164,11 +172,8 @@
         { type: "fiveGuysUnderMax", footageKey: "irrelevant" },
         { type: "alreadyDisputed", footageKey: "disputedByThirdParty" },
         { type: "underDisputeThreshold", footageKey: "irrelevant" },
-        {
-          type: "reasonIn",
-          reasons: ["missing items", "prepared incorrectly", "incorrect item", "food safety complaint"],
-          footageKey: "irrelevant",
-        },
+        { type: "reasonIn", reasons: ["missing items", "food safety complaint"], footageKey: "irrelevant" },
+        { type: "reasonIn", reasons: ["prepared incorrectly", "incorrect item"], footageKey: "irrelevant" },
       ],
 
       sheet: {
@@ -218,7 +223,7 @@
       buttonFill: "Fill from Uber Eats",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "2.4.14",
+      versionLabel: "2.4.16",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: sharedCustomerAliases,
       locationAliases: [],
@@ -3626,7 +3631,6 @@
   }
 
   function loadUserConditions() {
-    if (userConditionsCache) return userConditionsCache;
     userConditionsCache = coerceConditions(readGm(CONDITIONS_KEY));
     return userConditionsCache;
   }
@@ -3682,15 +3686,23 @@
   function matchAliasList(text, aliases) {
     const value = normalizeSpace(text);
     if (!value || !Array.isArray(aliases)) return "";
-    for (const rule of aliases) {
-      if (!rule || !rule.match || !rule.value) continue;
-      try {
-        if (new RegExp(String(rule.match), "i").test(value)) return normalizeSpace(rule.value);
-      } catch {
-        if (normalizeKey(value) === normalizeKey(rule.match)) return normalizeSpace(rule.value);
-      }
+    const valueKey = normalizeKey(value);
+    if (!valueKey) return "";
+    const rules = aliases.filter((rule) => rule && normalizeSpace(rule.match) && normalizeSpace(rule.value));
+    for (const rule of rules) {
+      if (normalizeKey(rule.match) === valueKey) return normalizeSpace(rule.value);
     }
-    return "";
+    let best = null;
+    let bestLen = 0;
+    for (const rule of rules) {
+      const matchKey = normalizeKey(rule.match);
+      if (matchKey.length < 4 || valueKey.length < 4) continue;
+      const hit = valueKey.includes(matchKey) || matchKey.includes(valueKey);
+      if (!hit || matchKey.length <= bestLen) continue;
+      best = rule;
+      bestLen = matchKey.length;
+    }
+    return best ? normalizeSpace(best.value) : "";
   }
 
   function resolveCustomerName(name) {
@@ -4239,6 +4251,16 @@
       next.reasonMap = reasonMap;
       next.videoSubmitted = panel.querySelector("[data-video-submitted]")?.value || "No";
       next.platformLabel = normalizeSpace(panel.querySelector("[data-platform-label]")?.value) || null;
+      ["customerAliases", "locationAliases"].forEach((kind) => {
+        const from = normalizeSpace(panel.querySelector(`[data-cond-from="${kind}"]`)?.value);
+        const to = normalizeSpace(panel.querySelector(`[data-cond-to="${kind}"]`)?.value);
+        if (!from || !to) return;
+        const list = Array.isArray(next[kind]) ? next[kind].slice() : [];
+        const idx = list.findIndex((rule) => normalizeKey(rule && rule.match) === normalizeKey(from));
+        if (idx >= 0) list[idx] = { match: from, value: to };
+        else list.push({ match: from, value: to });
+        next[kind] = list;
+      });
       saveUserConditions(next);
       toast("Saved Uber Eats conditions. Extract the order again.", "success", 5000);
       renderMapPanel();
@@ -4470,7 +4492,11 @@
       toast("Extract the order first, then copy the sheet row.", "error", 6000);
       return;
     }
-    const row = buildEisSheetRow(payload);
+    const row = buildEisSheetRow({
+      ...payload,
+      customer: resolveCustomerName(payload.customer),
+      location: resolveLocationName(payload.location),
+    });
     const copied = copyTextToClipboard(row);
     if (!copied) {
       toast("Could not copy. Select the row from the preview and copy it manually.", "error", 6000);

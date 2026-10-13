@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Deliveroo Refund → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.4.16
+// @version      2.4.26
 // @description  Read Deliveroo refunds, map fields/conditions (incl. location aliases) to Workhorse, fill OpSpot, copy Sheets.
 // @author       Claims Ops
 // @match        https://partner-hub.deliveroo.com/*
@@ -230,7 +230,7 @@
       buttonFill: "Fill from Uber Eats",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "2.4.16",
+      versionLabel: "2.4.26",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: sharedCustomerAliases,
       locationAliases: [],
@@ -2492,9 +2492,11 @@
   const btnId = `${uiPrefix}-btn`;
   const sheetBtnId = `${uiPrefix}-sheet-btn`;
   const mapBtnId = `${uiPrefix}-map-btn`;
+  const timesBtnId = `${uiPrefix}-times-btn`;
   const mapPanelId = `${uiPrefix}-map-panel`;
   const FIELD_MAP_KEY = "deliveroo_user_field_map_v1";
   const CONDITIONS_KEY = "deliveroo_user_conditions_v1";
+  const LIST_TIMES_KEY = "deliveroo_list_times_v1";
   const workhorse = core.workhorse;
 
   /** Workhorse fields you can point at Deliveroo page text */
@@ -2749,6 +2751,689 @@
     return { customer: "", location: "" };
   }
 
+  function parseListDateTimeNearCode(text, code) {
+    const flat = normalizeSpace(text);
+    const codeAt = flat.search(new RegExp(`\\b${String(code).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`));
+    if (codeAt < 0) return null;
+    const re = /(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\s+at\s+(\d{1,2}:\d{2}(?:\s*[AP]M)?)/gi;
+    let best = null;
+    let bestDist = Infinity;
+    let match;
+    while ((match = re.exec(flat))) {
+      const dist = Math.abs(match.index - codeAt);
+      const time = extractTime(match[2]);
+      if (!time || dist >= bestDist) continue;
+      best = { dateRaw: normalizeSpace(match[1]), time };
+      bestDist = dist;
+    }
+    return best;
+  }
+
+  function listRowDateTime(orderCode) {
+    const code = (String(orderCode || "").match(/\d{3,}/) || [])[0] || "";
+    if (!code) return null;
+    const codeRe = new RegExp(`\\b${code}\\b`);
+    const nodes = document.querySelectorAll("tr, [role='row'], li, a, span, div");
+    let best = null;
+    let bestLen = Infinity;
+    for (let i = 0; i < nodes.length; i++) {
+      const start = nodes[i];
+      if (!visible(start)) continue;
+      const own = normalizeSpace(start.innerText || start.textContent || "");
+      if (!own || own.length > 24 || !codeRe.test(own)) continue;
+      let node = start;
+      for (let depth = 0; depth < 8 && node; depth++) {
+        const text = node.innerText || "";
+        if (text.length > 500) break;
+        const parsed = parseListDateTimeNearCode(text, code);
+        if (parsed) {
+          if (text.length < bestLen) {
+            best = parsed;
+            bestLen = text.length;
+          }
+          break;
+        }
+        node = node.parentElement;
+      }
+    }
+    if (best) return best;
+    const lines = pageLines();
+    for (let i = 0; i < lines.length; i++) {
+      if (!codeRe.test(lines[i]) || lines[i].length > 24) continue;
+      const windowText = lines.slice(Math.max(0, i - 1), i + 4).join(" ");
+      const parsed = parseListDateTimeNearCode(windowText, code);
+      if (parsed) return parsed;
+    }
+    return null;
+  }
+
+  function orderCodeFromText(text) {
+    const tokens = String(text || "").match(/\b\d{3,8}\b/g) || [];
+    return tokens.find((token) => !/^(19|20)\d{2}$/.test(token)) || "";
+  }
+
+  function collectAllListOrderTimes() {
+    const byCode = new Map();
+    const consider = (text) => {
+      const flat = normalizeSpace(text);
+      if (flat.length < 12 || flat.length > 420) return;
+      const stampRe = /(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\s+at\s+(\d{1,2}:\d{2}(?:\s*[AP]M)?)/gi;
+      let stamp;
+      while ((stamp = stampRe.exec(flat))) {
+        const time = extractTime(stamp[2]);
+        if (!time) continue;
+        const dateDigits = new Set((stamp[1].match(/\d+/g) || []));
+        const around = `${flat.slice(Math.max(0, stamp.index - 90), stamp.index)} ${flat.slice(stamp.index + stamp[0].length, stamp.index + stamp[0].length + 40)}`;
+        const code = (around.match(/\b\d{3,8}\b/g) || []).find((token) => !dateDigits.has(token) && !/^(19|20)\d{2}$/.test(token));
+        if (!code) continue;
+        const prev = byCode.get(code);
+        const status = classifyDisputeStatus(flat);
+        if (!prev || flat.length < prev.len) {
+          byCode.set(code, {
+            orderNumber: code,
+            time,
+            dateRaw: normalizeSpace(stamp[1]),
+            len: flat.length,
+            disputeStatus: (prev && prev.disputeStatus) || status,
+            branch: (prev && prev.branch) || "",
+          });
+        } else if (status && !prev.disputeStatus) {
+          prev.disputeStatus = status;
+        }
+      }
+    };
+
+    const nodes = document.querySelectorAll("tr, [role='row'], li, a, article, div");
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      if (!visible(el)) continue;
+      if (el.closest(`#${uiPrefix}-btn-bar, #${uiPrefix}-preview, #${uiPrefix}-toast, #${mapPanelId}`)) continue;
+      consider(el.innerText || "");
+    }
+    const lines = pageLines();
+    for (let i = 0; i < lines.length; i++) {
+      if (!/^\d{3,8}$/.test(lines[i]) || /^(19|20)\d{2}$/.test(lines[i])) {
+        if (/\bat\s+\d{1,2}:\d{2}/i.test(lines[i])) consider(lines[i]);
+        continue;
+      }
+      consider([lines[i], lines[i + 1], lines[i + 2], lines[i + 3]].filter(Boolean).join(" "));
+    }
+    const statusNodes = document.querySelectorAll("tr, [role='row'], li, article");
+    for (let i = 0; i < statusNodes.length; i++) {
+      const el = statusNodes[i];
+      if (!visible(el)) continue;
+      if (el.closest(`#${uiPrefix}-btn-bar, #${uiPrefix}-preview, #${uiPrefix}-toast, #${mapPanelId}`)) continue;
+      const text = el.innerText || "";
+      if (text.length < 8 || text.length > 1500) continue;
+      const status = classifyDisputeStatus(text);
+      const branch = branchFromListText(text) || branchFromRowCells(el);
+      if (!status && !branch) continue;
+      const code = orderCodeFromText(text);
+      if (!code) continue;
+      const prev = byCode.get(code);
+      if (prev) {
+        if (status && !prev.disputeStatus) prev.disputeStatus = status;
+        if (branch && !prev.branch) prev.branch = branch;
+      } else {
+        byCode.set(code, { orderNumber: code, time: "", dateRaw: "", len: text.length, disputeStatus: status || "", branch: branch || "" });
+      }
+    }
+    const pageBranch = pageBranchName();
+    for (const row of byCode.values()) {
+      if (!row.branch && pageBranch) row.branch = pageBranch;
+    }
+    return [...byCode.values()].map(({ orderNumber, time, dateRaw, disputeStatus, branch }) => ({
+      orderNumber,
+      time,
+      dateRaw,
+      disputeStatus: disputeStatus || "",
+      branch: branch || "",
+    }));
+  }
+
+  function branchFromListText(text) {
+    const lines = String(text || "").split(/\n+/);
+    for (let i = 0; i < lines.length; i++) {
+      const bit = normalizeSpace(lines[i]);
+      if (!looksLikeBrandLocation(bit)) continue;
+      const location = resolveLocationName(splitBrandLocation(bit).location);
+      if (location && !/^(uk|united kingdom|gb)$/i.test(location)) return location;
+    }
+    return "";
+  }
+
+  function cleanBranchCell(text) {
+    const value = normalizeSpace(text);
+    if (!value || value.length > 80) return "";
+    if (/^(approved|rejected|awaiting review)$/i.test(value)) return "";
+    if (parseClaimDate(value).iso && value.length < 32) return "";
+    if (/^[\d£€$]/.test(value) || /^\d{3,8}$/.test(value)) return "";
+    if (looksLikeBrandLocation(value)) {
+      const location = resolveLocationName(splitBrandLocation(value).location);
+      return location && !/^(uk|united kingdom|gb)$/i.test(location) ? location : "";
+    }
+    return resolveLocationName(value);
+  }
+
+  function branchFromRowCells(row) {
+    const table = row && row.closest ? row.closest("table") : null;
+    if (!table || !row.children) return "";
+    const headerRow = table.querySelector("thead tr") || (table.rows && table.rows[0]);
+    if (!headerRow || headerRow === row) return "";
+    const headers = [...headerRow.children].map((cell) => normalizeKey(cell.innerText || cell.textContent || ""));
+    const idx = headers.findIndex((header) => header === "branch" || header === "location" || header === "restaurant" || header === "site" || header.includes("branch"));
+    if (idx < 0 || !row.children[idx]) return "";
+    return cleanBranchCell(row.children[idx].innerText || row.children[idx].textContent || "");
+  }
+
+  function pageBranchName() {
+    const nodes = document.querySelectorAll("button, [role='combobox']");
+    for (let i = 0; i < nodes.length; i++) {
+      const text = normalizeSpace(nodes[i].innerText || "");
+      if (!text || text.length > 80 || /all branches|select branch/i.test(text)) continue;
+      const fromLine = branchFromListText(text);
+      if (fromLine) return fromLine;
+    }
+    return "";
+  }
+
+  function sameClaimDate(current, dateRaw) {
+    const want = parseClaimDate(dateRaw);
+    if (!want.iso) return false;
+    const got = parseClaimDate(current);
+    return !!got.iso && got.iso === want.iso;
+  }
+
+  function sameBranch(current, want) {
+    if (!want) return true;
+    const left = normalizeKey(resolveLocationName(current));
+    const right = normalizeKey(resolveLocationName(want));
+    return !!left && left === right;
+  }
+
+  function classifyDisputeStatus(text) {
+    const flat = normalizeSpace(text);
+    if (!flat) return "";
+    if (/\bawaiting\s+review\b/i.test(flat)) return "awaiting";
+    if (/\brejected\b/i.test(flat) && !/\bawaiting\b/i.test(flat)) return "rejected";
+    if (/\bapproved\b/i.test(flat) && !/\bnot\s+approved\b/i.test(flat)) return "approved";
+    return "";
+  }
+
+  function choiceMatches(current, next) {
+    return !!next && normalizeKey(current) === normalizeKey(next);
+  }
+
+  function choiceText(found) {
+    if (!found) return "";
+    const row = found.row;
+    const rendered = row && row.querySelector
+      ? row.querySelector(".select2-selection__rendered")
+      : null;
+    if (rendered && normalizeSpace(rendered.textContent)) return normalizeSpace(rendered.textContent);
+    const control = found.control;
+    if (!control) return "";
+    if (control.tagName === "SELECT" && control.selectedOptions && control.selectedOptions[0]) {
+      return normalizeSpace(control.selectedOptions[0].textContent);
+    }
+    return normalizeSpace(control.value || control.textContent || "");
+  }
+
+  function disputeResolution(status, footageText) {
+    if (status !== "approved" && status !== "rejected") return null;
+    const footage = normalizeKey(footageText);
+    const disputedCorrectly = /disputed correctly/.test(footage);
+    const notAtFault = /video evidence confirms restaurant is not at fault/.test(footage)
+      || /video evidence confirms restaurant not at fault/.test(footage);
+    if (status === "approved") {
+      const update = { outcome: "Won" };
+      if (!disputedCorrectly && !notAtFault) update.footageStatus = "Won without footage";
+      return update;
+    }
+    const update = { outcome: "Lost" };
+    if (!disputedCorrectly && notAtFault) {
+      update.footageStatus = "Correct claim rejected by the aggregator";
+    }
+    return update;
+  }
+
+  function readListTimes() {
+    let value = null;
+    try {
+      if (typeof GM_getValue === "function") value = GM_getValue(LIST_TIMES_KEY, null);
+    } catch {
+      value = null;
+    }
+    if (typeof value === "string") {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        value = null;
+      }
+    }
+    if (!value || !Array.isArray(value.rows)) return { checkedAt: "", rows: [] };
+    return value;
+  }
+
+  function saveListTimes(batch) {
+    try {
+      if (typeof GM_setValue === "function") GM_setValue(LIST_TIMES_KEY, batch);
+    } catch (err) {
+      toast(`Could not store the checked times: ${err.message || err}`, "error");
+    }
+    try {
+      if (typeof GM !== "undefined" && GM.setValue) GM.setValue(LIST_TIMES_KEY, batch);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function rememberedListTime(orderNumber) {
+    const code = orderCodeFromText(orderNumber);
+    if (!code) return "";
+    const row = (readListTimes().rows || []).find((item) => item && item.orderNumber === code);
+    return row && row.time ? row.time : "";
+  }
+
+  function pageWin() {
+    return typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+  }
+
+  function modalIsOpen() {
+    const el = document.getElementById("modal");
+    if (!el) return false;
+    return el.classList.contains("in") || el.classList.contains("show") || el.getAttribute("aria-hidden") === "false";
+  }
+
+  function findModalButton(pattern) {
+    const modal = document.getElementById("modal") || document.getElementById("modalWrapper");
+    if (!modal) return null;
+    return [...modal.querySelectorAll("button, a, input")].find((el) => {
+      if (!visible(el)) return false;
+      const text = normalizeSpace(el.value || el.innerText || el.textContent || "");
+      if (/add new/i.test(text)) return false;
+      return pattern.test(text);
+    }) || null;
+  }
+
+  function claimRowEdit(row) {
+    const call = row.getAttribute("onmousedown") || "";
+    const match = call.match(/loadSysModal\(\s*(\d+)\s*,\s*(\d+)\s*,\s*'([^']+)'/);
+    if (!match) return null;
+    return { moduleId: Number(match[1]), entityId: Number(match[2]), dataId: match[3] };
+  }
+
+  async function closeClaimEditor() {
+    if (!modalIsOpen()) return;
+    const cancel = findModalButton(/^cancel$/i);
+    if (cancel) safeClick(cancel);
+    await waitUntil(() => !modalIsOpen(), 4000, 80);
+  }
+
+  async function editOneClaimTime(job) {
+    const page = pageWin();
+    if (typeof page.loadSysModal !== "function") return false;
+    await closeClaimEditor();
+    page.loadSysModal(job.moduleId, job.entityId, job.dataId, "");
+    const modal = await waitUntil(() => {
+      const el = document.getElementById("modal");
+      if (!el || !modalIsOpen()) return null;
+      if (!/order time/i.test(el.innerText || "")) return null;
+      return el;
+    }, 8000, 80);
+    if (!modal) return false;
+    const orderLabel = (workhorse.labels && workhorse.labels.orderNumber) || "Order Number";
+    const timeLabel = (workhorse.labels && workhorse.labels.orderTime) || "Order Time";
+    const orderField = core.controlAfterLabel(modal, orderLabel);
+    const formNum = orderCodeFromText(orderField && orderField.control ? orderField.control.value : "");
+    if (formNum && formNum !== job.num) {
+      await closeClaimEditor();
+      return false;
+    }
+    let timeChanged = false;
+    if (job.want) {
+      const timeField = core.controlAfterLabel(modal, timeLabel);
+      if (!timeField || !timeField.control) {
+        if (job.disputeStatus !== "approved" && job.disputeStatus !== "rejected" && !job.dateRaw && !job.branch) {
+          await closeClaimEditor();
+          return null;
+        }
+      } else if (extractTime(timeField.control.value || timeField.control.textContent || "") !== job.want) {
+        core.setInputValue(timeField.control, job.want, { skipFocus: false });
+        const $ = page.jQuery || page.$;
+        if ($) {
+          try { $(timeField.control).timepicker("setTime", job.want); } catch { /* list time is plain HH:MM */ }
+          try { $(timeField.control).val(job.want).trigger("change"); } catch { /* ignore */ }
+        }
+        timeChanged = true;
+      }
+    }
+    const placed = await applyDateAndBranch(modal, job);
+    const dispute = await applyDisputeFields(modal, job.disputeStatus);
+    if (!timeChanged && !dispute.changed && !placed.changed) {
+      await closeClaimEditor();
+      return {
+        ok: true,
+        unchanged: true,
+        timeChanged: false,
+        statusChanged: false,
+        dateChanged: false,
+        branchChanged: false,
+        failed: dispute.failed || placed.failed,
+      };
+    }
+    const save = findModalButton(/^save$/i);
+    if (!save) {
+      await closeClaimEditor();
+      return null;
+    }
+    safeClick(save);
+    await waitUntil(() => !modalIsOpen(), 10000, 100);
+    if (modalIsOpen()) return null;
+    return {
+      ok: true,
+      unchanged: false,
+      timeChanged,
+      statusChanged: dispute.changed,
+      dateChanged: placed.dateChanged,
+      branchChanged: placed.branchChanged,
+      failed: dispute.failed || placed.failed,
+    };
+  }
+
+  async function applyDateAndBranch(modal, job) {
+    let dateChanged = false;
+    let branchChanged = false;
+    let failed = false;
+    if (job.dateRaw) {
+      const dateLabel = (workhorse.labels && workhorse.labels.claimDate) || "Claim Date";
+      const parsed = parseClaimDate(job.dateRaw);
+      const dateFound = core.controlAfterLabel(modal, dateLabel);
+      const currentDate = dateFound && dateFound.control ? dateFound.control.value || dateFound.control.textContent || "" : "";
+      if (parsed.iso && !sameClaimDate(currentDate, job.dateRaw)) {
+        const res = await core.fillLabeledField(modal, dateLabel, parsed.dash, { iso: parsed.iso });
+        if (res && res.ok) dateChanged = true;
+        else failed = true;
+      }
+    }
+    if (job.branch) {
+      const locationLabel = (workhorse.labels && workhorse.labels.location) || "Location";
+      const locationFound = core.controlAfterLabel(modal, locationLabel);
+      if (!sameBranch(choiceText(locationFound), job.branch)) {
+        const res = await core.fillLabeledField(modal, locationLabel, resolveLocationName(job.branch));
+        if (res && res.ok) branchChanged = true;
+        else failed = true;
+      }
+    }
+    return { changed: dateChanged || branchChanged, dateChanged, branchChanged, failed };
+  }
+
+  async function applyDisputeFields(modal, status) {
+    if (status !== "approved" && status !== "rejected") return { changed: false, failed: false };
+    const footageLabel = (workhorse.labels && workhorse.labels.footageStatus) || "Footage Status";
+    const outcomeLabel = (workhorse.labels && workhorse.labels.outcome) || "Outcome";
+    const footageFound = core.controlAfterLabel(modal, footageLabel);
+    const patch = disputeResolution(status, choiceText(footageFound));
+    if (!patch) return { changed: false, failed: false };
+    let changed = false;
+    let failed = false;
+    const outcomeFound = core.controlAfterLabel(modal, outcomeLabel);
+    if (patch.outcome && !choiceMatches(choiceText(outcomeFound), patch.outcome)) {
+      const res = await core.fillLabeledField(modal, outcomeLabel, patch.outcome);
+      if (res && res.ok) changed = true;
+      else failed = true;
+    }
+    if (patch.footageStatus) {
+      const freshFootage = core.controlAfterLabel(modal, footageLabel);
+      if (!choiceMatches(choiceText(freshFootage), patch.footageStatus)) {
+        const res = await core.fillLabeledField(modal, footageLabel, patch.footageStatus);
+        if (res && res.ok) changed = true;
+        else failed = true;
+      }
+    }
+    return { changed, failed };
+  }
+
+  function orderKey(value) {
+    const code = orderCodeFromText(value);
+    if (!code) return "";
+    return code.replace(/^0+/, "") || "0";
+  }
+
+  function claimColumns(table) {
+    const headerCells = [...table.querySelectorAll("thead th, thead td")];
+    const headers = headerCells.map((cell) => normalizeKey(cell.innerText || cell.textContent || ""));
+    return {
+      orderIdx: headers.findIndex((header) => header === "order number" || header.includes("order number")),
+      timeIdx: headers.findIndex((header) => header === "order time" || header === "time"),
+      dateIdx: headers.findIndex((header) => header === "claim date" || header === "date"),
+      locationIdx: headers.findIndex((header) => header === "location" || header === "branch"),
+      outcomeIdx: headers.findIndex((header) => header === "outcome"),
+      footageIdx: headers.findIndex((header) => header === "footage status" || header.includes("footage")),
+    };
+  }
+
+  function findClaimRow(orderNumber) {
+    const table = document.getElementById("10000Table");
+    if (!table) return null;
+    const cols = claimColumns(table);
+    if (cols.orderIdx < 0 || cols.timeIdx < 0) return null;
+    const want = orderKey(orderNumber);
+    const row = [...table.querySelectorAll("tbody tr")].find((tr) => {
+      const cell = tr.children[cols.orderIdx];
+      return cell && orderKey(cell.innerText || "") === want;
+    });
+    return row ? { row, cols } : null;
+  }
+
+  async function searchClaimOrder(orderNumber) {
+    if (findClaimRow(orderNumber)) return true;
+    const page = pageWin();
+    const search = document.getElementById("tableSearch");
+    if (!search || typeof page.loadTableData !== "function") return false;
+    const want = orderKey(orderNumber);
+    search.value = want;
+    page.loadTableData(1, 10000, 10000);
+    const found = await waitUntil(() => findClaimRow(want), 8000, 150);
+    return !!found;
+  }
+
+  async function restoreClaimList() {
+    const page = pageWin();
+    const search = document.getElementById("tableSearch");
+    if (search) search.value = "";
+    if (typeof page.loadTableData === "function") page.loadTableData(1, 10000, 10000);
+  }
+
+  let listEditRunning = false;
+
+  function rowSnapshot(row, cols) {
+    const cell = (idx) => (idx >= 0 && row.children[idx] ? normalizeSpace(row.children[idx].innerText || "") : "");
+    return {
+      time: cols.timeIdx >= 0 ? extractTime(cell(cols.timeIdx)) : "",
+      date: cell(cols.dateIdx),
+      dateKnown: cols.dateIdx >= 0,
+      branch: cell(cols.locationIdx),
+      branchKnown: cols.locationIdx >= 0,
+      outcome: cell(cols.outcomeIdx),
+      outcomeKnown: cols.outcomeIdx >= 0,
+      footage: cell(cols.footageIdx),
+      footageKnown: cols.footageIdx >= 0,
+    };
+  }
+
+  function jobFromInfo(edit, num, info) {
+    return {
+      ...(edit || {}),
+      num,
+      want: (info && info.time) || "",
+      disputeStatus: (info && info.disputeStatus) || "",
+      dateRaw: (info && info.dateRaw) || "",
+      branch: (info && info.branch) || "",
+    };
+  }
+
+  function claimNeedsEdit(info, current) {
+    const timeDiff = !!(info.time && current.time !== info.time);
+    const dateDiff = !!(info.dateRaw && (!current.dateKnown || !sameClaimDate(current.date, info.dateRaw)));
+    const branchDiff = !!(info.branch && (!current.branchKnown || !sameBranch(current.branch, info.branch)));
+    const status = info.disputeStatus;
+    if (status !== "approved" && status !== "rejected") return { timeDiff, statusDiff: false, dateDiff, branchDiff };
+    if (!current.footageKnown || !current.outcomeKnown) return { timeDiff, statusDiff: true, dateDiff, branchDiff };
+    const patch = disputeResolution(status, current.footage);
+    if (!patch) return { timeDiff, statusDiff: false, dateDiff, branchDiff };
+    const statusDiff = (!!patch.outcome && !choiceMatches(current.outcome, patch.outcome))
+      || (!!patch.footageStatus && !choiceMatches(current.footage, patch.footageStatus));
+    return { timeDiff, statusDiff, dateDiff, branchDiff };
+  }
+
+  async function applyCheckedTimes(batch) {
+    const byOrder = new Map();
+    for (const row of (batch && batch.rows) || []) {
+      const key = orderKey(row && row.orderNumber);
+      if (!key) continue;
+      const prev = byOrder.get(key) || { time: "", disputeStatus: "", dateRaw: "", branch: "" };
+      if (row.time) prev.time = row.time;
+      if (row.dateRaw) prev.dateRaw = row.dateRaw;
+      if (row.branch) prev.branch = row.branch;
+      if (row.disputeStatus) prev.disputeStatus = row.disputeStatus;
+      if (prev.time || prev.dateRaw || prev.branch || prev.disputeStatus === "approved" || prev.disputeStatus === "rejected") byOrder.set(key, prev);
+    }
+    let changed = 0;
+    let statusChanged = 0;
+    let dateChanged = 0;
+    let branchChanged = 0;
+    let updatedOrders = 0;
+    let same = 0;
+    let locked = 0;
+
+    const writeTime = (control, want) => {
+      if (!control || !want) return false;
+      if (extractTime(control.value || control.textContent) === want) {
+        same += 1;
+        return true;
+      }
+      if (control.tagName === "INPUT" || control.tagName === "TEXTAREA") {
+        core.setInputValue(control, want, { skipFocus: true });
+        changed += 1;
+        updatedOrders += 1;
+        return true;
+      }
+      if (control.getAttribute && control.getAttribute("contenteditable") === "true") {
+        control.textContent = want;
+        control.dispatchEvent(new Event("input", { bubbles: true }));
+        changed += 1;
+        updatedOrders += 1;
+        return true;
+      }
+      return false;
+    };
+
+    const modal = typeof core.getClaimsModal === "function" ? core.getClaimsModal(true) : null;
+    if (modal) {
+      const orderField = core.controlAfterLabel(modal, (workhorse.labels && workhorse.labels.orderNumber) || "Order Number");
+      const timeField = core.controlAfterLabel(modal, (workhorse.labels && workhorse.labels.orderTime) || "Order Time");
+      const num = orderKey(orderField && orderField.control ? orderField.control.value : "");
+      const info = byOrder.get(num);
+      const statusPending = info && (info.disputeStatus === "approved" || info.disputeStatus === "rejected" || info.dateRaw || info.branch);
+      if (info && info.time && !statusPending && timeField && timeField.control && writeTime(timeField.control, info.time)) {
+        byOrder.delete(num);
+      }
+    }
+
+    const claimsTable = document.getElementById("10000Table");
+    const tables = claimsTable ? [claimsTable] : [...document.querySelectorAll("table")];
+    const pending = [];
+    for (let t = 0; t < tables.length; t++) {
+      const cols = claimColumns(tables[t]);
+      if (cols.orderIdx < 0 || cols.timeIdx < 0) continue;
+      const bodyRows = [...tables[t].querySelectorAll("tbody tr")];
+      for (let r = 0; r < bodyRows.length; r++) {
+        const cells = [...bodyRows[r].children];
+        if (cells.length <= Math.max(cols.orderIdx, cols.timeIdx)) continue;
+        const num = orderKey(cells[cols.orderIdx].innerText || "");
+        const info = byOrder.get(num);
+        if (!info) continue;
+        const need = claimNeedsEdit(info, rowSnapshot(bodyRows[r], cols));
+        if (!need.timeDiff && !need.statusDiff && !need.dateDiff && !need.branchDiff) {
+          same += 1;
+          byOrder.delete(num);
+          continue;
+        }
+        if (need.timeDiff && !need.statusDiff && !need.dateDiff && !need.branchDiff) {
+          const input = cells[cols.timeIdx].querySelector("input, textarea");
+          if (input && writeTime(input, info.time)) {
+            byOrder.delete(num);
+            continue;
+          }
+        }
+        const edit = claimRowEdit(bodyRows[r]);
+        if (edit) pending.push(jobFromInfo(edit, num, info));
+        else locked += 1;
+        byOrder.delete(num);
+      }
+    }
+
+    const notOnPage = [...byOrder.entries()].map(([num, info]) => jobFromInfo({}, num, info));
+    if ((pending.length || notOnPage.length) && isOpSpotPage()) {
+      if (listEditRunning) {
+        return { changed, same, locked, listed: byOrder.size + pending.length + same, message: "The claims list is already being updated." };
+      }
+      listEditRunning = true;
+      try { sessionStorage.setItem("dcf-edit-list", "1"); } catch { /* ignore */ }
+      try {
+        const queue = pending.concat(notOnPage);
+        for (let i = 0; i < queue.length; i++) {
+          const job = queue[i];
+          toast(`Editing list ${i + 1} of ${queue.length}: order ${job.num}`, "info", 2000);
+          if (!job.dataId) {
+            const found = await searchClaimOrder(job.num);
+            const located = found ? findClaimRow(job.num) : null;
+            const edit = located && claimRowEdit(located.row);
+            if (!edit) {
+              locked += 1;
+              continue;
+            }
+            const need = claimNeedsEdit(
+              { time: job.want, disputeStatus: job.disputeStatus, dateRaw: job.dateRaw, branch: job.branch },
+              rowSnapshot(located.row, located.cols)
+            );
+            if (!need.timeDiff && !need.statusDiff && !need.dateDiff && !need.branchDiff) {
+              same += 1;
+              continue;
+            }
+            job.moduleId = edit.moduleId;
+            job.entityId = edit.entityId;
+            job.dataId = edit.dataId;
+          }
+          const result = await editOneClaimTime(job);
+          if (result && result.ok && result.unchanged) {
+            if (result.failed) locked += 1;
+            else same += 1;
+          } else if (result && result.ok) {
+            updatedOrders += 1;
+            if (result.timeChanged) changed += 1;
+            if (result.dateChanged) dateChanged += 1;
+            if (result.branchChanged) branchChanged += 1;
+            if (result.statusChanged) statusChanged += 1;
+          } else locked += 1;
+        }
+        if (notOnPage.length) await restoreClaimList();
+      } finally {
+        listEditRunning = false;
+        try { sessionStorage.removeItem("dcf-edit-list"); } catch { /* ignore */ }
+      }
+    } else {
+      try { sessionStorage.removeItem("dcf-edit-list"); } catch { /* ignore */ }
+    }
+
+    const listed = updatedOrders + same + locked;
+    let message = `Checked ${listed} orders. ${changed} time${changed === 1 ? "" : "s"} corrected, ${dateChanged} date${dateChanged === 1 ? "" : "s"} corrected, ${branchChanged} branch${branchChanged === 1 ? "" : "es"} corrected, ${statusChanged} outcome${statusChanged === 1 ? "" : "s"} updated, ${same} already correct.`;
+    if (locked) message += ` ${locked} were not on the open claims page.`;
+    if (!changed && !dateChanged && !branchChanged && !statusChanged && !same && !locked) message += " The Deliveroo orders are not in the claims list that is open.";
+    return { changed: changed + dateChanged + branchChanged + statusChanged, same, locked, listed, message };
+  }
+
   function extractOrderSubmittedTime() {
     const stage = findVisibleLabel(document.body, "Order submitted");
     if (!stage) return "";
@@ -2868,23 +3553,37 @@
   /* Click-to-map: pick Deliveroo page text → Workhorse field                   */
   /* -------------------------------------------------------------------------- */
 
+  function readStoredObject(key) {
+    let value = null;
+    try {
+      if (typeof GM_getValue === "function") value = GM_getValue(key, null);
+    } catch {
+      value = null;
+    }
+    if (typeof value === "string") {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        value = null;
+      }
+    }
+    return value && typeof value === "object" ? value : null;
+  }
+
   function loadUserFieldMap() {
     if (userFieldMapCache) return userFieldMapCache;
-    let map = {};
-    try {
-      map = (typeof GM_getValue === "function" && GM_getValue(FIELD_MAP_KEY, null)) || {};
-    } catch {
-      map = {};
-    }
-    if (!map || typeof map !== "object") map = {};
-    userFieldMapCache = map;
-    return map;
+    const map = readStoredObject(FIELD_MAP_KEY) || readStoredObject(`${FIELD_MAP_KEY}__json`);
+    userFieldMapCache = map && !Array.isArray(map) ? map : {};
+    return userFieldMapCache;
   }
 
   function saveUserFieldMap(map) {
     userFieldMapCache = map || {};
     try {
-      if (typeof GM_setValue === "function") GM_setValue(FIELD_MAP_KEY, userFieldMapCache);
+      if (typeof GM_setValue === "function") {
+        GM_setValue(FIELD_MAP_KEY, userFieldMapCache);
+        GM_setValue(`${FIELD_MAP_KEY}__json`, JSON.stringify(userFieldMapCache));
+      }
     } catch (err) {
       toast(`Could not save field map: ${err.message || err}`, "error");
     }
@@ -2938,22 +3637,17 @@
 
   function loadUserConditions() {
     if (userConditionsCache) return userConditionsCache;
-    let data = null;
-    try {
-      data = typeof GM_getValue === "function" ? GM_getValue(CONDITIONS_KEY, null) : null;
-    } catch {
-      data = null;
-    }
+    const data = readStoredObject(CONDITIONS_KEY) || readStoredObject(`${CONDITIONS_KEY}__json`);
     const thresholdRaw = data && data.disputeThresholdGbp;
     const thresholdNum = thresholdRaw == null || thresholdRaw === "" ? null : Number(thresholdRaw);
     const fiveRaw = data && data.fiveGuysMaxEur;
     const fiveNum = fiveRaw == null || fiveRaw === "" ? null : Number(fiveRaw);
     userConditionsCache = {
       ...defaultUserConditions(),
-      ...(data && typeof data === "object" ? data : {}),
+      ...(data || {}),
       locationAliases: Array.isArray(data && data.locationAliases) ? data.locationAliases : [],
       customerAliases: Array.isArray(data && data.customerAliases) ? data.customerAliases : [],
-      reasonMap: data && data.reasonMap && typeof data.reasonMap === "object" ? data.reasonMap : {},
+      reasonMap: data && data.reasonMap && typeof data.reasonMap === "object" && !Array.isArray(data.reasonMap) ? data.reasonMap : {},
       disputeThresholdGbp: thresholdNum != null && !Number.isNaN(thresholdNum) ? thresholdNum : null,
       fiveGuysMaxEur: fiveNum != null && !Number.isNaN(fiveNum) ? fiveNum : null,
       videoSubmitted: data && data.videoSubmitted ? normalizeSpace(data.videoSubmitted) : null,
@@ -2981,7 +3675,10 @@
       conditionTweaks: normalizeConditionTweaks(data && data.conditionTweaks),
     };
     try {
-      if (typeof GM_setValue === "function") GM_setValue(CONDITIONS_KEY, userConditionsCache);
+      if (typeof GM_setValue === "function") {
+        GM_setValue(CONDITIONS_KEY, userConditionsCache);
+        GM_setValue(`${CONDITIONS_KEY}__json`, JSON.stringify(userConditionsCache));
+      }
     } catch (err) {
       toast(`Could not save conditions: ${err.message || err}`, "error");
     }
@@ -3092,14 +3789,31 @@
   function matchAliasList(text, aliases) {
     const value = normalizeSpace(text);
     if (!value || !Array.isArray(aliases)) return "";
-    for (const rule of aliases) {
-      if (!rule || !rule.match || !rule.value) continue;
+    const valueKey = normalizeKey(value);
+    if (!valueKey) return "";
+    const rules = aliases.filter((rule) => rule && normalizeSpace(rule.match) && normalizeSpace(rule.value));
+    for (const rule of rules) {
+      if (normalizeKey(rule.match) === valueKey) return normalizeSpace(rule.value);
+    }
+    let best = null;
+    let bestLen = 0;
+    for (const rule of rules) {
+      const matchKey = normalizeKey(rule.match);
+      if (matchKey.length < 4 || valueKey.length < 4) continue;
+      if (!(valueKey.includes(matchKey) || matchKey.includes(valueKey))) continue;
+      if (matchKey.length <= bestLen) continue;
+      best = rule;
+      bestLen = matchKey.length;
+    }
+    if (best) return normalizeSpace(best.value);
+    for (const rule of rules) {
+      const match = String(rule.match);
+      if (!/[\\|^$+?*[\]]/.test(match) && !match.includes(".*")) continue;
       try {
-        if (new RegExp(String(rule.match), "i").test(value)) return normalizeSpace(rule.value);
+        if (new RegExp(match, "i").test(value)) return normalizeSpace(rule.value);
       } catch {
-        if (normalizeKey(value) === normalizeKey(rule.match)) return normalizeSpace(rule.value);
+        /* a place name with parentheses is already compared as text */
       }
-      if (normalizeKey(value) === normalizeKey(rule.match)) return normalizeSpace(rule.value);
     }
     return "";
   }
@@ -3321,12 +4035,14 @@
   }
 
   function ensureMapStyles() {
-    const styleId = `${uiPrefix}-map-style-v6`;
+    const styleId = `${uiPrefix}-map-style-v8`;
     if (document.getElementById(styleId)) return;
     document.getElementById(`${uiPrefix}-map-style`)?.remove();
     document.getElementById(`${uiPrefix}-map-style-v3`)?.remove();
     document.getElementById(`${uiPrefix}-map-style-v4`)?.remove();
     document.getElementById(`${uiPrefix}-map-style-v5`)?.remove();
+    document.getElementById(`${uiPrefix}-map-style-v6`)?.remove();
+    document.getElementById(`${uiPrefix}-map-style-v7`)?.remove();
     const style = document.createElement("style");
     style.id = styleId;
     style.textContent = `
@@ -3337,10 +4053,22 @@
         font: 700 15px/1.2 Segoe UI, system-ui, sans-serif;
       }
       #${mapBtnId}:hover { background: #111827; color: #fff; }
+      #${timesBtnId} {
+        background: #1d4ed8; color: #eff6ff; border: 0; cursor: pointer;
+        border-radius: 999px; padding: 12px 22px;
+        box-shadow: 0 10px 30px rgba(0,0,0,.35);
+        font: 700 15px/1.2 Segoe UI, system-ui, sans-serif;
+      }
+      #${timesBtnId}:hover { background: #111827; color: #fff; }
+      #${timesBtnId}:disabled { opacity: .65; cursor: wait; }
       #${mapPanelId} {
-        position: fixed; top: 64px; left: 18px; z-index: 2147483646;
-        width: 460px; max-height: 75vh; overflow: auto;
-        background: #0f172a; color: #f8fafc; border-radius: 12px;
+        position: fixed !important; inset: auto !important; margin: 0 !important; border: 0 !important;
+        top: 72px !important; left: 18px !important; right: auto !important; bottom: auto !important;
+        transform: none !important;
+        z-index: 2147483647 !important; display: block !important; visibility: visible !important;
+        opacity: 1 !important; pointer-events: auto !important;
+        width: min(480px, calc(100vw - 24px)); max-height: 75vh; overflow: auto;
+        background: #0f172a !important; color: #f8fafc !important; border-radius: 12px;
         padding: 0 14px 14px; box-shadow: 0 12px 40px rgba(0,0,0,.4);
         font: 13px/1.4 Segoe UI, system-ui, sans-serif;
       }
@@ -3755,8 +4483,49 @@
     if (!panel) return;
     const pos = clampMapPanelPosition(mapPanelPos.left, mapPanelPos.top, panel);
     mapPanelPos = pos;
-    panel.style.left = `${pos.left}px`;
-    panel.style.top = `${pos.top}px`;
+    panel.style.setProperty("left", `${pos.left}px`, "important");
+    panel.style.setProperty("top", `${pos.top}px`, "important");
+    panel.style.setProperty("transform", "none", "important");
+  }
+
+  function pinMapPanel(panel) {
+    panel.style.setProperty("position", "fixed", "important");
+    panel.style.setProperty("inset", "auto", "important");
+    panel.style.setProperty("margin", "0", "important");
+    panel.style.setProperty("right", "auto", "important");
+    panel.style.setProperty("bottom", "auto", "important");
+    panel.style.setProperty("border", "0", "important");
+    panel.style.setProperty("width", "min(480px, calc(100vw - 24px))", "important");
+    panel.style.setProperty("max-height", "75vh", "important");
+    panel.style.setProperty("overflow", "auto", "important");
+    panel.style.setProperty("z-index", "2147483647", "important");
+    panel.style.setProperty("pointer-events", "auto", "important");
+    panel.style.setProperty("display", "block", "important");
+    panel.style.setProperty("visibility", "visible", "important");
+    panel.style.setProperty("opacity", "1", "important");
+    panel.style.setProperty("background", "#0f172a", "important");
+    panel.style.setProperty("color", "#f8fafc", "important");
+    if (!panel.dataset.placed) {
+      const width = Math.min(480, Math.max(280, window.innerWidth - 24));
+      mapPanelPos = { top: 72, left: Math.max(8, Math.round((window.innerWidth - width) / 2)) };
+      panel.dataset.placed = "1";
+    }
+    applyMapPanelPosition(panel);
+  }
+
+  function showMapPanel(panel) {
+    if (!panel.isConnected) document.documentElement.appendChild(panel);
+    panel.hidden = false;
+    panel.setAttribute("popover", "manual");
+    pinMapPanel(panel);
+    if (typeof panel.showPopover === "function") {
+      try {
+        if (!panel.matches(":popover-open")) panel.showPopover();
+      } catch (err) {
+        console.warn("[Deliveroo Claims] showPopover failed", err);
+      }
+    }
+    pinMapPanel(panel);
   }
 
   function enableMapPanelDrag(panel) {
@@ -3776,8 +4545,9 @@
         panel
       );
       mapPanelPos = next;
-      panel.style.left = `${next.left}px`;
-      panel.style.top = `${next.top}px`;
+      panel.style.setProperty("left", `${next.left}px`, "important");
+      panel.style.setProperty("top", `${next.top}px`, "important");
+      panel.style.setProperty("transform", "none", "important");
     };
 
     const onUp = () => {
@@ -3837,13 +4607,21 @@
   function renderMapPanel() {
     ensureMapStyles();
     let panel = document.getElementById(mapPanelId);
-    if (!panel) {
+    if (!panel || !panel.isConnected) {
       panel = document.createElement("div");
       panel.id = mapPanelId;
-      document.body.appendChild(panel);
+      panel.setAttribute("popover", "manual");
+      document.documentElement.appendChild(panel);
       enableMapPanelDrag(panel);
+      if (!panel.dataset.keysBound) {
+        panel.dataset.keysBound = "1";
+        ["keydown", "keyup", "keypress", "beforeinput", "paste", "focusin"].forEach((type) => {
+          panel.addEventListener(type, (event) => {
+            if (event.target.closest("input, textarea, select")) event.stopPropagation();
+          });
+        });
+      }
     }
-    applyMapPanelPosition(panel);
 
     const map = loadUserFieldMap();
     const conditions = loadUserConditions();
@@ -3871,7 +4649,7 @@
     `;
 
     const conditionsBody = `
-      <p>When Deliveroo names differ from Workhorse, add aliases. Regex allowed in the “from” box (e.g. <code>victoria.*</code>).</p>
+      <p>When Deliveroo names differ from Workhorse, add aliases. A place name matches as text, including names in parentheses. A pattern such as <code>victoria.*</code> still works.</p>
 
       <div class="dcf-cond-section">
         <h4>Location aliases (Deliveroo → Workhorse)</h4>
@@ -3926,6 +4704,7 @@
       </div>
       ${mapPanelTab === "conditions" ? conditionsBody : fieldsBody}
     `;
+    showMapPanel(panel);
 
     panel.querySelectorAll("[data-map-tab]").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -3984,7 +4763,9 @@
       panel.querySelectorAll("[data-reason-edit]").forEach((el) => {
         const from = el.getAttribute("data-reason-edit");
         const to = normalizeSpace(el.value);
-        if (from && to) reasonMap[from] = to;
+        if (!from) return;
+        if (!to) delete reasonMap[from];
+        else reasonMap[from] = to;
       });
 
       const customerAliases = [...(next.customerAliases || [])];
@@ -3997,6 +4778,17 @@
         const row = { match, value };
         if (existing >= 0) customerAliases[existing] = row;
         else customerAliases.push(row);
+      });
+
+      ["customerAliases", "locationAliases"].forEach((kind) => {
+        const from = normalizeSpace(panel.querySelector(`[data-cond-from="${kind}"]`)?.value);
+        const to = normalizeSpace(panel.querySelector(`[data-cond-to="${kind}"]`)?.value);
+        if (!from || !to) return;
+        const list = kind === "customerAliases" ? customerAliases : [...(next.locationAliases || [])];
+        const idx = list.findIndex((rule) => normalizeKey(rule && rule.match) === normalizeKey(from));
+        if (idx >= 0) list[idx] = { match: from, value: to };
+        else list.push({ match: from, value: to });
+        if (kind === "locationAliases") next.locationAliases = list;
       });
 
       next.disputeThresholdGbp = thresholdNum;
@@ -4071,14 +4863,27 @@
   }
 
   function toggleMapPanel() {
-    ensureMapStyles();
-    const existing = document.getElementById(mapPanelId);
-    if (existing) {
-      stopMapPick();
-      existing.remove();
-      return;
+    try {
+      ensureMapStyles();
+      const existing = document.getElementById(mapPanelId);
+      if (existing && existing.isConnected && existing.childElementCount) {
+        stopMapPick();
+        try {
+          existing.hidePopover();
+        } catch {
+          /* ignore */
+        }
+        existing.remove();
+        return;
+      }
+      if (existing) existing.remove();
+      renderMapPanel();
+    } catch (err) {
+      console.error("[Deliveroo Claims] map panel failed", err);
+      const leftover = document.getElementById(mapPanelId);
+      if (leftover && !leftover.childElementCount) leftover.remove();
+      toast(`Could not open map panel: ${err.message || err}`, "error", 8000);
     }
-    renderMapPanel();
   }
 
   function extractRefundPayload() {
@@ -4161,6 +4966,13 @@
 
     payload = applyUserMapsToExtraction(payload);
 
+    const listStamp = listRowDateTime(payload.orderNumber || orderNumber);
+    if (listStamp && listStamp.time) payload.orderTime = listStamp.time;
+    else {
+      const remembered = rememberedListTime(payload.orderNumber || orderNumber);
+      if (remembered) payload.orderTime = remembered;
+    }
+
     if (!payload.orderNumber) errors.push("Order Number");
     if (!payload.customer) errors.push("Customer");
     if (!payload.location) errors.push("Location");
@@ -4193,11 +5005,12 @@
     const existing = document.getElementById(btnId);
     const sheetExisting = document.getElementById(sheetBtnId);
     const mapExisting = document.getElementById(mapBtnId);
+    const timesExisting = document.getElementById(timesBtnId);
     if (
       existing &&
       existing.onclick &&
       (!isDeliverooHub() ||
-        ((sheetExisting && sheetExisting.onclick) && mapExisting && mapExisting.onclick))
+        ((sheetExisting && sheetExisting.onclick) && mapExisting && mapExisting.onclick && timesExisting && timesExisting.onclick))
     ) {
       return;
     }
@@ -4210,8 +5023,22 @@
           toast(`No stored order. Click ${platform.buttonExtract || "Auto-Fill & Dispute"} on the refund tab first, then click here.`, "error", 7000);
           return;
         }
+        const remembered = rememberedListTime(payload.orderNumber);
+        if (remembered) payload.orderTime = remembered;
         await applyPayloadToClaims(payload, { force: true });
       });
+      try {
+        if (sessionStorage.getItem("dcf-edit-list") === "1") {
+          const batch = readListTimes();
+          setTimeout(() => {
+            applyCheckedTimes(batch).then((result) => {
+              toast(result.message, result.changed ? "success" : "info", 8000);
+            });
+          }, 800);
+        }
+      } catch {
+        /* ignore */
+      }
       return;
     }
 
@@ -4222,6 +5049,7 @@
         injectButton(sheetBtnId, platform.buttonSheetCopy, onCopySheetClick);
       }
       injectButton(mapBtnId, "Map & conditions", toggleMapPanel);
+      injectButton(timesBtnId, "Check all times", onCheckAllTimesClick);
     }
   }
 
@@ -4267,12 +5095,26 @@
         observerQueued = false;
         if (isGoogleSheetsPage()) {
           if (!document.getElementById(sheetBtnId)) remount();
-        } else if (!document.getElementById(btnId) || (isDeliverooHub() && (!document.getElementById(mapBtnId) || (platform.buttonSheetCopy && !document.getElementById(sheetBtnId))))) {
+        } else if (!document.getElementById(btnId) || (isDeliverooHub() && (!document.getElementById(mapBtnId) || !document.getElementById(timesBtnId) || (platform.buttonSheetCopy && !document.getElementById(sheetBtnId))))) {
           remount();
         }
       });
     }).observe(document.documentElement, { childList: true, subtree: true });
     if (typeof GM_addValueChangeListener === "function") {
+      GM_addValueChangeListener(LIST_TIMES_KEY, (_n, _o, value, remote) => {
+        if (!remote || !isOpSpotPage() || !value) return;
+        let batch = value;
+        if (typeof batch === "string") {
+          try {
+            batch = JSON.parse(batch);
+          } catch {
+            return;
+          }
+        }
+        applyCheckedTimes(batch).then((result) => {
+          toast(result.message, result.changed ? "success" : "info", 8000);
+        });
+      });
       GM_addValueChangeListener(platform.storageKey, (_n, _o, value, remote) => {
         if (remote && isOpSpotPage() && value) {
           let payload = value;
@@ -4284,6 +5126,8 @@
             }
           }
           if (!payload || !payload.orderNumber) return;
+          const remembered = rememberedListTime(payload.orderNumber);
+          if (remembered) payload.orderTime = remembered;
           resetFillGuards();
           applyPayloadToClaims(payload, { force: true });
         }
@@ -4298,6 +5142,43 @@
     }
     setupOpSpotSaveHooks();
     mount();
+  }
+
+  async function onCheckAllTimesClick() {
+    const btn = document.getElementById(timesBtnId);
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Checking times…";
+    }
+    try {
+      const rows = collectAllListOrderTimes();
+      if (!rows.length) {
+        toast("No order times on this list. Leave the orders list open and do not open an order.", "error", 7000);
+        return;
+      }
+      const batch = { checkedAt: new Date().toISOString(), rows };
+      saveListTimes(batch);
+      if (isOpSpotPage()) {
+        const result = await applyCheckedTimes(batch);
+        toast(result.message, result.changed ? "success" : "info", 8000);
+        return;
+      }
+      const approved = rows.filter((row) => row.disputeStatus === "approved").length;
+      const rejected = rows.filter((row) => row.disputeStatus === "rejected").length;
+      const awaiting = rows.filter((row) => row.disputeStatus === "awaiting").length;
+      toast(
+        `Checked ${rows.length} orders. ${approved} approved, ${rejected} rejected, ${awaiting} awaiting review. Workhorse will correct the time, date, and branch, set Approved to Won, and set Rejected to Lost.`,
+        "success",
+        8000
+      );
+    } catch (err) {
+      toast(`Time check failed: ${err.message || err}`, "error", 8000);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Check all times";
+      }
+    }
   }
 
   async function onExtractClick() {

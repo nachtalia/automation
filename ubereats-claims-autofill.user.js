@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Eats Order → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.4.16
+// @version      2.4.26
 // @description  Read Uber Eats Manager orders/issues and fill OpSpot Claims (preset-driven Workhorse fills).
 // @author       Claims Ops
 // @match        https://merchants.ubereats.com/*
@@ -223,7 +223,7 @@
       buttonFill: "Fill from Uber Eats",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "2.4.16",
+      versionLabel: "2.4.26",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: sharedCustomerAliases,
       locationAliases: [],

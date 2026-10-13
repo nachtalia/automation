@@ -224,7 +224,7 @@
       buttonFill: "Fill from Uber Eats",
       buttonSheetCopy: "",
       buttonSheetPaste: "",
-      versionLabel: "2.4.16",
+      versionLabel: "2.4.26",
       fiveGuysNotDisputedMaxEur: null,
       customerAliases: sharedCustomerAliases,
       locationAliases: [],

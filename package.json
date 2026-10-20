@@ -1,0 +1,9 @@
+{
+  "name": "claims-automation",
+  "private": true,
+  "description": "Deliveroo / Uber Eats / Grubhub → OpSpot claims userscripts",
+  "scripts": {
+    "test": "node --test test/**/*.test.js",
+    "build": "node build-static.js"
+  }
+}

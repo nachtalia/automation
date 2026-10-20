@@ -13,9 +13,19 @@ Each `.user.js` file is **self-contained** (presets + core inlined). Edit shared
 | [`claims-presets.js`](claims-presets.js) | **Edit here** — Workhorse labels/fill order + platform presets |
 | [`claims-core.js`](claims-core.js) | Shared OpSpot fill engine, rules, transfer, UI, sheet helpers |
 | [`build-static.js`](build-static.js) | Inlines presets + core into `.user.js` files |
+| [`deliveroo-list-update.js`](deliveroo-list-update.js) | Pure Check-all-times / Won-Lost decision helpers (unit-tested) |
 | [`deliveroo-claims-autofill.user.js`](deliveroo-claims-autofill.user.js) | Deliveroo userscript |
 | [`ubereats-claims-autofill.user.js`](ubereats-claims-autofill.user.js) | Uber Eats userscript |
 | [`grubhub-claims-autofill.user.js`](grubhub-claims-autofill.user.js) | Grubhub Google Sheet → OpSpot |
+
+### Unit tests (list update / Won-Lost)
+
+```bash
+npm test
+# or: node --test test/**/*.test.js
+```
+
+Covers Approved→Won, Rejected→Lost, branch validate-only (never rewrite Location), duplicate order # matching, and empty-location not blocking outcomes. Keep `deliveroo-list-update.js` in sync with the update path in the Deliveroo userscript.
 
 ```mermaid
 flowchart LR

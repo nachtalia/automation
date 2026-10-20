@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Deliveroo Refund → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.4.26
+// @version      2.4.31
 // @description  Read Deliveroo refunds, map fields/conditions (incl. location aliases) to Workhorse, fill OpSpot, copy Sheets.
 // @author       Claims Ops
 // @match        https://partner-hub.deliveroo.com/*
@@ -2812,11 +2812,50 @@
     return tokens.find((token) => !/^(19|20)\d{2}$/.test(token)) || "";
   }
 
+  function preferDisputeStatus(prev, next) {
+    if (!next) return prev || "";
+    if (!prev) return next;
+    if (prev === next) return prev;
+    // Definitive Deliveroo outcomes always beat awaiting / empty.
+    if ((next === "approved" || next === "rejected") && prev === "awaiting") return next;
+    if ((prev === "approved" || prev === "rejected") && next === "awaiting") return prev;
+    if ((next === "approved" || next === "rejected") && (prev === "approved" || prev === "rejected") && next !== prev) {
+      return next; // prefer the more local/recent scrape
+    }
+    return prev;
+  }
+
   function collectAllListOrderTimes() {
     const byCode = new Map();
+    const upsert = (code, patch, len) => {
+      if (!code) return;
+      const prev = byCode.get(code);
+      if (!prev) {
+        byCode.set(code, {
+          orderNumber: code,
+          time: patch.time || "",
+          dateRaw: patch.dateRaw || "",
+          len: len || 0,
+          disputeStatus: patch.disputeStatus || "",
+          branch: patch.branch || "",
+        });
+        return;
+      }
+      if (patch.time && (!prev.time || (len && len < prev.len))) {
+        prev.time = patch.time;
+        if (patch.dateRaw) prev.dateRaw = patch.dateRaw;
+        if (len && (!prev.len || len < prev.len)) prev.len = len;
+      } else if (patch.dateRaw && !prev.dateRaw) {
+        prev.dateRaw = patch.dateRaw;
+      }
+      prev.disputeStatus = preferDisputeStatus(prev.disputeStatus, patch.disputeStatus);
+      if (patch.branch && !prev.branch) prev.branch = patch.branch;
+    };
+
     const consider = (text) => {
       const flat = normalizeSpace(text);
-      if (flat.length < 12 || flat.length > 420) return;
+      // Allow longer cards; status is read from a tight window around each stamp.
+      if (flat.length < 12 || flat.length > 2500) return;
       const stampRe = /(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\s+at\s+(\d{1,2}:\d{2}(?:\s*[AP]M)?)/gi;
       let stamp;
       while ((stamp = stampRe.exec(flat))) {
@@ -2826,20 +2865,18 @@
         const around = `${flat.slice(Math.max(0, stamp.index - 90), stamp.index)} ${flat.slice(stamp.index + stamp[0].length, stamp.index + stamp[0].length + 40)}`;
         const code = (around.match(/\b\d{3,8}\b/g) || []).find((token) => !dateDigits.has(token) && !/^(19|20)\d{2}$/.test(token));
         if (!code) continue;
-        const prev = byCode.get(code);
-        const status = classifyDisputeStatus(flat);
-        if (!prev || flat.length < prev.len) {
-          byCode.set(code, {
-            orderNumber: code,
+        // Status near this order only — avoid stealing Approved/Rejected from a sibling card.
+        const local = flat.slice(Math.max(0, stamp.index - 120), stamp.index + stamp[0].length + 160);
+        const status = classifyDisputeStatus(local) || classifyDisputeStatus(around);
+        upsert(
+          code,
+          {
             time,
             dateRaw: normalizeSpace(stamp[1]),
-            len: flat.length,
-            disputeStatus: (prev && prev.disputeStatus) || status,
-            branch: (prev && prev.branch) || "",
-          });
-        } else if (status && !prev.disputeStatus) {
-          prev.disputeStatus = status;
-        }
+            disputeStatus: status,
+          },
+          local.length
+        );
       }
     };
 
@@ -2856,27 +2893,23 @@
         if (/\bat\s+\d{1,2}:\d{2}/i.test(lines[i])) consider(lines[i]);
         continue;
       }
-      consider([lines[i], lines[i + 1], lines[i + 2], lines[i + 3]].filter(Boolean).join(" "));
+      // Include extra lines so Approved/Rejected badges below the stamp are captured.
+      consider([lines[i], lines[i + 1], lines[i + 2], lines[i + 3], lines[i + 4], lines[i + 5]].filter(Boolean).join(" "));
     }
-    const statusNodes = document.querySelectorAll("tr, [role='row'], li, article");
+    const statusNodes = document.querySelectorAll("tr, [role='row'], li, article, [data-testid], span, p");
     for (let i = 0; i < statusNodes.length; i++) {
       const el = statusNodes[i];
       if (!visible(el)) continue;
       if (el.closest(`#${uiPrefix}-btn-bar, #${uiPrefix}-preview, #${uiPrefix}-toast, #${mapPanelId}`)) continue;
       const text = el.innerText || "";
-      if (text.length < 8 || text.length > 1500) continue;
+      // Keep nodes small so one status is not applied to the wrong order in a big container.
+      if (text.length < 4 || text.length > 600) continue;
       const status = classifyDisputeStatus(text);
       const branch = branchFromListText(text) || branchFromRowCells(el);
       if (!status && !branch) continue;
       const code = orderCodeFromText(text);
       if (!code) continue;
-      const prev = byCode.get(code);
-      if (prev) {
-        if (status && !prev.disputeStatus) prev.disputeStatus = status;
-        if (branch && !prev.branch) prev.branch = branch;
-      } else {
-        byCode.set(code, { orderNumber: code, time: "", dateRaw: "", len: text.length, disputeStatus: status || "", branch: branch || "" });
-      }
+      upsert(code, { disputeStatus: status, branch }, text.length);
     }
     const pageBranch = pageBranchName();
     for (const row of byCode.values()) {
@@ -2946,17 +2979,24 @@
 
   function sameBranch(current, want) {
     if (!want) return true;
+    // Empty/unreadable Workhorse location: do not block won/lost — we never rewrite Location,
+    // but we must still update Outcome when Deliveroo says approved/rejected.
+    if (!normalizeSpace(current)) return true;
     const left = normalizeKey(resolveLocationName(current));
     const right = normalizeKey(resolveLocationName(want));
-    return !!left && left === right;
+    if (!left || !right) return true;
+    if (left === right) return true;
+    // Soft match: "Canary Wharf" vs "Shake Shack Canary Wharf" / alias differences
+    return left.includes(right) || right.includes(left);
   }
 
   function classifyDisputeStatus(text) {
     const flat = normalizeSpace(text);
     if (!flat) return "";
-    if (/\bawaiting\s+review\b/i.test(flat)) return "awaiting";
-    if (/\brejected\b/i.test(flat) && !/\bawaiting\b/i.test(flat)) return "rejected";
+    // Prefer definitive outcomes first (cards can still mention older "awaiting" text).
+    if (/\brejected\b/i.test(flat)) return "rejected";
     if (/\bapproved\b/i.test(flat) && !/\bnot\s+approved\b/i.test(flat)) return "approved";
+    if (/\bawaiting\s+review\b/i.test(flat)) return "awaiting";
     return "";
   }
 
@@ -2979,6 +3019,7 @@
     return normalizeSpace(control.value || control.textContent || "");
   }
 
+  // List-update decisions are mirrored in deliveroo-list-update.js (npm test).
   function disputeResolution(status, footageText) {
     if (status !== "approved" && status !== "rejected") return null;
     const footage = normalizeKey(footageText);
@@ -3045,6 +3086,33 @@
     return el.classList.contains("in") || el.classList.contains("show") || el.getAttribute("aria-hidden") === "false";
   }
 
+  /**
+   * OpSpot/Bootstrap leaves .modal-backdrop layers after rapid open/save/cancel.
+   * Stacked backdrops paint the claims page solid black while our button (max z-index) stays visible.
+   */
+  function clearModalDebris() {
+    const backdrops = document.querySelectorAll(
+      ".modal-backdrop, .modal-backdrop.fade, .modal-backdrop.in, .modal-backdrop.show, .backdrop, .ew-overlay"
+    );
+    for (let i = 0; i < backdrops.length; i++) {
+      try {
+        backdrops[i].parentNode && backdrops[i].parentNode.removeChild(backdrops[i]);
+      } catch {
+        /* ignore */
+      }
+    }
+    document.body.classList.remove("modal-open");
+    document.documentElement.classList.remove("modal-open");
+    if (document.body.style.overflow === "hidden") document.body.style.overflow = "";
+    if (document.body.style.paddingRight) document.body.style.paddingRight = "";
+    const modal = document.getElementById("modal");
+    if (modal && !modalIsOpen()) {
+      modal.classList.remove("in", "show");
+      modal.style.display = "none";
+      modal.setAttribute("aria-hidden", "true");
+    }
+  }
+
   function findModalButton(pattern) {
     const modal = document.getElementById("modal") || document.getElementById("modalWrapper");
     if (!modal) return null;
@@ -3064,16 +3132,21 @@
   }
 
   async function closeClaimEditor() {
-    if (!modalIsOpen()) return;
+    if (!modalIsOpen()) {
+      clearModalDebris();
+      return;
+    }
     const cancel = findModalButton(/^cancel$/i);
     if (cancel) safeClick(cancel);
     await waitUntil(() => !modalIsOpen(), 4000, 80);
+    clearModalDebris();
   }
 
   async function editOneClaimTime(job) {
     const page = pageWin();
     if (typeof page.loadSysModal !== "function") return false;
     await closeClaimEditor();
+    clearModalDebris();
     page.loadSysModal(job.moduleId, job.entityId, job.dataId, "");
     const modal = await waitUntil(() => {
       const el = document.getElementById("modal");
@@ -3085,16 +3158,32 @@
     const orderLabel = (workhorse.labels && workhorse.labels.orderNumber) || "Order Number";
     const timeLabel = (workhorse.labels && workhorse.labels.orderTime) || "Order Time";
     const orderField = core.controlAfterLabel(modal, orderLabel);
-    const formNum = orderCodeFromText(orderField && orderField.control ? orderField.control.value : "");
-    if (formNum && formNum !== job.num) {
+    const formNum = orderKey(orderField && orderField.control ? orderField.control.value : "");
+    if (formNum && formNum !== orderKey(job.num)) {
       await closeClaimEditor();
       return false;
+    }
+    // Validate Deliveroo branch before writing — never change Location. Only skip when both
+    // sides have a clear location and they conflict (duplicate order # on another site).
+    const branchCheck = validateClaimBranchAndTime(modal, job);
+    if (branchCheck.branchMismatch) {
+      await closeClaimEditor();
+      return {
+        ok: true,
+        unchanged: true,
+        skippedMismatch: true,
+        timeChanged: false,
+        statusChanged: false,
+        dateChanged: false,
+        branchChanged: false,
+        failed: false,
+      };
     }
     let timeChanged = false;
     if (job.want) {
       const timeField = core.controlAfterLabel(modal, timeLabel);
       if (!timeField || !timeField.control) {
-        if (job.disputeStatus !== "approved" && job.disputeStatus !== "rejected" && !job.dateRaw && !job.branch) {
+        if (job.disputeStatus !== "approved" && job.disputeStatus !== "rejected" && !job.dateRaw) {
           await closeClaimEditor();
           return null;
         }
@@ -3108,7 +3197,7 @@
         timeChanged = true;
       }
     }
-    const placed = await applyDateAndBranch(modal, job);
+    const placed = await applyClaimDate(modal, job);
     const dispute = await applyDisputeFields(modal, job.disputeStatus);
     if (!timeChanged && !dispute.changed && !placed.changed) {
       await closeClaimEditor();
@@ -3129,6 +3218,7 @@
     }
     safeClick(save);
     await waitUntil(() => !modalIsOpen(), 10000, 100);
+    clearModalDebris();
     if (modalIsOpen()) return null;
     return {
       ok: true,
@@ -3136,14 +3226,30 @@
       timeChanged,
       statusChanged: dispute.changed,
       dateChanged: placed.dateChanged,
-      branchChanged: placed.branchChanged,
+      branchChanged: false,
       failed: dispute.failed || placed.failed,
     };
   }
 
-  async function applyDateAndBranch(modal, job) {
+  function validateClaimBranchAndTime(modal, job) {
+    const timeLabel = (workhorse.labels && workhorse.labels.orderTime) || "Order Time";
+    const timeField = core.controlAfterLabel(modal, timeLabel);
+    const formTime = timeField && timeField.control
+      ? extractTime(timeField.control.value || timeField.control.textContent || "")
+      : "";
+    // Matching Deliveroo time confirms the claim — allow Won/Lost even if location wording differs.
+    if (job.want && formTime && formTime === job.want) return { branchMismatch: false };
+    if (!job.branch) return { branchMismatch: false };
+    const locationLabel = (workhorse.labels && workhorse.labels.location) || "Location";
+    const locationFound = core.controlAfterLabel(modal, locationLabel);
+    const current = choiceText(locationFound);
+    // Placeholder / empty Select2 text is not a real mismatch.
+    if (!current || /select|choose|pick/i.test(current)) return { branchMismatch: false };
+    return { branchMismatch: !sameBranch(current, job.branch) };
+  }
+
+  async function applyClaimDate(modal, job) {
     let dateChanged = false;
-    let branchChanged = false;
     let failed = false;
     if (job.dateRaw) {
       const dateLabel = (workhorse.labels && workhorse.labels.claimDate) || "Claim Date";
@@ -3156,16 +3262,7 @@
         else failed = true;
       }
     }
-    if (job.branch) {
-      const locationLabel = (workhorse.labels && workhorse.labels.location) || "Location";
-      const locationFound = core.controlAfterLabel(modal, locationLabel);
-      if (!sameBranch(choiceText(locationFound), job.branch)) {
-        const res = await core.fillLabeledField(modal, locationLabel, resolveLocationName(job.branch));
-        if (res && res.ok) branchChanged = true;
-        else failed = true;
-      }
-    }
-    return { changed: dateChanged || branchChanged, dateChanged, branchChanged, failed };
+    return { changed: dateChanged, dateChanged, branchChanged: false, failed };
   }
 
   async function applyDisputeFields(modal, status) {
@@ -3177,19 +3274,26 @@
     if (!patch) return { changed: false, failed: false };
     let changed = false;
     let failed = false;
-    const outcomeFound = core.controlAfterLabel(modal, outcomeLabel);
-    if (patch.outcome && !choiceMatches(choiceText(outcomeFound), patch.outcome)) {
-      const res = await core.fillLabeledField(modal, outcomeLabel, patch.outcome);
-      if (res && res.ok) changed = true;
-      else failed = true;
+    const fillChoice = async (label, value) => {
+      if (!value) return false;
+      const found = core.controlAfterLabel(modal, label);
+      if (choiceMatches(choiceText(found), value)) return false;
+      let res = await core.fillLabeledField(modal, label, value);
+      if (res && res.ok) return true;
+      // Retry once after a short wait — Select2 options sometimes load late in OpSpot.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      res = await core.fillLabeledField(modal, label, value);
+      return !!(res && res.ok);
+    };
+    if (patch.outcome) {
+      const ok = await fillChoice(outcomeLabel, patch.outcome);
+      if (ok) changed = true;
+      else if (!choiceMatches(choiceText(core.controlAfterLabel(modal, outcomeLabel)), patch.outcome)) failed = true;
     }
     if (patch.footageStatus) {
-      const freshFootage = core.controlAfterLabel(modal, footageLabel);
-      if (!choiceMatches(choiceText(freshFootage), patch.footageStatus)) {
-        const res = await core.fillLabeledField(modal, footageLabel, patch.footageStatus);
-        if (res && res.ok) changed = true;
-        else failed = true;
-      }
+      const ok = await fillChoice(footageLabel, patch.footageStatus);
+      if (ok) changed = true;
+      else if (!choiceMatches(choiceText(core.controlAfterLabel(modal, footageLabel)), patch.footageStatus)) failed = true;
     }
     return { changed, failed };
   }
@@ -3213,28 +3317,56 @@
     };
   }
 
-  function findClaimRow(orderNumber) {
+  function rowMatchesDeliveroo(info, current) {
+    if (!info) return false;
+    // Same order # + same time → this claim (duplicate order #s across sites usually differ by time).
+    if (info.time && current.time && current.time === info.time) return true;
+    // Without a confirming time, skip clear location conflicts.
+    if (info.branch && current.branchKnown && normalizeSpace(current.branch) && !sameBranch(current.branch, info.branch)) {
+      return false;
+    }
+    return true;
+  }
+
+  function findClaimRow(orderNumber, branch, time) {
     const table = document.getElementById("10000Table");
     if (!table) return null;
     const cols = claimColumns(table);
     if (cols.orderIdx < 0 || cols.timeIdx < 0) return null;
     const want = orderKey(orderNumber);
-    const row = [...table.querySelectorAll("tbody tr")].find((tr) => {
+    const info = { branch: branch || "", time: time || "" };
+    const rows = [...table.querySelectorAll("tbody tr")].filter((tr) => {
       const cell = tr.children[cols.orderIdx];
       return cell && orderKey(cell.innerText || "") === want;
     });
-    return row ? { row, cols } : null;
+    if (!rows.length) return null;
+    // Prefer exact Order Time match first (best key for duplicate order numbers).
+    if (time) {
+      const timeMatches = rows.filter((tr) => rowSnapshot(tr, cols).time === time);
+      if (timeMatches.length === 1) return { row: timeMatches[0], cols };
+      if (timeMatches.length > 1) {
+        const branchOk = timeMatches.filter((tr) => {
+          const snap = rowSnapshot(tr, cols);
+          return !info.branch || !snap.branchKnown || !normalizeSpace(snap.branch) || sameBranch(snap.branch, info.branch);
+        });
+        return { row: (branchOk[0] || timeMatches[0]), cols };
+      }
+    }
+    const branchOk = rows.filter((tr) => rowMatchesDeliveroo(info, rowSnapshot(tr, cols)));
+    if (branch && !branchOk.length) return null;
+    const pool = branchOk.length ? branchOk : rows;
+    return { row: pool[0], cols };
   }
 
-  async function searchClaimOrder(orderNumber) {
-    if (findClaimRow(orderNumber)) return true;
+  async function searchClaimOrder(orderNumber, branch, time) {
+    if (findClaimRow(orderNumber, branch, time)) return true;
     const page = pageWin();
     const search = document.getElementById("tableSearch");
     if (!search || typeof page.loadTableData !== "function") return false;
     const want = orderKey(orderNumber);
     search.value = want;
     page.loadTableData(1, 10000, 10000);
-    const found = await waitUntil(() => findClaimRow(want), 8000, 150);
+    const found = await waitUntil(() => findClaimRow(want, branch, time), 8000, 150);
     return !!found;
   }
 
@@ -3276,36 +3408,78 @@
   function claimNeedsEdit(info, current) {
     const timeDiff = !!(info.time && current.time !== info.time);
     const dateDiff = !!(info.dateRaw && (!current.dateKnown || !sameClaimDate(current.date, info.dateRaw)));
-    const branchDiff = !!(info.branch && (!current.branchKnown || !sameBranch(current.branch, info.branch)));
+    // Branch is validated for matching only — never a reason to rewrite Location in Workhorse.
     const status = info.disputeStatus;
-    if (status !== "approved" && status !== "rejected") return { timeDiff, statusDiff: false, dateDiff, branchDiff };
-    if (!current.footageKnown || !current.outcomeKnown) return { timeDiff, statusDiff: true, dateDiff, branchDiff };
+    if (status !== "approved" && status !== "rejected") return { timeDiff, statusDiff: false, dateDiff, branchDiff: false };
+    if (!current.footageKnown || !current.outcomeKnown) return { timeDiff, statusDiff: true, dateDiff, branchDiff: false };
     const patch = disputeResolution(status, current.footage);
-    if (!patch) return { timeDiff, statusDiff: false, dateDiff, branchDiff };
+    if (!patch) return { timeDiff, statusDiff: false, dateDiff, branchDiff: false };
     const statusDiff = (!!patch.outcome && !choiceMatches(current.outcome, patch.outcome))
       || (!!patch.footageStatus && !choiceMatches(current.footage, patch.footageStatus));
-    return { timeDiff, statusDiff, dateDiff, branchDiff };
+    return { timeDiff, statusDiff, dateDiff, branchDiff: false };
+  }
+
+  /**
+   * Workhorse-first: for a visible claim row, find the matching Deliveroo scraped order.
+   * Prefer order # + time, then branch. Returns null if ambiguous duplicates.
+   */
+  function findDeliverooForClaim(deliverooRows, claim) {
+    if (!claim || !deliverooRows || !deliverooRows.length) return null;
+    const key = orderKey(claim.orderNumber || claim.num || "");
+    if (!key) return null;
+    const candidates = deliverooRows.filter((row) => orderKey(row && row.orderNumber) === key);
+    if (!candidates.length) return null;
+    if (claim.time) {
+      const timeMatches = candidates.filter((row) => row.time && row.time === claim.time);
+      if (timeMatches.length === 1) return timeMatches[0];
+      if (timeMatches.length > 1) {
+        const branchOk = timeMatches.filter(
+          (row) => !row.branch || !claim.branch || sameBranch(claim.branch, row.branch)
+        );
+        return branchOk[0] || timeMatches[0];
+      }
+    }
+    if (claim.branch) {
+      const branchOk = candidates.filter(
+        (row) => !row.branch || sameBranch(claim.branch, row.branch)
+      );
+      if (branchOk.length === 1) return branchOk[0];
+      if (branchOk.length > 1) {
+        if (claim.time) {
+          const timeOk = branchOk.find((row) => row.time === claim.time);
+          if (timeOk) return timeOk;
+        }
+        const withOutcome = branchOk.filter(
+          (row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected"
+        );
+        if (withOutcome.length === 1) return withOutcome[0];
+        return branchOk[0];
+      }
+    }
+    if (candidates.length === 1) return candidates[0];
+    const withOutcome = candidates.filter(
+      (row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected"
+    );
+    if (withOutcome.length === 1) return withOutcome[0];
+    return null;
   }
 
   async function applyCheckedTimes(batch) {
-    const byOrder = new Map();
-    for (const row of (batch && batch.rows) || []) {
-      const key = orderKey(row && row.orderNumber);
-      if (!key) continue;
-      const prev = byOrder.get(key) || { time: "", disputeStatus: "", dateRaw: "", branch: "" };
-      if (row.time) prev.time = row.time;
-      if (row.dateRaw) prev.dateRaw = row.dateRaw;
-      if (row.branch) prev.branch = row.branch;
-      if (row.disputeStatus) prev.disputeStatus = row.disputeStatus;
-      if (prev.time || prev.dateRaw || prev.branch || prev.disputeStatus === "approved" || prev.disputeStatus === "rejected") byOrder.set(key, prev);
-    }
+    // Keep full Deliveroo rows (do not collapse by order #) so duplicates can match by time/branch.
+    const deliverooRows = ((batch && batch.rows) || []).filter((row) => {
+      if (!row || !orderKey(row.orderNumber)) return false;
+      return !!(row.time || row.dateRaw || row.branch || row.disputeStatus === "approved" || row.disputeStatus === "rejected");
+    });
+
     let changed = 0;
     let statusChanged = 0;
     let dateChanged = 0;
-    let branchChanged = 0;
+    let skippedMismatch = 0;
     let updatedOrders = 0;
     let same = 0;
     let locked = 0;
+    let matched = 0;
+    let noDeliveroo = 0;
 
     const writeTime = (control, want) => {
       if (!control || !want) return false;
@@ -3329,21 +3503,34 @@
       return false;
     };
 
+    // Workhorse-first: only update claims visible on the open OpSpot list.
+    const claimsTable = document.getElementById("10000Table");
+    const tables = claimsTable ? [claimsTable] : [...document.querySelectorAll("table")];
+    const pending = [];
+    const seenClaimKeys = new Set();
+
     const modal = typeof core.getClaimsModal === "function" ? core.getClaimsModal(true) : null;
     if (modal) {
       const orderField = core.controlAfterLabel(modal, (workhorse.labels && workhorse.labels.orderNumber) || "Order Number");
       const timeField = core.controlAfterLabel(modal, (workhorse.labels && workhorse.labels.orderTime) || "Order Time");
+      const locationLabel = (workhorse.labels && workhorse.labels.location) || "Location";
+      const locationFound = core.controlAfterLabel(modal, locationLabel);
       const num = orderKey(orderField && orderField.control ? orderField.control.value : "");
-      const info = byOrder.get(num);
-      const statusPending = info && (info.disputeStatus === "approved" || info.disputeStatus === "rejected" || info.dateRaw || info.branch);
+      const modalTime = timeField && timeField.control
+        ? extractTime(timeField.control.value || timeField.control.textContent || "")
+        : "";
+      const info = findDeliverooForClaim(deliverooRows, {
+        orderNumber: num,
+        time: modalTime,
+        branch: choiceText(locationFound),
+      });
+      const statusPending = info && (info.disputeStatus === "approved" || info.disputeStatus === "rejected" || info.dateRaw);
       if (info && info.time && !statusPending && timeField && timeField.control && writeTime(timeField.control, info.time)) {
-        byOrder.delete(num);
+        seenClaimKeys.add(`${num}|${modalTime || info.time}`);
+        matched += 1;
       }
     }
 
-    const claimsTable = document.getElementById("10000Table");
-    const tables = claimsTable ? [claimsTable] : [...document.querySelectorAll("table")];
-    const pending = [];
     for (let t = 0; t < tables.length; t++) {
       const cols = claimColumns(tables[t]);
       if (cols.orderIdx < 0 || cols.timeIdx < 0) continue;
@@ -3352,74 +3539,75 @@
         const cells = [...bodyRows[r].children];
         if (cells.length <= Math.max(cols.orderIdx, cols.timeIdx)) continue;
         const num = orderKey(cells[cols.orderIdx].innerText || "");
-        const info = byOrder.get(num);
-        if (!info) continue;
-        const need = claimNeedsEdit(info, rowSnapshot(bodyRows[r], cols));
-        if (!need.timeDiff && !need.statusDiff && !need.dateDiff && !need.branchDiff) {
-          same += 1;
-          byOrder.delete(num);
+        if (!num) continue;
+        const current = rowSnapshot(bodyRows[r], cols);
+        const claimKey = `${num}|${current.time || ""}|${normalizeKey(current.branch || "")}`;
+        if (seenClaimKeys.has(claimKey)) continue;
+
+        const info = findDeliverooForClaim(deliverooRows, {
+          orderNumber: num,
+          time: current.time,
+          branch: current.branch,
+        });
+        if (!info) {
+          noDeliveroo += 1;
           continue;
         }
-        if (need.timeDiff && !need.statusDiff && !need.dateDiff && !need.branchDiff) {
+        matched += 1;
+        seenClaimKeys.add(claimKey);
+
+        if (!rowMatchesDeliveroo(info, current)) {
+          skippedMismatch += 1;
+          continue;
+        }
+        const need = claimNeedsEdit(info, current);
+        if (!need.timeDiff && !need.statusDiff && !need.dateDiff) {
+          same += 1;
+          continue;
+        }
+        if (need.timeDiff && !need.statusDiff && !need.dateDiff) {
           const input = cells[cols.timeIdx].querySelector("input, textarea");
-          if (input && writeTime(input, info.time)) {
-            byOrder.delete(num);
-            continue;
-          }
+          if (input && writeTime(input, info.time)) continue;
         }
         const edit = claimRowEdit(bodyRows[r]);
         if (edit) pending.push(jobFromInfo(edit, num, info));
         else locked += 1;
-        byOrder.delete(num);
       }
     }
 
-    const notOnPage = [...byOrder.entries()].map(([num, info]) => jobFromInfo({}, num, info));
-    if ((pending.length || notOnPage.length) && isOpSpotPage()) {
+    // Only edit claims already on the open page (no table-search crawl — much faster).
+    if (pending.length && isOpSpotPage()) {
       if (listEditRunning) {
-        return { changed, same, locked, listed: byOrder.size + pending.length + same, message: "The claims list is already being updated." };
+        return {
+          changed,
+          same,
+          locked,
+          listed: matched,
+          message: "The claims list is already being updated.",
+        };
       }
       listEditRunning = true;
       try { sessionStorage.setItem("dcf-edit-list", "1"); } catch { /* ignore */ }
       try {
-        const queue = pending.concat(notOnPage);
-        for (let i = 0; i < queue.length; i++) {
-          const job = queue[i];
-          toast(`Editing list ${i + 1} of ${queue.length}: order ${job.num}`, "info", 2000);
-          if (!job.dataId) {
-            const found = await searchClaimOrder(job.num);
-            const located = found ? findClaimRow(job.num) : null;
-            const edit = located && claimRowEdit(located.row);
-            if (!edit) {
-              locked += 1;
-              continue;
-            }
-            const need = claimNeedsEdit(
-              { time: job.want, disputeStatus: job.disputeStatus, dateRaw: job.dateRaw, branch: job.branch },
-              rowSnapshot(located.row, located.cols)
-            );
-            if (!need.timeDiff && !need.statusDiff && !need.dateDiff && !need.branchDiff) {
-              same += 1;
-              continue;
-            }
-            job.moduleId = edit.moduleId;
-            job.entityId = edit.entityId;
-            job.dataId = edit.dataId;
-          }
+        for (let i = 0; i < pending.length; i++) {
+          const job = pending[i];
+          toast(`Updating claim ${i + 1} of ${pending.length}: order ${job.num}`, "info", 2000);
           const result = await editOneClaimTime(job);
+          clearModalDebris();
+          await new Promise((resolve) => setTimeout(resolve, 120));
           if (result && result.ok && result.unchanged) {
-            if (result.failed) locked += 1;
+            if (result.skippedMismatch) skippedMismatch += 1;
+            else if (result.failed) locked += 1;
             else same += 1;
           } else if (result && result.ok) {
             updatedOrders += 1;
             if (result.timeChanged) changed += 1;
             if (result.dateChanged) dateChanged += 1;
-            if (result.branchChanged) branchChanged += 1;
             if (result.statusChanged) statusChanged += 1;
           } else locked += 1;
         }
-        if (notOnPage.length) await restoreClaimList();
       } finally {
+        clearModalDebris();
         listEditRunning = false;
         try { sessionStorage.removeItem("dcf-edit-list"); } catch { /* ignore */ }
       }
@@ -3427,11 +3615,13 @@
       try { sessionStorage.removeItem("dcf-edit-list"); } catch { /* ignore */ }
     }
 
-    const listed = updatedOrders + same + locked;
-    let message = `Checked ${listed} orders. ${changed} time${changed === 1 ? "" : "s"} corrected, ${dateChanged} date${dateChanged === 1 ? "" : "s"} corrected, ${branchChanged} branch${branchChanged === 1 ? "" : "es"} corrected, ${statusChanged} outcome${statusChanged === 1 ? "" : "s"} updated, ${same} already correct.`;
-    if (locked) message += ` ${locked} were not on the open claims page.`;
-    if (!changed && !dateChanged && !branchChanged && !statusChanged && !same && !locked) message += " The Deliveroo orders are not in the claims list that is open.";
-    return { changed: changed + dateChanged + branchChanged + statusChanged, same, locked, listed, message };
+    const listed = matched;
+    let message = `Matched ${matched} Workhorse claim${matched === 1 ? "" : "s"} to Deliveroo. ${changed} time${changed === 1 ? "" : "s"} corrected, ${dateChanged} date${dateChanged === 1 ? "" : "s"} corrected, ${statusChanged} outcome${statusChanged === 1 ? "" : "s"} updated, ${same} already correct.`;
+    if (skippedMismatch) message += ` ${skippedMismatch} skipped (branch/time mismatch).`;
+    if (locked) message += ` ${locked} could not be edited.`;
+    if (noDeliveroo && matched === 0) message += " No open claims matched the Deliveroo check — open the claims list that includes those orders.";
+    else if (noDeliveroo) message += ` ${noDeliveroo} on-screen claim${noDeliveroo === 1 ? "" : "s"} had no Deliveroo match.`;
+    return { changed: changed + dateChanged + statusChanged, same, locked, listed, message };
   }
 
   function extractOrderSubmittedTime() {
@@ -5166,10 +5356,11 @@
       const approved = rows.filter((row) => row.disputeStatus === "approved").length;
       const rejected = rows.filter((row) => row.disputeStatus === "rejected").length;
       const awaiting = rows.filter((row) => row.disputeStatus === "awaiting").length;
+      const unknown = rows.length - approved - rejected - awaiting;
       toast(
-        `Checked ${rows.length} orders. ${approved} approved, ${rejected} rejected, ${awaiting} awaiting review. Workhorse will correct the time, date, and branch, set Approved to Won, and set Rejected to Lost.`,
+        `Checked ${rows.length} Deliveroo orders. ${approved} approved→Won, ${rejected} rejected→Lost, ${awaiting} awaiting${unknown ? `, ${unknown} with no dispute badge read` : ""}. OpSpot will match these to the claims list that is open (faster / more accurate).`,
         "success",
-        8000
+        9000
       );
     } catch (err) {
       toast(`Time check failed: ${err.message || err}`, "error", 8000);

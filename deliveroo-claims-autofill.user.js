@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Deliveroo Refund → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.4.31
+// @version      2.4.38
 // @description  Read Deliveroo refunds, map fields/conditions (incl. location aliases) to Workhorse, fill OpSpot, copy Sheets.
 // @author       Claims Ops
 // @match        https://partner-hub.deliveroo.com/*
@@ -2770,7 +2770,7 @@
   }
 
   function listRowDateTime(orderCode) {
-    const code = (String(orderCode || "").match(/\d{3,}/) || [])[0] || "";
+    const code = (String(orderCode || "").match(/\d{1,8}/) || [])[0] || "";
     if (!code) return null;
     const codeRe = new RegExp(`\\b${code}\\b`);
     const nodes = document.querySelectorAll("tr, [role='row'], li, a, span, div");
@@ -2808,8 +2808,33 @@
   }
 
   function orderCodeFromText(text) {
-    const tokens = String(text || "").match(/\b\d{3,8}\b/g) || [];
-    return tokens.find((token) => !/^(19|20)\d{2}$/.test(token)) || "";
+    const raw = String(text || "");
+    // Digits inside dates must not be treated as order numbers (esp. 1–2 digit days).
+    const dateDigits = new Set();
+    const datePatterns = [
+      /\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b/g,
+      /\b[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}\b/g,
+      /\b\d{4}-\d{2}-\d{2}\b/g,
+      /\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b/g,
+    ];
+    for (const re of datePatterns) {
+      let match;
+      while ((match = re.exec(raw))) {
+        for (const digit of match[0].match(/\d+/g) || []) dateDigits.add(digit);
+      }
+    }
+    const tokens = raw.match(/\b\d{1,8}\b/g) || [];
+    const candidates = tokens.filter(
+      (token) => !/^(19|20)\d{2}$/.test(token) && !dateDigits.has(token)
+    );
+    if (candidates.length) {
+      candidates.sort((a, b) => b.length - a.length);
+      return candidates[0];
+    }
+    // Pure order cell: allow 1–8 digit codes (including 1–2 digit Deliveroo order #s).
+    const only = normalizeSpace(raw);
+    if (/^\d{1,8}$/.test(only) && !/^(19|20)\d{2}$/.test(only)) return only;
+    return "";
   }
 
   function preferDisputeStatus(prev, next) {
@@ -2852,9 +2877,13 @@
       if (patch.branch && !prev.branch) prev.branch = patch.branch;
     };
 
+    // 1) Refund disputes table / row text (Approved|Rejected + Site, often no clock time).
+    collectFromDisputeStatusTable(upsert);
+    collectFromDisputePageLines(upsert);
+
+    // 2) Older list cards that use "31 Oct 2024 at 14:30".
     const consider = (text) => {
       const flat = normalizeSpace(text);
-      // Allow longer cards; status is read from a tight window around each stamp.
       if (flat.length < 12 || flat.length > 2500) return;
       const stampRe = /(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\s+at\s+(\d{1,2}:\d{2}(?:\s*[AP]M)?)/gi;
       let stamp;
@@ -2863,17 +2892,22 @@
         if (!time) continue;
         const dateDigits = new Set((stamp[1].match(/\d+/g) || []));
         const around = `${flat.slice(Math.max(0, stamp.index - 90), stamp.index)} ${flat.slice(stamp.index + stamp[0].length, stamp.index + stamp[0].length + 40)}`;
-        const code = (around.match(/\b\d{3,8}\b/g) || []).find((token) => !dateDigits.has(token) && !/^(19|20)\d{2}$/.test(token));
+        const aroundCodes = (around.match(/\b\d{1,8}\b/g) || []).filter(
+          (token) => !dateDigits.has(token) && !/^(19|20)\d{2}$/.test(token)
+        );
+        aroundCodes.sort((a, b) => b.length - a.length);
+        const code = aroundCodes[0];
         if (!code) continue;
-        // Status near this order only — avoid stealing Approved/Rejected from a sibling card.
         const local = flat.slice(Math.max(0, stamp.index - 120), stamp.index + stamp[0].length + 160);
         const status = classifyDisputeStatus(local) || classifyDisputeStatus(around);
+        const branch = siteFromNearbyText(local) || siteFromNearbyText(around);
         upsert(
           code,
           {
             time,
             dateRaw: normalizeSpace(stamp[1]),
             disputeStatus: status,
+            branch: branch || "",
           },
           local.length
         );
@@ -2883,34 +2917,20 @@
     const nodes = document.querySelectorAll("tr, [role='row'], li, a, article, div");
     for (let i = 0; i < nodes.length; i++) {
       const el = nodes[i];
-      if (!visible(el)) continue;
       if (el.closest(`#${uiPrefix}-btn-bar, #${uiPrefix}-preview, #${uiPrefix}-toast, #${mapPanelId}`)) continue;
-      consider(el.innerText || "");
+      const text = el.innerText || "";
+      if (text.length < 12 || text.length > 2500) continue;
+      consider(text);
     }
     const lines = pageLines();
     for (let i = 0; i < lines.length; i++) {
-      if (!/^\d{3,8}$/.test(lines[i]) || /^(19|20)\d{2}$/.test(lines[i])) {
+      if (!/^\d{1,8}$/.test(lines[i]) || /^(19|20)\d{2}$/.test(lines[i])) {
         if (/\bat\s+\d{1,2}:\d{2}/i.test(lines[i])) consider(lines[i]);
         continue;
       }
-      // Include extra lines so Approved/Rejected badges below the stamp are captured.
       consider([lines[i], lines[i + 1], lines[i + 2], lines[i + 3], lines[i + 4], lines[i + 5]].filter(Boolean).join(" "));
     }
-    const statusNodes = document.querySelectorAll("tr, [role='row'], li, article, [data-testid], span, p");
-    for (let i = 0; i < statusNodes.length; i++) {
-      const el = statusNodes[i];
-      if (!visible(el)) continue;
-      if (el.closest(`#${uiPrefix}-btn-bar, #${uiPrefix}-preview, #${uiPrefix}-toast, #${mapPanelId}`)) continue;
-      const text = el.innerText || "";
-      // Keep nodes small so one status is not applied to the wrong order in a big container.
-      if (text.length < 4 || text.length > 600) continue;
-      const status = classifyDisputeStatus(text);
-      const branch = branchFromListText(text) || branchFromRowCells(el);
-      if (!status && !branch) continue;
-      const code = orderCodeFromText(text);
-      if (!code) continue;
-      upsert(code, { disputeStatus: status, branch }, text.length);
-    }
+
     const pageBranch = pageBranchName();
     for (const row of byCode.values()) {
       if (!row.branch && pageBranch) row.branch = pageBranch;
@@ -2922,6 +2942,176 @@
       disputeStatus: disputeStatus || "",
       branch: branch || "",
     }));
+  }
+
+  /** Pull Site from "Five Guys - Bath" / similar brand-dash-location in a row blob. */
+  function siteFromNearbyText(text) {
+    const flat = normalizeSpace(text);
+    if (!flat) return "";
+    const brandSite = flat.match(
+      /(?:shake\s*shack|jollibee|popeyes|five\s*guys)\s*[–—−-]\s*([A-Za-z0-9][A-Za-z0-9 &'./-]{0,50}?)(?=\s+\d{1,2}\s+[A-Za-z]{3}|\s+\d{4}\b|\s+Approved|\s+Rejected|\s+Awaiting|$)/i
+    );
+    if (brandSite) return resolveLocationName(normalizeSpace(brandSite[1]));
+    return siteLocationFromText(flat) || branchFromListText(flat);
+  }
+
+  /**
+   * Line-oriented scrape for Refund disputes:
+   * order# on its own line, then Site / date / Approved|Rejected nearby.
+   */
+  function collectFromDisputePageLines(upsert) {
+    const lines = pageLines();
+    for (let i = 0; i < lines.length; i++) {
+      const line = normalizeSpace(lines[i]);
+      if (!/^\d{1,8}$/.test(line) || /^(19|20)\d{2}$/.test(line)) continue;
+      const code = line;
+      const nearbyLines = [];
+      for (let j = i; j < Math.min(lines.length, i + 10); j++) {
+        const next = normalizeSpace(lines[j]);
+        if (!next) continue;
+        // Stop at the next order number (another dispute row).
+        if (j > i && /^\d{1,8}$/.test(next) && !/^(19|20)\d{2}$/.test(next)) break;
+        nearbyLines.push(next);
+      }
+      const nearby = nearbyLines.join(" ");
+      const status = classifyDisputeStatus(nearby);
+      const dateMatch = nearby.match(
+        /(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})/
+      );
+      const dateRaw = dateMatch ? normalizeSpace(dateMatch[1]) : "";
+      const time = extractTime(nearby) || "";
+      const branch = siteFromNearbyText(nearby);
+      if (!status && !dateRaw && !branch && !time) continue;
+      upsert(
+        code,
+        {
+          time,
+          dateRaw,
+          disputeStatus: status,
+          branch: branch || "",
+        },
+        nearby.length || 40
+      );
+    }
+  }
+
+  /**
+   * Partner Hub "Refund disputes" table columns:
+   * Order number | Site | Order date (e.g. 31 Oct 2024) | Dispute status | Dispute reason
+   * Dates often have no "at HH:MM", so stamp-based scraping misses Approved/Rejected.
+   */
+  function collectFromDisputeStatusTable(upsert) {
+    const tables = document.querySelectorAll("table, [role='table']");
+    for (let t = 0; t < tables.length; t++) {
+      const table = tables[t];
+      if (table.closest(`#${uiPrefix}-btn-bar, #${uiPrefix}-preview, #${uiPrefix}-toast, #${mapPanelId}`)) continue;
+      const headerCells = [
+        ...table.querySelectorAll("thead th, thead td, [role='columnheader']"),
+      ];
+      if (!headerCells.length && table.rows && table.rows[0]) {
+        headerCells.push(...table.rows[0].querySelectorAll("th, td"));
+      }
+      const headers = headerCells.map((cell) => normalizeKey(cell.innerText || cell.textContent || ""));
+      const orderIdx = headers.findIndex(
+        (h) => h === "order number" || h === "order no" || h.includes("order number")
+      );
+      const statusIdx = headers.findIndex(
+        (h) => h === "dispute status" || h === "status" || (h.includes("dispute") && h.includes("status"))
+      );
+      if (orderIdx < 0 || statusIdx < 0) continue;
+      const siteIdx = headers.findIndex(
+        (h) => h === "site" || h === "branch" || h === "location" || h === "restaurant"
+      );
+      const dateIdx = headers.findIndex(
+        (h) => h === "order date" || h === "date" || (h.includes("order") && h.includes("date"))
+      );
+
+      const bodyRows = table.tBodies && table.tBodies.length
+        ? [...table.tBodies[0].rows]
+        : [...table.querySelectorAll("tbody tr, [role='row']")].filter(
+            (tr) => !tr.querySelector("th, [role='columnheader']")
+          );
+      for (let r = 0; r < bodyRows.length; r++) {
+        const row = bodyRows[r];
+        const cells = [...row.children].filter(
+          (el) => el.tagName === "TD" || el.tagName === "TH" || el.getAttribute("role") === "cell" || el.getAttribute("role") === "gridcell"
+        );
+        if (!cells.length) continue;
+        const orderCell = cells[orderIdx];
+        const statusCell = cells[statusIdx];
+        if (!orderCell || !statusCell) continue;
+        const code = orderCodeFromText(orderCell.innerText || orderCell.textContent || "");
+        if (!code) continue;
+        const status = classifyDisputeStatus(statusCell.innerText || statusCell.textContent || "");
+        const dateRaw = dateIdx >= 0 && cells[dateIdx]
+          ? normalizeSpace(cells[dateIdx].innerText || cells[dateIdx].textContent || "")
+          : "";
+        const time = dateRaw ? extractTime(dateRaw) : "";
+        let branch = "";
+        if (siteIdx >= 0 && cells[siteIdx]) {
+          branch = siteLocationFromText(cells[siteIdx].innerText || cells[siteIdx].textContent || "");
+        }
+        upsert(
+          code,
+          {
+            time: time || "",
+            dateRaw: dateRaw || "",
+            disputeStatus: status,
+            branch: branch || "",
+          },
+          80
+        );
+      }
+    }
+
+    // Fallback: Partner Hub sometimes renders disputes as div/grid rows without a real <table>.
+    collectFromDisputeRowText(upsert);
+  }
+
+  function siteLocationFromText(text) {
+    const value = normalizeSpace(text);
+    if (!value) return "";
+    const cleaned = cleanBranchCell(value);
+    if (cleaned) return cleaned;
+    if (looksLikeBrandLocation(value)) {
+      const location = resolveLocationName(splitBrandLocation(value).location);
+      if (location) return location;
+    }
+    // "Five Guys - Bath" / plain "Bath"
+    const dashed = value.split(/\s*[–—−-]\s*/).map(normalizeSpace).filter(Boolean);
+    if (dashed.length >= 2) return resolveLocationName(dashed.slice(1).join(" - "));
+    return resolveLocationName(value);
+  }
+
+  function collectFromDisputeRowText(upsert) {
+    const rows = document.querySelectorAll("tr, [role='row'], li, article, [data-testid]");
+    for (let i = 0; i < rows.length; i++) {
+      const el = rows[i];
+      if (el.closest(`#${uiPrefix}-btn-bar, #${uiPrefix}-preview, #${uiPrefix}-toast, #${mapPanelId}`)) continue;
+      const text = normalizeSpace(el.innerText || el.textContent || "");
+      if (text.length < 8 || text.length > 800) continue;
+      if (!/\b(approved|rejected|awaiting\s+review)\b/i.test(text)) continue;
+      const code = orderCodeFromText(text);
+      if (!code) continue;
+      const status = classifyDisputeStatus(text);
+      if (!status) continue;
+      const dateMatch = text.match(
+        /(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})/
+      );
+      const dateRaw = dateMatch ? normalizeSpace(dateMatch[1]) : "";
+      const time = extractTime(text) || "";
+      const branch = siteFromNearbyText(text) || branchFromRowCells(el);
+      upsert(
+        code,
+        {
+          time,
+          dateRaw,
+          disputeStatus: status,
+          branch: branch || "",
+        },
+        text.length
+      );
+    }
   }
 
   function branchFromListText(text) {
@@ -2940,7 +3130,7 @@
     if (!value || value.length > 80) return "";
     if (/^(approved|rejected|awaiting review)$/i.test(value)) return "";
     if (parseClaimDate(value).iso && value.length < 32) return "";
-    if (/^[\d£€$]/.test(value) || /^\d{3,8}$/.test(value)) return "";
+    if (/^[\d£€$]/.test(value) || /^\d{1,8}$/.test(value)) return "";
     if (looksLikeBrandLocation(value)) {
       const location = resolveLocationName(splitBrandLocation(value).location);
       return location && !/^(uk|united kingdom|gb)$/i.test(location) ? location : "";
@@ -2987,7 +3177,14 @@
     if (!left || !right) return true;
     if (left === right) return true;
     // Soft match: "Canary Wharf" vs "Shake Shack Canary Wharf" / alias differences
-    return left.includes(right) || right.includes(left);
+    if (left.includes(right) || right.includes(left)) return true;
+    // "Five Guys - Bath" vs "Bath"
+    const leftLoc = normalizeKey(siteLocationFromText(current));
+    const rightLoc = normalizeKey(siteLocationFromText(want));
+    if (leftLoc && rightLoc && (leftLoc === rightLoc || leftLoc.includes(rightLoc) || rightLoc.includes(leftLoc))) {
+      return true;
+    }
+    return false;
   }
 
   function classifyDisputeStatus(text) {
@@ -3024,11 +3221,15 @@
     if (status !== "approved" && status !== "rejected") return null;
     const footage = normalizeKey(footageText);
     const disputedCorrectly = /disputed correctly/.test(footage);
+    const thirdParty = /(3rd|third)\s*party/.test(footage);
     const notAtFault = /video evidence confirms restaurant is not at fault/.test(footage)
       || /video evidence confirms restaurant not at fault/.test(footage);
     if (status === "approved") {
       const update = { outcome: "Won" };
-      if (!disputedCorrectly && !notAtFault) update.footageStatus = "Won without footage";
+      // Keep existing "Disputed by 3rd party" — do not overwrite with Won without footage.
+      if (!disputedCorrectly && !notAtFault && !thirdParty) {
+        update.footageStatus = "Won without footage";
+      }
       return update;
     }
     const update = { outcome: "Lost" };
@@ -3232,13 +3433,7 @@
   }
 
   function validateClaimBranchAndTime(modal, job) {
-    const timeLabel = (workhorse.labels && workhorse.labels.orderTime) || "Order Time";
-    const timeField = core.controlAfterLabel(modal, timeLabel);
-    const formTime = timeField && timeField.control
-      ? extractTime(timeField.control.value || timeField.control.textContent || "")
-      : "";
-    // Matching Deliveroo time confirms the claim — allow Won/Lost even if location wording differs.
-    if (job.want && formTime && formTime === job.want) return { branchMismatch: false };
+    // Location first — never skip location check just because times match.
     if (!job.branch) return { branchMismatch: false };
     const locationLabel = (workhorse.labels && workhorse.labels.location) || "Location";
     const locationFound = core.controlAfterLabel(modal, locationLabel);
@@ -3304,24 +3499,95 @@
     return code.replace(/^0+/, "") || "0";
   }
 
+  function claimHeaderCells(table) {
+    let headerCells = [...table.querySelectorAll("thead th, thead td")];
+    if (!headerCells.length && table.rows && table.rows[0]) {
+      headerCells = [...table.rows[0].querySelectorAll("th, td")];
+    }
+    if (!headerCells.length) {
+      const firstRow = table.querySelector("tr");
+      if (firstRow) headerCells = [...firstRow.querySelectorAll("th, td")];
+    }
+    return headerCells;
+  }
+
   function claimColumns(table) {
-    const headerCells = [...table.querySelectorAll("thead th, thead td")];
+    const headerCells = claimHeaderCells(table);
     const headers = headerCells.map((cell) => normalizeKey(cell.innerText || cell.textContent || ""));
+    const orderIdx = headers.findIndex(
+      (header) =>
+        header === "order number" ||
+        header === "order no" ||
+        header === "ordernumber" ||
+        header.includes("order number") ||
+        header === "order #"
+    );
+    const timeIdx = headers.findIndex(
+      (header) =>
+        header === "order time" ||
+        header === "ordertime" ||
+        header === "time" ||
+        header.includes("order time")
+    );
     return {
-      orderIdx: headers.findIndex((header) => header === "order number" || header.includes("order number")),
-      timeIdx: headers.findIndex((header) => header === "order time" || header === "time"),
-      dateIdx: headers.findIndex((header) => header === "claim date" || header === "date"),
-      locationIdx: headers.findIndex((header) => header === "location" || header === "branch"),
-      outcomeIdx: headers.findIndex((header) => header === "outcome"),
-      footageIdx: headers.findIndex((header) => header === "footage status" || header.includes("footage")),
+      orderIdx,
+      timeIdx,
+      dateIdx: headers.findIndex(
+        (header) => header === "claim date" || header === "claimdate" || header === "date" || header.includes("claim date")
+      ),
+      locationIdx: headers.findIndex(
+        (header) => header === "location" || header === "branch" || header.includes("location")
+      ),
+      outcomeIdx: headers.findIndex((header) => header === "outcome" || header.includes("outcome")),
+      footageIdx: headers.findIndex(
+        (header) => header === "footage status" || header.includes("footage")
+      ),
     };
+  }
+
+  /** Find the OpSpot claims grid even when #10000Table is missing / empty / clone header. */
+  function findWorkhorseClaimsTables() {
+    const preferred = document.getElementById("10000Table");
+    const all = [...document.querySelectorAll("table")].filter((table) => {
+      if (table.closest(`#${uiPrefix}-btn-bar, #${uiPrefix}-preview, #${uiPrefix}-toast, #${mapPanelId}`)) {
+        return false;
+      }
+      return true;
+    });
+    const scored = [];
+    for (const table of all) {
+      const cols = claimColumns(table);
+      if (cols.orderIdx < 0) continue;
+      const bodyRows = [...table.querySelectorAll("tbody tr")].filter((tr) => {
+        const cells = tr.querySelectorAll("td");
+        return cells.length > cols.orderIdx;
+      });
+      // Also count rows when there is no tbody (some OpSpot layouts).
+      const fallbackRows =
+        bodyRows.length > 0
+          ? bodyRows
+          : [...table.querySelectorAll("tr")].filter((tr, idx) => {
+              if (idx === 0 && tr.querySelector("th")) return false;
+              return tr.querySelectorAll("td").length > cols.orderIdx;
+            });
+      if (!fallbackRows.length && table !== preferred) continue;
+      scored.push({
+        table,
+        cols,
+        rows: fallbackRows,
+        prefer: table === preferred || (preferred && preferred.contains(table)),
+      });
+    }
+    scored.sort((a, b) => {
+      if (a.prefer !== b.prefer) return a.prefer ? -1 : 1;
+      return b.rows.length - a.rows.length;
+    });
+    return scored;
   }
 
   function rowMatchesDeliveroo(info, current) {
     if (!info) return false;
-    // Same order # + same time → this claim (duplicate order #s across sites usually differ by time).
-    if (info.time && current.time && current.time === info.time) return true;
-    // Without a confirming time, skip clear location conflicts.
+    // Location first: same order # on another site must not update this claim.
     if (info.branch && current.branchKnown && normalizeSpace(current.branch) && !sameBranch(current.branch, info.branch)) {
       return false;
     }
@@ -3329,33 +3595,36 @@
   }
 
   function findClaimRow(orderNumber, branch, time) {
-    const table = document.getElementById("10000Table");
-    if (!table) return null;
-    const cols = claimColumns(table);
-    if (cols.orderIdx < 0 || cols.timeIdx < 0) return null;
+    const tables = findWorkhorseClaimsTables();
+    if (!tables.length) return null;
     const want = orderKey(orderNumber);
-    const info = { branch: branch || "", time: time || "" };
-    const rows = [...table.querySelectorAll("tbody tr")].filter((tr) => {
-      const cell = tr.children[cols.orderIdx];
-      return cell && orderKey(cell.innerText || "") === want;
-    });
-    if (!rows.length) return null;
-    // Prefer exact Order Time match first (best key for duplicate order numbers).
-    if (time) {
-      const timeMatches = rows.filter((tr) => rowSnapshot(tr, cols).time === time);
-      if (timeMatches.length === 1) return { row: timeMatches[0], cols };
-      if (timeMatches.length > 1) {
-        const branchOk = timeMatches.filter((tr) => {
+    for (let t = 0; t < tables.length; t++) {
+      const { table, cols, rows } = tables[t];
+      if (cols.orderIdx < 0) continue;
+      const matches = rows.filter((tr) => {
+        const cells = tr.querySelectorAll("td");
+        const cell = cells[cols.orderIdx];
+        return cell && orderKey(cell.innerText || cell.textContent || "") === want;
+      });
+      if (!matches.length) continue;
+
+      let pool = matches;
+      if (branch) {
+        const branchOk = matches.filter((tr) => {
           const snap = rowSnapshot(tr, cols);
-          return !info.branch || !snap.branchKnown || !normalizeSpace(snap.branch) || sameBranch(snap.branch, info.branch);
+          return !snap.branchKnown || !normalizeSpace(snap.branch) || sameBranch(snap.branch, branch);
         });
-        return { row: (branchOk[0] || timeMatches[0]), cols };
+        if (!branchOk.length) continue;
+        pool = branchOk;
       }
+
+      if (time) {
+        const timeMatches = pool.filter((tr) => rowSnapshot(tr, cols).time === time);
+        if (timeMatches.length) return { row: timeMatches[0], cols, table };
+      }
+      return { row: pool[0], cols, table };
     }
-    const branchOk = rows.filter((tr) => rowMatchesDeliveroo(info, rowSnapshot(tr, cols)));
-    if (branch && !branchOk.length) return null;
-    const pool = branchOk.length ? branchOk : rows;
-    return { row: pool[0], cols };
+    return null;
   }
 
   async function searchClaimOrder(orderNumber, branch, time) {
@@ -3380,7 +3649,9 @@
   let listEditRunning = false;
 
   function rowSnapshot(row, cols) {
-    const cell = (idx) => (idx >= 0 && row.children[idx] ? normalizeSpace(row.children[idx].innerText || "") : "");
+    const tds = [...row.querySelectorAll("td")];
+    const cell = (idx) =>
+      idx >= 0 && tds[idx] ? normalizeSpace(tds[idx].innerText || tds[idx].textContent || "") : "";
     return {
       time: cols.timeIdx >= 0 ? extractTime(cell(cols.timeIdx)) : "",
       date: cell(cols.dateIdx),
@@ -3420,52 +3691,64 @@
   }
 
   /**
-   * Workhorse-first: for a visible claim row, find the matching Deliveroo scraped order.
-   * Prefer order # + time, then branch. Returns null if ambiguous duplicates.
+   * Workhorse → Deliveroo: find scraped Deliveroo row for one claim.
+   * Prefer location match, then time. If only one Deliveroo row has this order #, use it
+   * (Approved/Rejected still apply even when Site wording differs slightly).
    */
   function findDeliverooForClaim(deliverooRows, claim) {
     if (!claim || !deliverooRows || !deliverooRows.length) return null;
     const key = orderKey(claim.orderNumber || claim.num || "");
     if (!key) return null;
-    const candidates = deliverooRows.filter((row) => orderKey(row && row.orderNumber) === key);
-    if (!candidates.length) return null;
-    if (claim.time) {
-      const timeMatches = candidates.filter((row) => row.time && row.time === claim.time);
-      if (timeMatches.length === 1) return timeMatches[0];
-      if (timeMatches.length > 1) {
-        const branchOk = timeMatches.filter(
-          (row) => !row.branch || !claim.branch || sameBranch(claim.branch, row.branch)
-        );
-        return branchOk[0] || timeMatches[0];
+    let pool = deliverooRows.filter((row) => orderKey(row && row.orderNumber) === key);
+    if (!pool.length) return null;
+
+    const claimBranch = normalizeSpace(claim.branch || "");
+    const deliverooHasBranch = pool.some((row) => normalizeSpace(row.branch));
+    let locationMatched = false;
+
+    if (claimBranch && deliverooHasBranch) {
+      const locOk = pool.filter((row) => !row.branch || sameBranch(claimBranch, row.branch));
+      if (locOk.length) {
+        pool = locOk;
+        locationMatched = true;
+      } else if (pool.length === 1) {
+        // Unique order # — keep it even if Site text differs (e.g. aliases not set).
+        locationMatched = false;
+      } else {
+        // Several sites share this order # and none match Location — do not guess.
+        return null;
       }
-    }
-    if (claim.branch) {
-      const branchOk = candidates.filter(
-        (row) => !row.branch || sameBranch(claim.branch, row.branch)
+    } else if (!claimBranch && deliverooHasBranch && pool.length > 1) {
+      const withOutcome = pool.filter(
+        (row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected"
       );
-      if (branchOk.length === 1) return branchOk[0];
-      if (branchOk.length > 1) {
-        if (claim.time) {
-          const timeOk = branchOk.find((row) => row.time === claim.time);
-          if (timeOk) return timeOk;
-        }
-        const withOutcome = branchOk.filter(
-          (row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected"
-        );
-        if (withOutcome.length === 1) return withOutcome[0];
-        return branchOk[0];
-      }
+      if (withOutcome.length === 1) return withOutcome[0];
+      return null;
     }
-    if (candidates.length === 1) return candidates[0];
-    const withOutcome = candidates.filter(
+
+    if (claim.time) {
+      const timeMatches = pool.filter((row) => row.time && row.time === claim.time);
+      if (timeMatches.length) return timeMatches[0];
+    }
+
+    if (pool.length === 1) return pool[0];
+    const withOutcome = pool.filter(
       (row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected"
     );
     if (withOutcome.length === 1) return withOutcome[0];
-    return null;
+    if (withOutcome.length > 1) {
+      return locationMatched ? withOutcome[0] : withOutcome[0];
+    }
+    return pool[0] || null;
   }
 
+  /**
+   * Workhorse → Deliveroo updating:
+   * 1) Read every claim visible on the OpSpot list
+   * 2) Find that order on the stored Deliveroo check (location first, then order #)
+   * 3) Apply Won/Lost / time / date — never rewrite Location
+   */
   async function applyCheckedTimes(batch) {
-    // Keep full Deliveroo rows (do not collapse by order #) so duplicates can match by time/branch.
     const deliverooRows = ((batch && batch.rows) || []).filter((row) => {
       if (!row || !orderKey(row.orderNumber)) return false;
       return !!(row.time || row.dateRaw || row.branch || row.disputeStatus === "approved" || row.disputeStatus === "rejected");
@@ -3478,8 +3761,11 @@
     let updatedOrders = 0;
     let same = 0;
     let locked = 0;
+    let workhorseClaims = 0;
     let matched = 0;
     let noDeliveroo = 0;
+    const workhorseOrderSamples = [];
+    const missingOrderSamples = [];
 
     const writeTime = (control, want) => {
       if (!control || !want) return false;
@@ -3503,46 +3789,28 @@
       return false;
     };
 
-    // Workhorse-first: only update claims visible on the open OpSpot list.
-    const claimsTable = document.getElementById("10000Table");
-    const tables = claimsTable ? [claimsTable] : [...document.querySelectorAll("table")];
     const pending = [];
     const seenClaimKeys = new Set();
+    const workhorseTables = findWorkhorseClaimsTables();
 
-    const modal = typeof core.getClaimsModal === "function" ? core.getClaimsModal(true) : null;
-    if (modal) {
-      const orderField = core.controlAfterLabel(modal, (workhorse.labels && workhorse.labels.orderNumber) || "Order Number");
-      const timeField = core.controlAfterLabel(modal, (workhorse.labels && workhorse.labels.orderTime) || "Order Time");
-      const locationLabel = (workhorse.labels && workhorse.labels.location) || "Location";
-      const locationFound = core.controlAfterLabel(modal, locationLabel);
-      const num = orderKey(orderField && orderField.control ? orderField.control.value : "");
-      const modalTime = timeField && timeField.control
-        ? extractTime(timeField.control.value || timeField.control.textContent || "")
-        : "";
-      const info = findDeliverooForClaim(deliverooRows, {
-        orderNumber: num,
-        time: modalTime,
-        branch: choiceText(locationFound),
-      });
-      const statusPending = info && (info.disputeStatus === "approved" || info.disputeStatus === "rejected" || info.dateRaw);
-      if (info && info.time && !statusPending && timeField && timeField.control && writeTime(timeField.control, info.time)) {
-        seenClaimKeys.add(`${num}|${modalTime || info.time}`);
-        matched += 1;
-      }
-    }
-
-    for (let t = 0; t < tables.length; t++) {
-      const cols = claimColumns(tables[t]);
-      if (cols.orderIdx < 0 || cols.timeIdx < 0) continue;
-      const bodyRows = [...tables[t].querySelectorAll("tbody tr")];
+    // Only Workhorse → Deliveroo: walk open claims, look each up on Deliveroo.
+    for (let t = 0; t < workhorseTables.length; t++) {
+      const { cols, rows: bodyRows } = workhorseTables[t];
+      if (cols.orderIdx < 0) continue;
       for (let r = 0; r < bodyRows.length; r++) {
-        const cells = [...bodyRows[r].children];
-        if (cells.length <= Math.max(cols.orderIdx, cols.timeIdx)) continue;
-        const num = orderKey(cells[cols.orderIdx].innerText || "");
+        const cells = [...bodyRows[r].querySelectorAll("td")];
+        if (!cells.length) continue;
+        if (cells.length <= cols.orderIdx) continue;
+        const num = orderKey(cells[cols.orderIdx].innerText || cells[cols.orderIdx].textContent || "");
         if (!num) continue;
         const current = rowSnapshot(bodyRows[r], cols);
         const claimKey = `${num}|${current.time || ""}|${normalizeKey(current.branch || "")}`;
         if (seenClaimKeys.has(claimKey)) continue;
+        seenClaimKeys.add(claimKey);
+        workhorseClaims += 1;
+        if (workhorseOrderSamples.length < 8) {
+          workhorseOrderSamples.push(current.branch ? `${num}@${current.branch}` : num);
+        }
 
         const info = findDeliverooForClaim(deliverooRows, {
           orderNumber: num,
@@ -3551,21 +3819,23 @@
         });
         if (!info) {
           noDeliveroo += 1;
+          if (missingOrderSamples.length < 6) {
+            missingOrderSamples.push(current.branch ? `${num}@${current.branch}` : num);
+          }
           continue;
         }
-        matched += 1;
-        seenClaimKeys.add(claimKey);
-
         if (!rowMatchesDeliveroo(info, current)) {
           skippedMismatch += 1;
           continue;
         }
+        matched += 1;
+
         const need = claimNeedsEdit(info, current);
         if (!need.timeDiff && !need.statusDiff && !need.dateDiff) {
           same += 1;
           continue;
         }
-        if (need.timeDiff && !need.statusDiff && !need.dateDiff) {
+        if (need.timeDiff && !need.statusDiff && !need.dateDiff && cols.timeIdx >= 0 && cells[cols.timeIdx]) {
           const input = cells[cols.timeIdx].querySelector("input, textarea");
           if (input && writeTime(input, info.time)) continue;
         }
@@ -3573,16 +3843,17 @@
         if (edit) pending.push(jobFromInfo(edit, num, info));
         else locked += 1;
       }
+      // One good claims grid is enough (avoid double-counting clones).
+      if (workhorseClaims > 0) break;
     }
 
-    // Only edit claims already on the open page (no table-search crawl — much faster).
     if (pending.length && isOpSpotPage()) {
       if (listEditRunning) {
         return {
           changed,
           same,
           locked,
-          listed: matched,
+          listed: workhorseClaims,
           message: "The claims list is already being updated.",
         };
       }
@@ -3591,7 +3862,7 @@
       try {
         for (let i = 0; i < pending.length; i++) {
           const job = pending[i];
-          toast(`Updating claim ${i + 1} of ${pending.length}: order ${job.num}`, "info", 2000);
+          toast(`Workhorse→Deliveroo ${i + 1}/${pending.length}: order ${job.num}${job.branch ? " @ " + job.branch : ""}`, "info", 2000);
           const result = await editOneClaimTime(job);
           clearModalDebris();
           await new Promise((resolve) => setTimeout(resolve, 120));
@@ -3615,13 +3886,36 @@
       try { sessionStorage.removeItem("dcf-edit-list"); } catch { /* ignore */ }
     }
 
-    const listed = matched;
-    let message = `Matched ${matched} Workhorse claim${matched === 1 ? "" : "s"} to Deliveroo. ${changed} time${changed === 1 ? "" : "s"} corrected, ${dateChanged} date${dateChanged === 1 ? "" : "s"} corrected, ${statusChanged} outcome${statusChanged === 1 ? "" : "s"} updated, ${same} already correct.`;
-    if (skippedMismatch) message += ` ${skippedMismatch} skipped (branch/time mismatch).`;
+    const deliverooOutcomes = deliverooRows.filter(
+      (row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected"
+    ).length;
+    const deliverooOrderSamples = deliverooRows
+      .slice(0, 8)
+      .map((row) => (row.branch ? `${row.orderNumber}@${row.branch}` : row.orderNumber));
+    const whKeys = new Set(
+      [...seenClaimKeys].map((k) => String(k).split("|")[0]).filter(Boolean)
+    );
+    const overlap = deliverooRows.filter((row) => whKeys.has(orderKey(row.orderNumber))).length;
+
+    let message = `Checked ${workhorseClaims} Workhorse claim${workhorseClaims === 1 ? "" : "s"} → Deliveroo: ${matched} matched`;
+    message += `, ${statusChanged} outcome${statusChanged === 1 ? "" : "s"} updated, ${changed} time${changed === 1 ? "" : "s"}, ${dateChanged} date${dateChanged === 1 ? "" : "s"}, ${same} already correct.`;
+    if (noDeliveroo) message += ` ${noDeliveroo} not found on Deliveroo check.`;
+    if (skippedMismatch) message += ` ${skippedMismatch} skipped (location mismatch).`;
     if (locked) message += ` ${locked} could not be edited.`;
-    if (noDeliveroo && matched === 0) message += " No open claims matched the Deliveroo check — open the claims list that includes those orders.";
-    else if (noDeliveroo) message += ` ${noDeliveroo} on-screen claim${noDeliveroo === 1 ? "" : "s"} had no Deliveroo match.`;
-    return { changed: changed + dateChanged + statusChanged, same, locked, listed, message };
+    if (!deliverooRows.length) {
+      message = "No Deliveroo check stored. On Refund disputes click Check all times, then back here click Check Workhorse → Deliveroo.";
+    } else if (!workhorseClaims) {
+      message =
+        "Could not read the OpSpot claims grid (Order Number column). Scroll the claims table into view, wait for it to finish loading, then click Check Workhorse → Deliveroo again.";
+    } else if (matched === 0 && noDeliveroo === workhorseClaims) {
+      message = `0 matched — Workhorse orders are not in the last Deliveroo check (overlap ${overlap}/${workhorseClaims}).`;
+      message += ` Workhorse: ${workhorseOrderSamples.join(", ") || "—"}.`;
+      message += ` Deliveroo check (${deliverooRows.length} rows, ${deliverooOutcomes} Approved/Rejected): ${deliverooOrderSamples.join(", ") || "—"}.`;
+      message += " On the Deliveroo Refund disputes list that contains those Workhorse order numbers, click Check all times, then click Check Workhorse → Deliveroo again.";
+    } else if (!deliverooOutcomes && workhorseClaims) {
+      message += ` Deliveroo batch has ${deliverooRows.length} row${deliverooRows.length === 1 ? "" : "s"} but 0 Approved/Rejected — re-run Check all times on Refund disputes.`;
+    }
+    return { changed: changed + dateChanged + statusChanged, same, locked, listed: workhorseClaims, message };
   }
 
   function extractOrderSubmittedTime() {
@@ -4377,7 +4671,7 @@
     setTimeout(() => node.classList.remove("dcf-map-flash"), 1200);
 
     if (/^order\s*#\s*\d+$/i.test(value) || fieldKey === "orderNumber") {
-      if (/order\s*#\s*\d+/i.test(value) || /^\d{3,}$/.test(value)) {
+      if (/order\s*#\s*\d+/i.test(value) || /^\d{1,8}$/.test(value)) {
         return { type: "orderNumber", sampleValue: value };
       }
     }
@@ -4503,7 +4797,7 @@
       if (!raw && key !== "disputeAmount") continue;
 
       if (key === "orderNumber") {
-        const m = String(raw).match(/(\d{3,})/);
+        const m = String(raw).match(/(\d{1,8})/);
         if (m) out.orderNumber = m[1];
       } else if (key === "customer") {
         if (fixedMapping.type === "brandLocationLine") {
@@ -5196,11 +5490,14 @@
     const sheetExisting = document.getElementById(sheetBtnId);
     const mapExisting = document.getElementById(mapBtnId);
     const timesExisting = document.getElementById(timesBtnId);
+    const applyTimesBtnId = `${uiPrefix}-apply-times-btn`;
+    const applyExisting = document.getElementById(applyTimesBtnId);
     if (
       existing &&
       existing.onclick &&
       (!isDeliverooHub() ||
-        ((sheetExisting && sheetExisting.onclick) && mapExisting && mapExisting.onclick && timesExisting && timesExisting.onclick))
+        ((sheetExisting && sheetExisting.onclick) && mapExisting && mapExisting.onclick && timesExisting && timesExisting.onclick)) &&
+      (!isOpSpotPage() || (applyExisting && applyExisting.onclick))
     ) {
       return;
     }
@@ -5216,6 +5513,22 @@
         const remembered = rememberedListTime(payload.orderNumber);
         if (remembered) payload.orderTime = remembered;
         await applyPayloadToClaims(payload, { force: true });
+      });
+      injectButton(applyTimesBtnId, "Check Workhorse → Deliveroo", async () => {
+        const batch = readListTimes();
+        if (!batch.rows || !batch.rows.length) {
+          toast("No Deliveroo check stored. On Refund disputes click Check all times first, then click here.", "error", 8000);
+          return;
+        }
+        const approved = batch.rows.filter((row) => row.disputeStatus === "approved").length;
+        const rejected = batch.rows.filter((row) => row.disputeStatus === "rejected").length;
+        toast(
+          `Checking open Workhorse claims against Deliveroo (${batch.rows.length} stored; ${approved} approved, ${rejected} rejected)…`,
+          "info",
+          4000
+        );
+        const result = await applyCheckedTimes(batch);
+        toast(result.message, result.changed ? "success" : "info", 10000);
       });
       try {
         if (sessionStorage.getItem("dcf-edit-list") === "1") {
@@ -5357,10 +5670,16 @@
       const rejected = rows.filter((row) => row.disputeStatus === "rejected").length;
       const awaiting = rows.filter((row) => row.disputeStatus === "awaiting").length;
       const unknown = rows.length - approved - rejected - awaiting;
+      const withSite = rows.filter((row) => row.branch).length;
+      const sample = rows
+        .filter((row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected")
+        .slice(0, 3)
+        .map((row) => `${row.orderNumber}${row.branch ? "@" + row.branch : ""}:${row.disputeStatus}`)
+        .join(", ");
       toast(
-        `Checked ${rows.length} Deliveroo orders. ${approved} approved→Won, ${rejected} rejected→Lost, ${awaiting} awaiting${unknown ? `, ${unknown} with no dispute badge read` : ""}. OpSpot will match these to the claims list that is open (faster / more accurate).`,
-        "success",
-        9000
+        `Stored ${rows.length} Deliveroo orders (${approved} approved, ${rejected} rejected, ${awaiting} awaiting, ${withSite} with site${unknown ? `, ${unknown} no badge` : ""}).${sample ? ` e.g. ${sample}.` : ""} On OpSpot open those claims, then click Check Workhorse → Deliveroo.`,
+        approved + rejected > 0 ? "success" : "error",
+        10000
       );
     } catch (err) {
       toast(`Time check failed: ${err.message || err}`, "error", 8000);

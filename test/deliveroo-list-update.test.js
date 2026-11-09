@@ -12,7 +12,9 @@ const {
   planClaimUpdate,
   pickClaimRow,
   findDeliverooForClaim,
+  siteLocationFromText,
   orderKey,
+  orderCodeFromText,
   classifyDisputeStatus,
   preferDisputeStatus,
   choiceMatches,
@@ -41,6 +43,15 @@ describe("disputeResolution (Won / Lost)", () => {
       disputeResolution("approved", "Video evidence confirms restaurant is not at fault"),
       { outcome: "Won" }
     );
+  });
+
+  it("maps approved → Won without changing Disputed by 3rd party footage", () => {
+    assert.deepEqual(disputeResolution("approved", "Disputed by 3rd party"), {
+      outcome: "Won",
+    });
+    assert.deepEqual(disputeResolution("approved", "Disputed by 3rd Party"), {
+      outcome: "Won",
+    });
   });
 
   it("maps rejected → Lost", () => {
@@ -103,6 +114,13 @@ describe("sameBranch / validateClaimBranch (validate only, never rewrite)", () =
     assert.equal(sameBranch("Canary Wharf", "Shake Shack Canary Wharf"), true);
   });
 
+  it("matches Five Guys - Bath style site to Workhorse Bath", () => {
+    assert.equal(siteLocationFromText("Five Guys - Bath"), "Bath");
+    assert.equal(sameBranch("Bath", "Five Guys - Bath"), true);
+    assert.equal(sameBranch("Five Guys - Bath", "Bath"), true);
+    assert.equal(sameBranch("Bath", "Five Guys - Crawley"), false);
+  });
+
   it("flags a clear conflicting branch", () => {
     assert.equal(sameBranch("Victoria", "Brighton"), false);
     assert.deepEqual(validateClaimBranch("Victoria", "Brighton"), { branchMismatch: true });
@@ -130,7 +148,7 @@ describe("rowMatchesDeliveroo", () => {
     );
   });
 
-  it("accepts duplicate order on a different branch when time matches", () => {
+  it("rejects different branch even when time matches (location first)", () => {
     assert.equal(
       rowMatchesDeliveroo(info, {
         branch: "Brighton",
@@ -139,7 +157,7 @@ describe("rowMatchesDeliveroo", () => {
         outcomeKnown: true,
         footageKnown: true,
       }),
-      true
+      false
     );
   });
 
@@ -156,14 +174,14 @@ describe("rowMatchesDeliveroo", () => {
     );
   });
 
-  it("allows Won/Lost when form time matches even if location wording differs", () => {
+  it("does not bypass location mismatch just because times match", () => {
     assert.deepEqual(
       validateClaimBranchAndTime("Brighton Marina", "Victoria", "14:30", "14:30"),
-      { branchMismatch: false }
+      { branchMismatch: true }
     );
     assert.deepEqual(
-      validateClaimBranchAndTime("Brighton Marina", "Victoria", "09:00", "14:30"),
-      { branchMismatch: true }
+      validateClaimBranchAndTime("Victoria", "Victoria", "09:00", "14:30"),
+      { branchMismatch: false }
     );
   });
 
@@ -303,13 +321,14 @@ describe("planClaimUpdate", () => {
     assert.deepEqual(plan.patch, { outcome: "Lost" });
   });
 
-  it("does not skip when time matches even if branch wording differs", () => {
+  it("skips when branch conflicts even if time matches (location first)", () => {
     const plan = planClaimUpdate(
       { time: "14:30", branch: "Brighton", disputeStatus: "approved" },
       baseCurrent
     );
-    assert.equal(plan.action, "edit");
-    assert.equal(plan.updateOutcome, true);
+    assert.equal(plan.action, "skip");
+    assert.equal(plan.reason, "branch-mismatch");
+    assert.equal(plan.updateOutcome, false);
     assert.equal(plan.updateBranch, false);
   });
 
@@ -349,7 +368,7 @@ describe("planClaimUpdate", () => {
 });
 
 describe("pickClaimRow", () => {
-  it("among same-time duplicates, prefers matching branch", () => {
+  it("among same-time duplicates, prefers matching branch (location first)", () => {
     const rows = [
       { time: "14:30", branch: "Brighton", branchKnown: true },
       { time: "14:30", branch: "Victoria", branchKnown: true },
@@ -367,15 +386,42 @@ describe("pickClaimRow", () => {
     assert.equal(picked.time, "14:30");
   });
 
-  it("picks the time-matched row even when branch wording differs", () => {
+  it("returns null when only other-branch rows exist (location first)", () => {
     const rows = [{ time: "14:30", branch: "Brighton", branchKnown: true }];
-    const picked = pickClaimRow(rows, { branch: "Victoria", time: "14:30" });
-    assert.equal(picked.time, "14:30");
+    assert.equal(pickClaimRow(rows, { branch: "Victoria", time: "14:30" }), null);
   });
 
   it("returns null when no time match and only other-branch rows exist", () => {
     const rows = [{ time: "09:00", branch: "Brighton", branchKnown: true }];
     assert.equal(pickClaimRow(rows, { branch: "Victoria", time: "14:30" }), null);
+  });
+});
+
+describe("dispute table scrape helpers (status without time)", () => {
+  it("still plans Won when Deliveroo has date + approved but no clock time", () => {
+    const plan = planClaimUpdate(
+      {
+        time: "",
+        dateRaw: "31 Oct 2024",
+        branch: "Bath",
+        disputeStatus: "approved",
+      },
+      {
+        time: "14:30",
+        date: "03-11-2024",
+        dateKnown: true,
+        branch: "Bath",
+        branchKnown: true,
+        outcome: "Pending",
+        outcomeKnown: true,
+        footage: "Disputed by 3rd party",
+        footageKnown: true,
+      }
+    );
+    assert.equal(plan.action, "edit");
+    assert.equal(plan.updateOutcome, true);
+    assert.equal(plan.updateBranch, false);
+    assert.deepEqual(plan.patch, { outcome: "Won" });
   });
 });
 
@@ -386,7 +432,7 @@ describe("findDeliverooForClaim (Workhorse-first)", () => {
     { orderNumber: "5678", time: "11:00", branch: "Victoria", disputeStatus: "awaiting" },
   ];
 
-  it("matches Workhorse claim to Deliveroo by order # + time", () => {
+  it("matches Workhorse claim by location first, then order # + time", () => {
     const hit = findDeliverooForClaim(deliverooRows, {
       orderNumber: "1234",
       time: "14:30",
@@ -396,7 +442,7 @@ describe("findDeliverooForClaim (Workhorse-first)", () => {
     assert.equal(hit.branch, "Victoria");
   });
 
-  it("matches by branch when times differ / missing on claim", () => {
+  it("matches by location when times differ / missing on claim", () => {
     const hit = findDeliverooForClaim(deliverooRows, {
       orderNumber: "1234",
       time: "",
@@ -406,6 +452,31 @@ describe("findDeliverooForClaim (Workhorse-first)", () => {
     assert.equal(hit.disputeStatus, "approved");
   });
 
+  it("matches Five Guys - Bath Deliveroo site to Workhorse Bath", () => {
+    const rows = [
+      { orderNumber: "3136", time: "", branch: "Five Guys - Bath", disputeStatus: "approved" },
+      { orderNumber: "3136", time: "", branch: "Five Guys - Crawley", disputeStatus: "rejected" },
+    ];
+    const hit = findDeliverooForClaim(rows, {
+      orderNumber: "3136",
+      time: "",
+      branch: "Bath",
+    });
+    assert.equal(hit.disputeStatus, "approved");
+    assert.equal(siteLocationFromText(hit.branch), "Bath");
+  });
+
+  it("returns null when order # matches but location conflicts", () => {
+    assert.equal(
+      findDeliverooForClaim(deliverooRows, {
+        orderNumber: "1234",
+        time: "14:30",
+        branch: "Manchester",
+      }),
+      null
+    );
+  });
+
   it("returns null when order is not in the Deliveroo batch", () => {
     assert.equal(
       findDeliverooForClaim(deliverooRows, { orderNumber: "9999", time: "10:00", branch: "Victoria" }),
@@ -413,14 +484,14 @@ describe("findDeliverooForClaim (Workhorse-first)", () => {
     );
   });
 
-  it("returns null for ambiguous duplicate order # without time/branch", () => {
+  it("returns null for ambiguous duplicate order # without location", () => {
     assert.equal(
       findDeliverooForClaim(deliverooRows, { orderNumber: "1234", time: "", branch: "" }),
       null
     );
   });
 
-  it("unique order # matches even without time/branch", () => {
+  it("unique order # can match without location when only one Deliveroo row", () => {
     const hit = findDeliverooForClaim(deliverooRows, {
       orderNumber: "5678",
       time: "",
@@ -434,6 +505,20 @@ describe("orderKey / choiceMatches", () => {
   it("normalizes leading zeros so form and list keys match", () => {
     assert.equal(orderKey("01234"), orderKey("1234"));
     assert.equal(orderKey("Order 00456"), "456");
+  });
+
+  it("keeps 1, 2 and 3 digit order numbers", () => {
+    assert.equal(orderKey("5"), "5");
+    assert.equal(orderKey("42"), "42");
+    assert.equal(orderKey("007"), "7");
+    assert.equal(orderKey("313"), "313");
+  });
+
+  it("does not treat date day/month as the order number in mixed text", () => {
+    assert.equal(orderCodeFromText("2135 Five Guys - Bath 31 Oct 2024 Approved"), "2135");
+    assert.equal(orderCodeFromText("5 Approved 31 Oct 2024"), "5");
+    assert.equal(orderCodeFromText("42"), "42");
+    assert.equal(orderCodeFromText("31 Oct 2024 Approved"), "");
   });
 
   it("matches outcome labels case-insensitively", () => {

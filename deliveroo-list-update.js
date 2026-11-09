@@ -1,6 +1,8 @@
 /**
  * Pure helpers for Deliveroo → Workhorse list updates (Check all times / Won-Lost).
- * Used by unit tests; keep in sync with deliveroo-claims-autofill.user.js update path.
+ * Source of truth for unit tests (`npm test`).
+ * Keep in sync with the update path inside deliveroo-claims-autofill.user.js
+ * (Tampermonkey does not load this file — only the .user.js runs in the browser).
  */
 "use strict";
 
@@ -20,8 +22,34 @@ function identityLocation(name) {
 }
 
 function orderCodeFromText(text) {
-  const tokens = String(text || "").match(/\b\d{3,8}\b/g) || [];
-  return tokens.find((token) => !/^(19|20)\d{2}$/.test(token)) || "";
+  const raw = String(text || "");
+  // Digits inside dates must not be treated as order numbers (esp. 1–2 digit days).
+  const dateDigits = new Set();
+  const datePatterns = [
+    /\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b/g,
+    /\b[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}\b/g,
+    /\b\d{4}-\d{2}-\d{2}\b/g,
+    /\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b/g,
+  ];
+  for (const re of datePatterns) {
+    let match;
+    while ((match = re.exec(raw))) {
+      for (const digit of match[0].match(/\d+/g) || []) dateDigits.add(digit);
+    }
+  }
+  const tokens = raw.match(/\b\d{1,8}\b/g) || [];
+  const candidates = tokens.filter(
+    (token) => !/^(19|20)\d{2}$/.test(token) && !dateDigits.has(token)
+  );
+  if (candidates.length) {
+    // Prefer longer codes when a blob has several numbers.
+    candidates.sort((a, b) => b.length - a.length);
+    return candidates[0];
+  }
+  // Pure order cell: allow 1–8 digit codes (including 1–2 digit Deliveroo order #s).
+  const only = String(raw).trim();
+  if (/^\d{1,8}$/.test(only) && !/^(19|20)\d{2}$/.test(only)) return only;
+  return "";
 }
 
 function orderKey(value) {
@@ -46,7 +74,11 @@ function preferDisputeStatus(prev, next) {
   if (prev === next) return prev;
   if ((next === "approved" || next === "rejected") && prev === "awaiting") return next;
   if ((prev === "approved" || prev === "rejected") && next === "awaiting") return prev;
-  if ((next === "approved" || next === "rejected") && (prev === "approved" || prev === "rejected") && next !== prev) {
+  if (
+    (next === "approved" || next === "rejected") &&
+    (prev === "approved" || prev === "rejected") &&
+    next !== prev
+  ) {
     return next;
   }
   return prev;
@@ -57,18 +89,43 @@ function choiceMatches(current, next) {
 }
 
 /**
+ * Pull Site from "Five Guys - Bath" / similar brand-dash-location text.
+ */
+function siteLocationFromText(text, resolveLocationName = identityLocation) {
+  const value = normalizeSpace(text);
+  if (!value) return "";
+  const brandSite = value.match(
+    /(?:shake\s*shack|jollibee|popeyes|five\s*guys)\s*[–—−-]\s*([A-Za-z0-9][A-Za-z0-9 &'./-]{0,50}?)(?=\s+\d{1,2}\s+[A-Za-z]{3}|\s+\d{4}\b|\s+Approved|\s+Rejected|\s+Awaiting|$)/i
+  );
+  if (brandSite) return resolveLocationName(normalizeSpace(brandSite[1]));
+  const dashed = value.split(/\s*[–—−-]\s*/).map(normalizeSpace).filter(Boolean);
+  if (dashed.length >= 2) {
+    const maybeBrand = dashed[0];
+    if (/^(shake\s*shack|jollibee|popeyes|five\s*guys)$/i.test(maybeBrand)) {
+      return resolveLocationName(dashed.slice(1).join(" - "));
+    }
+    return resolveLocationName(dashed.slice(1).join(" - "));
+  }
+  return resolveLocationName(value);
+}
+
+/**
  * Map Deliveroo approved/rejected → Workhorse Outcome (+ optional Footage Status).
  */
 function disputeResolution(status, footageText) {
   if (status !== "approved" && status !== "rejected") return null;
   const footage = normalizeKey(footageText);
   const disputedCorrectly = /disputed correctly/.test(footage);
+  const thirdParty = /(3rd|third)\s*party/.test(footage);
   const notAtFault =
     /video evidence confirms restaurant is not at fault/.test(footage) ||
     /video evidence confirms restaurant not at fault/.test(footage);
   if (status === "approved") {
     const update = { outcome: "Won" };
-    if (!disputedCorrectly && !notAtFault) update.footageStatus = "Won without footage";
+    // Keep existing "Disputed by 3rd party" — do not overwrite with Won without footage.
+    if (!disputedCorrectly && !notAtFault && !thirdParty) {
+      update.footageStatus = "Won without footage";
+    }
     return update;
   }
   const update = { outcome: "Lost" };
@@ -89,17 +146,27 @@ function sameBranch(current, want, resolveLocationName = identityLocation) {
   const right = normalizeKey(resolveLocationName(want));
   if (!left || !right) return true;
   if (left === right) return true;
-  return left.includes(right) || right.includes(left);
+  // Soft match: "Canary Wharf" vs "Shake Shack Canary Wharf"
+  if (left.includes(right) || right.includes(left)) return true;
+  // "Five Guys - Bath" vs "Bath"
+  const leftLoc = normalizeKey(siteLocationFromText(current, resolveLocationName));
+  const rightLoc = normalizeKey(siteLocationFromText(want, resolveLocationName));
+  if (
+    leftLoc &&
+    rightLoc &&
+    (leftLoc === rightLoc || leftLoc.includes(rightLoc) || rightLoc.includes(leftLoc))
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /**
  * True when this Workhorse list row is the Deliveroo order (same site).
- * Conflicting non-empty locations → false (duplicate order # on another branch).
+ * Location first: conflicting non-empty locations → false.
  */
 function rowMatchesDeliveroo(info, current, resolveLocationName = identityLocation) {
   if (!info) return false;
-  // Same order # + same time → this claim (duplicate order #s across sites usually differ by time).
-  if (info.time && current.time && current.time === info.time) return true;
   if (
     info.branch &&
     current.branchKnown &&
@@ -111,11 +178,6 @@ function rowMatchesDeliveroo(info, current, resolveLocationName = identityLocati
   return true;
 }
 
-function validateClaimBranchAndTime(currentLocation, deliverooBranch, formTime, deliverooTime, resolveLocationName = identityLocation) {
-  if (deliverooTime && formTime && formTime === deliverooTime) return { branchMismatch: false };
-  return validateClaimBranch(currentLocation, deliverooBranch, resolveLocationName);
-}
-
 /**
  * Modal Location check before save. Placeholders / empty → allow; clear conflict → skip.
  */
@@ -124,6 +186,17 @@ function validateClaimBranch(currentLocation, deliverooBranch, resolveLocationNa
   const current = normalizeSpace(currentLocation);
   if (!current || /select|choose|pick/i.test(current)) return { branchMismatch: false };
   return { branchMismatch: !sameBranch(current, deliverooBranch, resolveLocationName) };
+}
+
+function validateClaimBranchAndTime(
+  currentLocation,
+  deliverooBranch,
+  formTime,
+  deliverooTime,
+  resolveLocationName = identityLocation
+) {
+  // Location first — time match does not bypass a location conflict.
+  return validateClaimBranch(currentLocation, deliverooBranch, resolveLocationName);
 }
 
 /**
@@ -180,7 +253,9 @@ function parseClaimDate(raw) {
     nov: "11",
     dec: "12",
   };
-  const named = text.match(/(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})/) || text.match(/([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})/);
+  const named =
+    text.match(/(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})/) ||
+    text.match(/([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})/);
   if (named) {
     let dd;
     let mon;
@@ -244,82 +319,68 @@ function planClaimUpdate(info, current, resolveLocationName = identityLocation) 
 
 /**
  * Pick the best Workhorse row among order-number matches.
- * Prefer exact time, then branch; never rewrite Location.
+ * Location first, then time; never rewrite Location.
  */
 function pickClaimRow(rows, info, resolveLocationName = identityLocation) {
   if (!rows || !rows.length) return null;
-  if (info.time) {
-    const timeMatches = rows.filter((row) => row.time === info.time);
-    if (timeMatches.length === 1) return timeMatches[0];
-    if (timeMatches.length > 1) {
-      const branchOk = timeMatches.filter((row) => {
-        return (
-          !info.branch ||
-          !row.branchKnown ||
-          !normalizeSpace(row.branch) ||
-          sameBranch(row.branch, info.branch, resolveLocationName)
-        );
-      });
-      return branchOk[0] || timeMatches[0];
-    }
+  let pool = rows;
+  if (info.branch) {
+    const branchOk = rows.filter((row) => {
+      return (
+        !row.branchKnown ||
+        !normalizeSpace(row.branch) ||
+        sameBranch(row.branch, info.branch, resolveLocationName)
+      );
+    });
+    if (!branchOk.length) return null;
+    pool = branchOk;
   }
-  const branchOk = rows.filter((row) => rowMatchesDeliveroo(info, row, resolveLocationName));
-  if (info.branch && !branchOk.length) return null;
-  return (branchOk.length ? branchOk : rows)[0];
+  if (info.time) {
+    const timeMatches = pool.filter((row) => row.time === info.time);
+    if (timeMatches.length) return timeMatches[0];
+  }
+  return pool[0];
 }
 
 /**
  * Workhorse-first lookup: given a visible claim row, find the matching Deliveroo order.
- * Prefer order # + time, then branch. Used so we only update claims already on screen.
+ * Validate Location first, then order #, then time. Never match order # alone across sites.
  */
 function findDeliverooForClaim(deliverooRows, claim, resolveLocationName = identityLocation) {
   if (!claim || !deliverooRows || !deliverooRows.length) return null;
   const key = orderKey(claim.orderNumber || claim.num || "");
   if (!key) return null;
-  const candidates = deliverooRows.filter((row) => orderKey(row && row.orderNumber) === key);
-  if (!candidates.length) return null;
+  let pool = deliverooRows.filter((row) => orderKey(row && row.orderNumber) === key);
+  if (!pool.length) return null;
+
+  const claimBranch = normalizeSpace(claim.branch || "");
+  const deliverooHasBranch = pool.some((row) => normalizeSpace(row.branch));
+
+  if (claimBranch && deliverooHasBranch) {
+    const locOk = pool.filter(
+      (row) => !row.branch || sameBranch(claimBranch, row.branch, resolveLocationName)
+    );
+    if (!locOk.length) return null;
+    pool = locOk;
+  } else if (!claimBranch && deliverooHasBranch && pool.length > 1) {
+    return null;
+  }
 
   if (claim.time) {
-    const timeMatches = candidates.filter((row) => row.time && row.time === claim.time);
-    if (timeMatches.length === 1) return timeMatches[0];
-    if (timeMatches.length > 1) {
-      const branchOk = timeMatches.filter(
-        (row) =>
-          !row.branch ||
-          !claim.branch ||
-          sameBranch(claim.branch, row.branch, resolveLocationName)
-      );
-      return branchOk[0] || timeMatches[0];
-    }
+    const timeMatches = pool.filter((row) => row.time && row.time === claim.time);
+    if (timeMatches.length) return timeMatches[0];
   }
 
-  if (claim.branch) {
-    const branchOk = candidates.filter(
-      (row) => !row.branch || sameBranch(claim.branch, row.branch, resolveLocationName)
-    );
-    if (branchOk.length === 1) return branchOk[0];
-    if (branchOk.length > 1) {
-      if (claim.time) {
-        const timeOk = branchOk.find((row) => row.time === claim.time);
-        if (timeOk) return timeOk;
-      }
-      const withOutcome = branchOk.filter(
-        (row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected"
-      );
-      if (withOutcome.length === 1) return withOutcome[0];
-      return branchOk[0];
-    }
-  }
-
-  if (candidates.length === 1) return candidates[0];
-  const withOutcome = candidates.filter(
+  if (pool.length === 1) return pool[0];
+  const withOutcome = pool.filter(
     (row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected"
   );
   if (withOutcome.length === 1) return withOutcome[0];
-  return null; // ambiguous duplicate order # — do not guess
+  if (withOutcome.length > 1) return withOutcome[0];
+  return pool[0] || null;
 }
 
-module.exports = {
+const api = {
   normalizeSpace,
   normalizeKey,
   orderCodeFromText,
@@ -327,6 +388,7 @@ module.exports = {
   classifyDisputeStatus,
   preferDisputeStatus,
   choiceMatches,
+  siteLocationFromText,
   disputeResolution,
   sameBranch,
   rowMatchesDeliveroo,
@@ -339,3 +401,10 @@ module.exports = {
   pickClaimRow,
   findDeliverooForClaim,
 };
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = api;
+}
+if (typeof globalThis !== "undefined") {
+  globalThis.DeliverooListUpdate = api;
+}

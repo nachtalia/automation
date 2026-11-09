@@ -115,6 +115,33 @@ Then re-paste the updated `.user.js` into Tampermonkey and refresh the tabs.
 5. OpSpot Claims → **Add New** → **Fill from Deliveroo**.
 6. Review, then **Save** (or **Save and Add New**).
 
+### Update Won / Lost from Refund disputes (list check)
+
+Use this when Deliveroo already shows **Approved** / **Rejected** and you want OpSpot Outcome set to **Won** / **Lost** without opening each refund.
+
+1. On Deliveroo Partner Hub → **Refund disputes** list (the page with Order number / Site / Dispute status).
+2. Click **Check all times** — stores order #, site, date/time, and Approved|Rejected|Awaiting (order # can be 1–8 digits).
+3. On OpSpot, open the claims grid that includes those same order numbers.
+4. Click **Check Workhorse → Deliveroo**.
+5. Review each modal (Outcome / time / footage), then **Save** yourself.
+
+| Deliveroo status | OpSpot Outcome | Footage note |
+|------------------|----------------|--------------|
+| Approved | Won | Sets “Won without footage” unless already “Disputed correctly”, “Video confirms not at fault”, or **Disputed by 3rd party** (3rd party is kept) |
+| Rejected | Lost | Sets Lost footage rules (incl. not-at-fault special case) |
+| Awaiting review | — | No outcome change |
+
+Matching rules (Workhorse → Deliveroo):
+
+- Compares **Location first**, then order #, then time.
+- Same order # on different branches will not cross-update.
+- Empty Workhorse Location does **not** block Won/Lost.
+- Unique order # can still match if Site wording differs slightly.
+- Location is **validated only** — never rewritten on the claims list.
+- Logic lives in [`deliveroo-list-update.js`](deliveroo-list-update.js) (unit-tested); the live buttons are in [`deliveroo-claims-autofill.user.js`](deliveroo-claims-autofill.user.js). **Do not** paste `deliveroo-list-update.js` into Tampermonkey.
+
+If the toast says **0 matched / not found on Deliveroo check**, re-run **Check all times** on the Refund disputes list that actually contains those Workhorse order numbers, then check again.
+
 ### Copy to Google Sheet
 
 Brand → tab (from presets): Shake Shack, Jollibee UK, Popeyes.
@@ -201,6 +228,9 @@ Sheet: [Grubhub adjustments](https://docs.google.com/spreadsheets/d/1fLAWWmj_ZBI
 | Fill does nothing | Re-paste latest static `.user.js` (v2.2.4+); open Add New first |
 | Platform dropdown wrong | OpSpot options must be exactly **Deliveroo** / **Uber Eats** / **Grubhub** |
 | Grubhub extract fails | Click the **row number** (not one cell), Ctrl+C, then Extract; allow clipboard if prompted |
+| Won/Lost not updating | Reload latest Deliveroo userscript; **Check all times** on the matching Refund disputes list first; then **Check Workhorse → Deliveroo**; toast shows Workhorse vs Deliveroo order samples |
+| “No claims on Workhorse list” | Scroll the OpSpot claims table into view and wait for it to load |
+| Short order # (1–2 digits) missed | Use userscript **v2.4.38+** (1–8 digit order numbers) |
 
 ---
 

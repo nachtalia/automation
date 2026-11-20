@@ -129,7 +129,16 @@
     }
 
     function extractTime(text) {
-      const m = String(text || "").match(/\b([01]?\d|2[0-3]):([0-5]\d)/);
+      const raw = String(text || "");
+      const ampm = raw.match(/\b([01]?\d|2[0-3]):([0-5]\d)\s*([AaPp][Mm])\b/);
+      if (ampm) {
+        let hour = Number.parseInt(ampm[1], 10);
+        const minute = ampm[2];
+        if (/pm/i.test(ampm[3]) && hour < 12) hour += 12;
+        if (/am/i.test(ampm[3]) && hour === 12) hour = 0;
+        return `${String(hour).padStart(2, "0")}:${minute}`;
+      }
+      const m = raw.match(/\b([01]?\d|2[0-3]):([0-5]\d)/);
       return m ? `${m[1].padStart(2, "0")}:${m[2]}` : "";
     }
 

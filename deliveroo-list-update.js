@@ -344,7 +344,9 @@ function pickClaimRow(rows, info, resolveLocationName = identityLocation) {
 
 /**
  * Workhorse-first lookup: given a visible claim row, find the matching Deliveroo order.
- * Validate Location first, then order #, then time. Never match order # alone across sites.
+ * Validate Location first, then order #, then time.
+ * Duplicate order #s across sites never guess. Unique order # with Approved/Rejected may
+ * still match when Site wording differs.
  */
 function findDeliverooForClaim(deliverooRows, claim, resolveLocationName = identityLocation) {
   if (!claim || !deliverooRows || !deliverooRows.length) return null;
@@ -355,14 +357,23 @@ function findDeliverooForClaim(deliverooRows, claim, resolveLocationName = ident
 
   const claimBranch = normalizeSpace(claim.branch || "");
   const deliverooHasBranch = pool.some((row) => normalizeSpace(row.branch));
+  const withOutcome = () =>
+    pool.filter((row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected");
 
   if (claimBranch && deliverooHasBranch) {
     const locOk = pool.filter(
       (row) => !row.branch || sameBranch(claimBranch, row.branch, resolveLocationName)
     );
-    if (!locOk.length) return null;
-    pool = locOk;
+    if (locOk.length) {
+      pool = locOk;
+    } else if (pool.length === 1 && withOutcome().length === 1) {
+      // Unique order # with a definitive outcome — allow slight Site wording differences.
+    } else {
+      return null;
+    }
   } else if (!claimBranch && deliverooHasBranch && pool.length > 1) {
+    const outcomes = withOutcome();
+    if (outcomes.length === 1) return outcomes[0];
     return null;
   }
 
@@ -372,11 +383,9 @@ function findDeliverooForClaim(deliverooRows, claim, resolveLocationName = ident
   }
 
   if (pool.length === 1) return pool[0];
-  const withOutcome = pool.filter(
-    (row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected"
-  );
-  if (withOutcome.length === 1) return withOutcome[0];
-  if (withOutcome.length > 1) return withOutcome[0];
+  const outcomes = withOutcome();
+  if (outcomes.length === 1) return outcomes[0];
+  if (outcomes.length > 1) return outcomes[0];
   return pool[0] || null;
 }
 

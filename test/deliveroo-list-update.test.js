@@ -499,6 +499,33 @@ describe("findDeliverooForClaim (Workhorse-first)", () => {
     });
     assert.equal(hit.orderNumber, "5678");
   });
+
+  it("unique order # with Approved/Rejected matches even when Site text differs", () => {
+    const rows = [
+      { orderNumber: "9450", time: "", branch: "Five Guys - Reading Oracle", disputeStatus: "approved" },
+    ];
+    const hit = findDeliverooForClaim(rows, {
+      orderNumber: "9450",
+      time: "",
+      branch: "Clapham",
+    });
+    assert.equal(hit.disputeStatus, "approved");
+  });
+
+  it("keeps separate Approved/Rejected per site for the same order #", () => {
+    const rows = [
+      { orderNumber: "532", time: "", branch: "Bath", disputeStatus: "approved" },
+      { orderNumber: "532", time: "", branch: "Clapham", disputeStatus: "rejected" },
+    ];
+    assert.equal(
+      findDeliverooForClaim(rows, { orderNumber: "532", time: "", branch: "Clapham" }).disputeStatus,
+      "rejected"
+    );
+    assert.equal(
+      findDeliverooForClaim(rows, { orderNumber: "532", time: "", branch: "Bath" }).disputeStatus,
+      "approved"
+    );
+  });
 });
 
 describe("orderKey / choiceMatches", () => {

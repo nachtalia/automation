@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Deliveroo Refund → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.4.38
+// @version      2.4.41
 // @description  Read Deliveroo refunds, map fields/conditions (incl. location aliases) to Workhorse, fill OpSpot, copy Sheets.
 // @author       Claims Ops
 // @match        https://partner-hub.deliveroo.com/*
@@ -520,7 +520,16 @@
     }
 
     function extractTime(text) {
-      const m = String(text || "").match(/\b([01]?\d|2[0-3]):([0-5]\d)/);
+      const raw = String(text || "");
+      const ampm = raw.match(/\b([01]?\d|2[0-3]):([0-5]\d)\s*([AaPp][Mm])\b/);
+      if (ampm) {
+        let hour = Number.parseInt(ampm[1], 10);
+        const minute = ampm[2];
+        if (/pm/i.test(ampm[3]) && hour < 12) hour += 12;
+        if (/am/i.test(ampm[3]) && hour === 12) hour = 0;
+        return `${String(hour).padStart(2, "0")}:${minute}`;
+      }
+      const m = raw.match(/\b([01]?\d|2[0-3]):([0-5]\d)/);
       return m ? `${m[1].padStart(2, "0")}:${m[2]}` : "";
     }
 
@@ -2850,19 +2859,38 @@
     return prev;
   }
 
+  /** Keep one stored row per order#+site so Approved/Rejected are not collapsed across branches. */
+  function listRowStorageKey(code, branch) {
+    const order = orderKey(code) || String(code || "");
+    const loc = normalizeKey(siteLocationFromText(branch) || branch || "") || "_";
+    return `${order}::${loc}`;
+  }
+
   function collectAllListOrderTimes() {
     const byCode = new Map();
     const upsert = (code, patch, len) => {
       if (!code) return;
-      const prev = byCode.get(code);
+      const branch = (patch && patch.branch) || "";
+      const key = listRowStorageKey(code, branch);
+      // If this scrape now has a site, move any earlier bare (no-site) row into this key.
+      if (branch) {
+        const bareKey = listRowStorageKey(code, "");
+        if (bareKey !== key && byCode.has(bareKey) && !byCode.has(key)) {
+          const bare = byCode.get(bareKey);
+          byCode.delete(bareKey);
+          bare.branch = branch;
+          byCode.set(key, bare);
+        }
+      }
+      const prev = byCode.get(key);
       if (!prev) {
-        byCode.set(code, {
+        byCode.set(key, {
           orderNumber: code,
           time: patch.time || "",
           dateRaw: patch.dateRaw || "",
           len: len || 0,
           disputeStatus: patch.disputeStatus || "",
-          branch: patch.branch || "",
+          branch: branch || "",
         });
         return;
       }
@@ -2874,7 +2902,7 @@
         prev.dateRaw = patch.dateRaw;
       }
       prev.disputeStatus = preferDisputeStatus(prev.disputeStatus, patch.disputeStatus);
-      if (patch.branch && !prev.branch) prev.branch = patch.branch;
+      if (branch && !prev.branch) prev.branch = branch;
     };
 
     // 1) Refund disputes table / row text (Approved|Rejected + Site, often no clock time).
@@ -3270,11 +3298,16 @@
     }
   }
 
-  function rememberedListTime(orderNumber) {
-    const code = orderCodeFromText(orderNumber);
-    if (!code) return "";
-    const row = (readListTimes().rows || []).find((item) => item && item.orderNumber === code);
-    return row && row.time ? row.time : "";
+  function rememberedListTime(orderNumber, branch) {
+    const key = orderKey(orderNumber);
+    if (!key) return "";
+    const rows = (readListTimes().rows || []).filter((item) => item && orderKey(item.orderNumber) === key && item.time);
+    if (!rows.length) return "";
+    if (branch) {
+      const locOk = rows.filter((row) => !row.branch || sameBranch(branch, row.branch));
+      if (locOk.length) return locOk[0].time;
+    }
+    return rows.length === 1 ? rows[0].time : "";
   }
 
   function pageWin() {
@@ -3692,8 +3725,8 @@
 
   /**
    * Workhorse → Deliveroo: find scraped Deliveroo row for one claim.
-   * Prefer location match, then time. If only one Deliveroo row has this order #, use it
-   * (Approved/Rejected still apply even when Site wording differs slightly).
+   * Prefer location match, then time. Unique order # with Approved/Rejected can still match
+   * when Site wording differs; duplicate order #s across sites never guess.
    */
   function findDeliverooForClaim(deliverooRows, claim) {
     if (!claim || !deliverooRows || !deliverooRows.length) return null;
@@ -3705,24 +3738,27 @@
     const claimBranch = normalizeSpace(claim.branch || "");
     const deliverooHasBranch = pool.some((row) => normalizeSpace(row.branch));
     let locationMatched = false;
+    const withOutcome = () =>
+      pool.filter((row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected");
 
     if (claimBranch && deliverooHasBranch) {
       const locOk = pool.filter((row) => !row.branch || sameBranch(claimBranch, row.branch));
       if (locOk.length) {
         pool = locOk;
         locationMatched = true;
-      } else if (pool.length === 1) {
-        // Unique order # — keep it even if Site text differs (e.g. aliases not set).
+      } else if (pool.length === 1 && withOutcome().length === 1) {
+        // Unique order # with a definitive outcome — Site text can differ (aliases).
+        locationMatched = false;
+      } else if (withOutcome().length === 1 && pool.length === withOutcome().length) {
+        pool = withOutcome();
         locationMatched = false;
       } else {
         // Several sites share this order # and none match Location — do not guess.
         return null;
       }
     } else if (!claimBranch && deliverooHasBranch && pool.length > 1) {
-      const withOutcome = pool.filter(
-        (row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected"
-      );
-      if (withOutcome.length === 1) return withOutcome[0];
+      const outcomes = withOutcome();
+      if (outcomes.length === 1) return outcomes[0];
       return null;
     }
 
@@ -3732,13 +3768,9 @@
     }
 
     if (pool.length === 1) return pool[0];
-    const withOutcome = pool.filter(
-      (row) => row.disputeStatus === "approved" || row.disputeStatus === "rejected"
-    );
-    if (withOutcome.length === 1) return withOutcome[0];
-    if (withOutcome.length > 1) {
-      return locationMatched ? withOutcome[0] : withOutcome[0];
-    }
+    const outcomes = withOutcome();
+    if (outcomes.length === 1) return outcomes[0];
+    if (outcomes.length > 1) return locationMatched ? outcomes[0] : outcomes[0];
     return pool[0] || null;
   }
 
@@ -3763,9 +3795,11 @@
     let locked = 0;
     let workhorseClaims = 0;
     let matched = 0;
+    let matchedNoStatus = 0;
     let noDeliveroo = 0;
     const workhorseOrderSamples = [];
     const missingOrderSamples = [];
+    const mismatchSamples = [];
 
     const writeTime = (control, want) => {
       if (!control || !want) return false;
@@ -3824,11 +3858,23 @@
           }
           continue;
         }
+        const hasOutcome =
+          info.disputeStatus === "approved" || info.disputeStatus === "rejected";
+        const sameOrderCount = deliverooRows.filter((row) => orderKey(row.orderNumber) === num).length;
+        // Location mismatch: still allow Won/Lost when this order # is unique on Deliveroo.
         if (!rowMatchesDeliveroo(info, current)) {
-          skippedMismatch += 1;
-          continue;
+          if (!(hasOutcome && sameOrderCount === 1)) {
+            skippedMismatch += 1;
+            if (mismatchSamples.length < 5) {
+              mismatchSamples.push(
+                `${num} WH:${current.branch || "—"} ≠ DR:${info.branch || "—"}`
+              );
+            }
+            continue;
+          }
         }
         matched += 1;
+        if (!hasOutcome) matchedNoStatus += 1;
 
         const need = claimNeedsEdit(info, current);
         if (!need.timeDiff && !need.statusDiff && !need.dateDiff) {
@@ -3899,8 +3945,15 @@
 
     let message = `Checked ${workhorseClaims} Workhorse claim${workhorseClaims === 1 ? "" : "s"} → Deliveroo: ${matched} matched`;
     message += `, ${statusChanged} outcome${statusChanged === 1 ? "" : "s"} updated, ${changed} time${changed === 1 ? "" : "s"}, ${dateChanged} date${dateChanged === 1 ? "" : "s"}, ${same} already correct.`;
+    if (matchedNoStatus) {
+      message += ` ${matchedNoStatus} matched with no Approved/Rejected on Deliveroo (Pending stays).`;
+    }
     if (noDeliveroo) message += ` ${noDeliveroo} not found on Deliveroo check.`;
-    if (skippedMismatch) message += ` ${skippedMismatch} skipped (location mismatch).`;
+    if (skippedMismatch) {
+      message += ` ${skippedMismatch} skipped (location mismatch)`;
+      if (mismatchSamples.length) message += `: ${mismatchSamples.join("; ")}`;
+      message += ".";
+    }
     if (locked) message += ` ${locked} could not be edited.`;
     if (!deliverooRows.length) {
       message = "No Deliveroo check stored. On Refund disputes click Check all times, then back here click Check Workhorse → Deliveroo.";
@@ -3923,17 +3976,41 @@
     if (!stage) return "";
     hits.push({ label: "Order submitted", el: stage, valueEl: null, value: "" });
 
+    const stampRe =
+      /(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\s+(\d{1,2}:\d{2}(?:\s*[AP]M)?)/i;
+
     const prev = stage.previousElementSibling;
-    if (prev && extractTime(prev.innerText)) {
-      const time = extractTime(prev.innerText);
-      hits.push({ label: "Order Time", el: prev, valueEl: prev, value: time });
-      return time;
+    if (prev) {
+      const prevText = normalizeSpace(prev.innerText || prev.textContent || "");
+      const stamped = prevText.match(stampRe);
+      const time = stamped ? extractTime(`${stamped[1]} ${stamped[2]}`) : extractTime(prevText);
+      if (time) {
+        hits.push({ label: "Order Time", el: prev, valueEl: prev, value: time });
+        return time;
+      }
     }
 
-    const row = stage.closest("li, tr, article, section, div") || stage.parentElement;
-    const time = extractTime(row && row.innerText);
-    if (time) hits.push({ label: "Order Time", el: row, valueEl: row, value: time });
-    return time;
+    // Prefer the compact timeline row that contains "Order submitted" (not a huge parent with many times).
+    let node = stage;
+    for (let depth = 0; depth < 6 && node; depth++) {
+      const text = normalizeSpace(node.innerText || node.textContent || "");
+      if (!text || text.length > 160) {
+        node = node.parentElement;
+        continue;
+      }
+      if (!/order\s*submitted/i.test(text)) {
+        node = node.parentElement;
+        continue;
+      }
+      const stamped = text.match(stampRe);
+      const time = stamped ? extractTime(`${stamped[1]} ${stamped[2]}`) : extractTime(text);
+      if (time) {
+        hits.push({ label: "Order Time", el: node, valueEl: node, value: time });
+        return time;
+      }
+      node = node.parentElement;
+    }
+    return "";
   }
 
   function extractRefundedItems() {
@@ -5384,8 +5461,9 @@
     let dateRaw = valuesAfterLabel("Date ordered")[0] || "";
     let claimDate = parseClaimDate(dateRaw);
 
-    let orderTime = extractTime(dateRaw);
-    if (!orderTime) orderTime = extractOrderSubmittedTime();
+    // Prefer Order submitted (24h timeline) over Date ordered (12h). Do not let list memory override later.
+    let orderTime = extractOrderSubmittedTime();
+    if (!orderTime) orderTime = extractTime(dateRaw);
 
     let orderValue = parseMoney(pickBestLabeledValue("Order total", "", true) || valuesAfterLabel("Order total")[0] || "");
     let disputeAmount = parseMoney(pickBestLabeledValue("Partner refund value", "", true) || "");
@@ -5450,11 +5528,14 @@
 
     payload = applyUserMapsToExtraction(payload);
 
-    const listStamp = listRowDateTime(payload.orderNumber || orderNumber);
-    if (listStamp && listStamp.time) payload.orderTime = listStamp.time;
-    else {
-      const remembered = rememberedListTime(payload.orderNumber || orderNumber);
-      if (remembered) payload.orderTime = remembered;
+    // Detail-page time wins. Check-all-times memory only fills a gap (never overwrites 21:05 with a stale 08:01).
+    if (!payload.orderTime) {
+      const listStamp = listRowDateTime(payload.orderNumber || orderNumber);
+      if (listStamp && listStamp.time) payload.orderTime = listStamp.time;
+      else {
+        const remembered = rememberedListTime(payload.orderNumber || orderNumber, payload.location);
+        if (remembered) payload.orderTime = remembered;
+      }
     }
 
     if (!payload.orderNumber) errors.push("Order Number");
@@ -5510,8 +5591,10 @@
           toast(`No stored order. Click ${platform.buttonExtract || "Auto-Fill & Dispute"} on the refund tab first, then click here.`, "error", 7000);
           return;
         }
-        const remembered = rememberedListTime(payload.orderNumber);
-        if (remembered) payload.orderTime = remembered;
+        if (!payload.orderTime) {
+          const remembered = rememberedListTime(payload.orderNumber, payload.location);
+          if (remembered) payload.orderTime = remembered;
+        }
         await applyPayloadToClaims(payload, { force: true });
       });
       injectButton(applyTimesBtnId, "Check Workhorse → Deliveroo", async () => {
@@ -5629,8 +5712,10 @@
             }
           }
           if (!payload || !payload.orderNumber) return;
-          const remembered = rememberedListTime(payload.orderNumber);
-          if (remembered) payload.orderTime = remembered;
+          if (!payload.orderTime) {
+            const remembered = rememberedListTime(payload.orderNumber, payload.location);
+            if (remembered) payload.orderTime = remembered;
+          }
           resetFillGuards();
           applyPayloadToClaims(payload, { force: true });
         }

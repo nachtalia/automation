@@ -108,6 +108,8 @@
       customerAliases: sharedCustomerAliases,
       /** Deliveroo branch text → Workhorse Location dropdown value */
       locationAliases: [
+        // "Kings Cross Pentonville Road" / "King's Cross St Pancras" → King's Cross
+        { match: "king[’']?s\\s*cross", value: "King's Cross" },
         // { match: "victoria station", value: "Victoria" },
         // { match: "brighton marina", value: "Brighton" },
       ],

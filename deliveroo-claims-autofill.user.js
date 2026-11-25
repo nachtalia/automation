@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Deliveroo Refund → OpSpot Claims Auto-Fill
 // @namespace    https://local.claims-ops
-// @version      2.4.41
+// @version      2.4.44
 // @description  Read Deliveroo refunds, map fields/conditions (incl. location aliases) to Workhorse, fill OpSpot, copy Sheets.
 // @author       Claims Ops
 // @match        https://partner-hub.deliveroo.com/*
@@ -140,6 +140,8 @@
       customerAliases: sharedCustomerAliases,
       /** Deliveroo branch text → Workhorse Location dropdown value */
       locationAliases: [
+        // "Kings Cross Pentonville Road" / "King's Cross St Pancras" → King's Cross
+        { match: "king[’']?s\\s*cross", value: "King's Cross" },
         // { match: "victoria station", value: "Victoria" },
         // { match: "brighton marina", value: "Brighton" },
       ],
@@ -2724,6 +2726,36 @@
     };
 
     if (heading) {
+      // Deliveroo shows "Five Guys - Kings Cross Pentonville Road" directly ABOVE "Order #3022".
+      const above = [];
+      let prev = heading.previousElementSibling;
+      while (prev && above.length < 4) {
+        above.push(prev);
+        prev = prev.previousElementSibling;
+      }
+      let up = heading.parentElement;
+      for (let depth = 0; up && depth < 2 && above.length < 8; depth++) {
+        let aunt = up.previousElementSibling;
+        let n = 0;
+        while (aunt && n < 3) {
+          above.push(aunt);
+          aunt = aunt.previousElementSibling;
+          n += 1;
+        }
+        up = up.parentElement;
+      }
+      for (const block of above) {
+        if (isRestaurantSwitcher(block)) continue;
+        const direct = tryLine(block);
+        if (direct) return direct;
+        const kids = [...block.querySelectorAll("h1, h2, h3, h4, p, span, div, strong")].reverse();
+        for (const kid of kids) {
+          if (isRestaurantSwitcher(kid)) continue;
+          const parsed = tryLine(kid);
+          if (parsed) return parsed;
+        }
+      }
+
       const nearby = [];
       let sib = heading.nextElementSibling;
       while (sib && nearby.length < 8) {
@@ -2754,10 +2786,39 @@
     const idx = lines.findIndex(
       (line) => orderNumber && /^order\s*#\s*\d+$/i.test(line) && line.includes(orderNumber)
     );
-    if (idx >= 0 && lines[idx + 1] && looksLikeBrandLocation(lines[idx + 1])) {
-      return splitBrandLocation(lines[idx + 1]);
+    if (idx >= 0) {
+      for (const line of [lines[idx - 1], lines[idx + 1]]) {
+        if (line && looksLikeBrandLocation(line)) {
+          const parsed = splitBrandLocation(line);
+          if (parsed.customer && parsed.location) return parsed;
+        }
+      }
     }
     return { customer: "", location: "" };
+  }
+
+  /** The restaurant picker in the top bar ("Five Guys - Birmingham New Street ▾") is the
+   *  logged-in site, not the order's branch — never read customer/location from it. */
+  function isRestaurantSwitcher(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.closest("header, nav, [role='banner'], [role='navigation'], [aria-haspopup], button")) return true;
+    const rect = el.getBoundingClientRect();
+    return rect.top + window.scrollY < 70 && rect.left < 260;
+  }
+
+  /** Brand line nearest the Order # heading (above first), skipping the top-bar switcher. */
+  function brandLineNearOrder(orderNumber) {
+    const lines = pageLines();
+    const idx = lines.findIndex(
+      (line) => /^order\s*#\s*\d+$/i.test(line) && (!orderNumber || line.includes(orderNumber))
+    );
+    if (idx < 0) return "";
+    for (let d = 1; d <= 3; d++) {
+      for (const line of [lines[idx - d], lines[idx + d]]) {
+        if (line && looksLikeBrandLocation(line)) return line;
+      }
+    }
+    return "";
   }
 
   function parseListDateTimeNearCode(text, code) {
@@ -4720,11 +4781,237 @@
     document.documentElement.appendChild(style);
   }
 
+  /* -------------------------------------------------------------------------- */
+  /* Tight text highlights: box only the text that is read, not the whole row   */
+  /* -------------------------------------------------------------------------- */
+
+  const TIGHT_LAYER_ID = `${uiPrefix}-tight-layer`;
+  const tightMarks = []; // { range, tag, color, fill }
+  let tightRaf = 0;
+  let tightListening = false;
+
+  function collectTextNodes(root) {
+    if (!root) return [];
+    if (root.nodeType === 3) return root.nodeValue && root.nodeValue.trim() ? [root] : [];
+    const out = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => (n.nodeValue && n.nodeValue.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT),
+    });
+    while (walker.nextNode()) out.push(walker.currentNode);
+    return out;
+  }
+
+  function trimmedRangeOfNodes(nodes) {
+    if (!nodes || !nodes.length) return null;
+    const first = nodes[0];
+    const last = nodes[nodes.length - 1];
+    const range = document.createRange();
+    range.setStart(first, Math.max(0, first.nodeValue.search(/\S/)));
+    range.setEnd(last, last.nodeValue.length - last.nodeValue.match(/\s*$/)[0].length);
+    return range;
+  }
+
+  /** Range around `wanted` inside el (e.g. just "3022" in "Order #3022"); else el's trimmed text. */
+  function textRangeIn(el, wanted) {
+    const nodes = collectTextNodes(el);
+    if (!nodes.length) return null;
+    const needle = normalizeSpace(wanted || "").toLowerCase();
+    if (needle) {
+      for (const node of nodes) {
+        const idx = node.nodeValue.toLowerCase().indexOf(needle);
+        if (idx >= 0) {
+          const range = document.createRange();
+          range.setStart(node, idx);
+          range.setEnd(node, idx + needle.length);
+          return range;
+        }
+      }
+    }
+    return trimmedRangeOfNodes(nodes);
+  }
+
+  function ensureTightLayer() {
+    let layer = document.getElementById(TIGHT_LAYER_ID);
+    if (!layer) {
+      layer = document.createElement("div");
+      layer.id = TIGHT_LAYER_ID;
+      layer.style.cssText =
+        "position:fixed;left:0;top:0;width:0;height:0;pointer-events:none;z-index:2147483646;";
+      document.documentElement.appendChild(layer);
+    }
+    return layer;
+  }
+
+  function renderTightMarks() {
+    tightRaf = 0;
+    const layer = ensureTightLayer();
+    layer.textContent = "";
+    for (let i = tightMarks.length - 1; i >= 0; i--) {
+      if (!tightMarks[i].range.startContainer.isConnected) tightMarks.splice(i, 1);
+    }
+    for (const mark of tightMarks) {
+      for (const rect of mark.range.getClientRects()) {
+        if (rect.width < 1 || rect.height < 1) continue;
+        const box = document.createElement("div");
+        box.style.cssText =
+          `position:fixed;left:${rect.left - 3}px;top:${rect.top - 2}px;` +
+          `width:${rect.width + 6}px;height:${rect.height + 4}px;` +
+          `border:2px solid ${mark.color};background:${mark.fill};border-radius:4px;box-sizing:border-box;`;
+        layer.appendChild(box);
+      }
+    }
+  }
+
+  function scheduleTightRender() {
+    if (!tightRaf) tightRaf = requestAnimationFrame(renderTightMarks);
+  }
+
+  function addTightMark(range, tag, color) {
+    if (!range) return;
+    if (!tightListening) {
+      tightListening = true;
+      window.addEventListener("scroll", scheduleTightRender, { capture: true, passive: true });
+      window.addEventListener("resize", scheduleTightRender, { passive: true });
+    }
+    tightMarks.push({ range, tag, color, fill: tightRgba(color, 0.18) });
+    scheduleTightRender();
+  }
+
+  function clearTightMarks(tag) {
+    for (let i = tightMarks.length - 1; i >= 0; i--) {
+      if (!tag || tightMarks[i].tag === tag) tightMarks.splice(i, 1);
+    }
+    scheduleTightRender();
+  }
+
+  function tightRgba(hex, alpha) {
+    const raw = String(hex || "").replace("#", "");
+    const full = raw.length === 3 ? raw.split("").map((c) => c + c).join("") : raw;
+    const n = parseInt(full, 16);
+    if (!Number.isFinite(n) || full.length !== 6) return `rgba(0,204,188,${alpha})`;
+    return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+  }
+
+  /** Highlight only the extracted value text of each hit (replaces whole-row outlines). */
+  function highlightHitsTight() {
+    clearTightMarks("hit");
+    const color = platform.hitColor || "#00ccbc";
+    for (const hit of hits) {
+      if (hit.el) hit.el.classList.remove(hitClass);
+      if (hit.valueEl) hit.valueEl.classList.remove(hitClass);
+      const primary = hit.valueEl || hit.el;
+      if (primary) addTightMark(textRangeIn(primary, hit.value), "hit", color);
+      if (hit.el && hit.valueEl && hit.el !== hit.valueEl) addTightMark(textRangeIn(hit.el, ""), "hit", color);
+    }
+  }
+
+  function caretAtPoint(x, y) {
+    if (document.caretPositionFromPoint) {
+      const p = document.caretPositionFromPoint(x, y);
+      return p ? { node: p.offsetNode, offset: p.offset } : null;
+    }
+    if (document.caretRangeFromPoint) {
+      const r = document.caretRangeFromPoint(x, y);
+      return r ? { node: r.startContainer, offset: r.startOffset } : null;
+    }
+    return null;
+  }
+
+  /** The text run directly under the pointer (tight), or the target's own short text. */
+  function textRangeAtPoint(x, y, target) {
+    const caret = caretAtPoint(x, y);
+    const node = caret && caret.node;
+    if (node && node.nodeType === 3 && node.nodeValue.trim()) {
+      const range = trimmedRangeOfNodes([node]);
+      const inside = [...range.getClientRects()].some(
+        (rc) => x >= rc.left - 3 && x <= rc.right + 3 && y >= rc.top - 3 && y <= rc.bottom + 3
+      );
+      if (inside) return range;
+    }
+    if (target && target.nodeType === 1 && normalizeSpace(target.innerText || "").length <= 120) {
+      return trimmedRangeOfNodes(collectTextNodes(target));
+    }
+    return null;
+  }
+
+  function rangeElement(range) {
+    if (!range) return null;
+    const c = range.commonAncestorContainer;
+    return c.nodeType === 3 ? c.parentElement : c;
+  }
+
+  /* Remember which part of the line was highlighted, so later orders read the same spot. */
+  function countWords(text) {
+    const t = normalizeSpace(text);
+    return t ? t.split(" ").length : 0;
+  }
+
+  function makeValuePart(full, start, end) {
+    const before = full.slice(0, start);
+    const after = full.slice(end);
+    return {
+      before,
+      after,
+      beforeSep: ((before.match(/[\-–—−|,:#·@\/(]+\s*$/) || [""])[0]).trim(),
+      afterSep: ((after.match(/^\s*[\-–—−|,:#·@\/)]+/) || [""])[0]).trim(),
+      beforeWords: countWords(before),
+      afterWords: countWords(after),
+    };
+  }
+
+  function applyValuePart(raw, part) {
+    const original = normalizeSpace(raw);
+    if (!part || !original) return original;
+    let s = original;
+    if (part.before) {
+      if (s.toLowerCase().startsWith(part.before.toLowerCase())) s = s.slice(part.before.length);
+      else if (part.beforeSep && s.includes(part.beforeSep)) s = s.slice(s.indexOf(part.beforeSep) + part.beforeSep.length);
+      else if (part.beforeWords) s = s.split(" ").slice(part.beforeWords).join(" ");
+    }
+    s = normalizeSpace(s);
+    if (part.after) {
+      if (s.toLowerCase().endsWith(part.after.toLowerCase())) s = s.slice(0, s.length - part.after.length);
+      else if (part.afterSep && s.includes(part.afterSep)) s = s.slice(0, s.indexOf(part.afterSep));
+      else if (part.afterWords) s = s.split(" ").slice(0, -part.afterWords).join(" ");
+    }
+    return normalizeSpace(s) || original;
+  }
+
+  /** Mapping from a picked range: whole-line mapping + which part of it was highlighted. */
+  function inferMappingFromPick(el, fieldKey, pickedText) {
+    const mapping = inferMappingFromElement(el, fieldKey);
+    if (!mapping) return null;
+    const picked = normalizeSpace(pickedText || "");
+    const full = normalizeSpace(mapping.sampleValue || "");
+    if (!picked || !full || normalizeKey(picked) === normalizeKey(full)) return mapping;
+    if (mapping.type === "literal") return { ...mapping, sampleValue: picked };
+    if (mapping.type === "brandLocationLine") {
+      const parsed = splitBrandLocation(full);
+      const pk = normalizeKey(picked);
+      const side =
+        parsed.customer && normalizeKey(parsed.customer).includes(pk) ? "customer" :
+        parsed.location && normalizeKey(parsed.location).includes(pk) ? "location" : "";
+      return side ? { ...mapping, side, picked } : mapping;
+    }
+    const idx = full.toLowerCase().indexOf(picked.toLowerCase());
+    if (idx < 0) return mapping;
+    return {
+      ...mapping,
+      picked: full.slice(idx, idx + picked.length),
+      part: makeValuePart(full, idx, idx + picked.length),
+    };
+  }
+
+  let mapPickListeners = [];
+
   function stopMapPick() {
     if (mapPickHandler) {
       document.removeEventListener("click", mapPickHandler, true);
       mapPickHandler = null;
     }
+    for (const [type, fn] of mapPickListeners) document.removeEventListener(type, fn, true);
+    mapPickListeners = [];
+    clearTightMarks("hover");
     mapPickKey = null;
     document.body && document.body.classList.remove("dcf-map-picking");
   }
@@ -4743,9 +5030,6 @@
       value = normalizeSpace((node.innerText || "").split("\n")[0]);
     }
     if (!value || value.length > 120) return null;
-
-    node.classList.add("dcf-map-flash");
-    setTimeout(() => node.classList.remove("dcf-map-flash"), 1200);
 
     if (/^order\s*#\s*\d+$/i.test(value) || fieldKey === "orderNumber") {
       if (/order\s*#\s*\d+/i.test(value) || /^\d{1,8}$/.test(value)) {
@@ -4843,9 +5127,7 @@
       const orderNumber = extractOrderNumber();
       const brand = extractBrandAndLocation(orderNumber);
       if (brand.customer && brand.location) return `${brand.customer} - ${brand.location}`;
-      const lines = pageLines();
-      const hit = lines.find((line) => looksLikeBrandLocation(line));
-      return hit || mapping.sampleValue || "";
+      return brandLineNearOrder(orderNumber) || mapping.sampleValue || "";
     }
     if (mapping.type === "afterLabel" && mapping.label) {
       const asMoney = fieldKey === "orderValue" || fieldKey === "disputeAmount";
@@ -4870,7 +5152,10 @@
         (key === "otherReason" || key === "refundReason") && mapping.type === "brandLocationLine"
           ? { type: "literal", sampleValue: mapping.sampleValue }
           : mapping;
-      const raw = readMappedRaw(fixedMapping, key);
+      let raw = readMappedRaw(fixedMapping, key);
+      if (fixedMapping.part && fixedMapping.type !== "brandLocationLine") {
+        raw = applyValuePart(raw, fixedMapping.part);
+      }
       if (!raw && key !== "disputeAmount") continue;
 
       if (key === "orderNumber") {
@@ -4991,33 +5276,107 @@
     stopMapPick();
     mapPickKey = fieldKey;
     document.body.classList.add("dcf-map-picking");
-    toast(`Click the Deliveroo value for "${MAPPABLE_FIELDS.find((f) => f.key === fieldKey)?.label || fieldKey}"`, "info", 6000);
+    toast(
+      `Click the Deliveroo value for "${MAPPABLE_FIELDS.find((f) => f.key === fieldKey)?.label || fieldKey}" ` +
+        `— or drag to highlight just the part you want (e.g. only 3022 in "Order #3022").`,
+      "info",
+      7000
+    );
     renderMapPanel();
 
-    mapPickHandler = (event) => {
-      if (event.target.closest(`#${mapPanelId}, #${uiPrefix}-btn-bar`)) return;
+    const inUi = (target) =>
+      target && target.closest && target.closest(`#${mapPanelId}, #${uiPrefix}-btn-bar, #${uiPrefix}-toast`);
+
+    const swallowNextClick = () => {
+      const swallow = (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.removeEventListener("click", swallow, true);
+      };
+      document.addEventListener("click", swallow, true);
+      setTimeout(() => document.removeEventListener("click", swallow, true), 500);
+    };
+
+    let hoverRaf = 0;
+    const onMove = (event) => {
+      if (hoverRaf) return;
+      const { clientX, clientY, target } = event;
+      hoverRaf = requestAnimationFrame(() => {
+        hoverRaf = 0;
+        clearTightMarks("hover");
+        if (inUi(target)) return;
+        const sel = window.getSelection();
+        if (sel && !sel.isCollapsed) return; // user is dragging a selection
+        addTightMark(textRangeAtPoint(clientX, clientY, target), "hover", "#38bdf8");
+      });
+    };
+
+    // Stop the page reacting (opening rows, closing modals) but keep native text selection.
+    const onDown = (event) => {
+      if (inUi(event.target)) return;
+      event.stopPropagation();
+    };
+
+    const onUp = (event) => {
+      if (inUi(event.target) || event.button !== 0) return;
       event.preventDefault();
       event.stopPropagation();
-      const mapping = inferMappingFromElement(event.target, fieldKey);
+
+      let range = null;
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.rangeCount) {
+        const selected = sel.getRangeAt(0).cloneRange();
+        if (!inUi(rangeElement(selected)) && normalizeSpace(selected.toString())) range = selected;
+      }
+      if (!range) range = textRangeAtPoint(event.clientX, event.clientY, event.target);
+
+      const pickedText = range ? range.toString() : "";
+      const anchor = rangeElement(range) || event.target;
+      const mapping = inferMappingFromPick(anchor, fieldKey, pickedText);
       stopMapPick();
+      swallowNextClick();
+      if (sel) sel.removeAllRanges();
       if (!mapping) {
-        toast("Could not read that click. Try a clearer label or value.", "error");
+        toast("Could not read that spot. Click directly on the value text, or drag over it.", "error");
         renderMapPanel();
         return;
       }
+      if (range) {
+        addTightMark(range, "flash", "#fbbf24");
+        setTimeout(() => clearTightMarks("flash"), 1800);
+      }
       const map = { ...loadUserFieldMap(), [fieldKey]: mapping };
       saveUserFieldMap(map);
+      const shown = mapping.picked || mapping.sampleValue;
       const desc = mapping.type === "afterLabel"
-        ? `label "${mapping.label}" → ${mapping.sampleValue}`
-        : `${mapping.type}: ${mapping.sampleValue}`;
+        ? `label "${mapping.label}" → ${shown}`
+        : `${mapping.type}: ${shown}`;
       toast(`Mapped ${fieldKey}: ${desc}`, "success", 5000);
       renderMapPanel();
     };
+
+    mapPickHandler = (event) => {
+      if (inUi(event.target)) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
     document.addEventListener("click", mapPickHandler, true);
+    mapPickListeners = [
+      ["mousemove", onMove],
+      ["mousedown", onDown],
+      ["pointerdown", onDown],
+      ["mouseup", onUp],
+    ];
+    for (const [type, fn] of mapPickListeners) document.addEventListener(type, fn, true);
   }
 
   function mappingSummary(mapping) {
     if (!mapping) return "Default (auto)";
+    const base = mappingSummaryBase(mapping);
+    return mapping.picked ? `${base} — only “${escapeAttr(mapping.picked)}”` : base;
+  }
+
+  function mappingSummaryBase(mapping) {
     if (mapping.type === "literal") return `Clicked text: ${mapping.sampleValue || "?"}`;
     if (mapping.type === "afterLabel") {
       return mapping.clickedLabel
@@ -5025,7 +5384,10 @@
         : `“${mapping.label}” → ${mapping.sampleValue || "?"}`;
     }
     if (mapping.type === "orderNumber") return `Order # from heading (${mapping.sampleValue || ""})`;
-    if (mapping.type === "brandLocationLine") return `Brand – location line (${mapping.sampleValue || ""})`;
+    if (mapping.type === "brandLocationLine") {
+      const parsed = splitBrandLocation(mapping.sampleValue || "");
+      return `Brand – location line → Customer “${escapeAttr(parsed.customer)}”, Location “${escapeAttr(parsed.location)}”`;
+    }
     return mapping.type;
   }
 
@@ -5449,6 +5811,7 @@
 
   function extractRefundPayload() {
     clearHits();
+    clearTightMarks("hit");
     invalidatePageLines();
     const errors = [];
     const lines = pageLines();
@@ -5491,7 +5854,7 @@
     }
 
     const alreadyDisputed = detectAlreadyDisputed(lines);
-    highlightHits();
+    highlightHitsTight();
 
     const matchedItems = itemsMatchingReason(items, refundReason);
     const disputeFields = buildDisputeFieldValues(matchedItems, refundReason, customer, storeLocation);
@@ -5551,7 +5914,100 @@
     return payload;
   }
 
+  /* -------------------------------------------------------------------------- */
+  /* Compact button bar: docked bottom-right, wraps, collapsible                 */
+  /* -------------------------------------------------------------------------- */
+
+  const BAR_STYLE_ID = `${uiPrefix}-bar-style-v1`;
+  const BAR_COLLAPSED_KEY = `${uiPrefix}-bar-collapsed`;
+  const barToggleId = `${uiPrefix}-bar-toggle`;
+
+  function ensureBarStyles() {
+    if (document.getElementById(BAR_STYLE_ID)) return;
+    const bar = `#${uiPrefix}-btn-bar`;
+    const style = document.createElement("style");
+    style.id = BAR_STYLE_ID;
+    style.textContent = `
+      ${bar} {
+        position: fixed !important; top: auto !important; left: auto !important;
+        right: 16px !important; bottom: 16px !important; transform: none !important;
+        z-index: 2147483645 !important;
+        display: flex !important; flex-wrap: wrap; justify-content: flex-end; align-items: center;
+        gap: 6px !important; max-width: min(560px, calc(100vw - 32px));
+        padding: 6px !important; border-radius: 12px;
+        background: rgba(15, 23, 42, .88); backdrop-filter: blur(6px);
+        box-shadow: 0 6px 20px rgba(0,0,0,.28);
+        font: 600 12.5px/1.2 Segoe UI, system-ui, sans-serif;
+      }
+      ${bar} > button {
+        flex: 0 0 auto; margin: 0 !important; border: 0 !important; cursor: pointer;
+        border-radius: 8px !important; padding: 7px 12px !important;
+        box-shadow: none !important; white-space: nowrap;
+        font: 600 12.5px/1.2 Segoe UI, system-ui, sans-serif !important;
+        background: #334155; color: #f8fafc;
+        transition: filter .12s ease, background .12s ease;
+      }
+      ${bar} > button:hover { filter: brightness(1.15); }
+      ${bar} > button:disabled { opacity: .6; cursor: wait; }
+      ${bar} > #${btnId} { background: ${platform.hitColor || "#00ccbc"} !important; color: #06221f !important; }
+      ${bar} > #${sheetBtnId} { background: #0f766e !important; color: #ecfdf5 !important; }
+      ${bar} > #${mapBtnId} { background: #134e4a !important; color: #ecfdf5 !important; }
+      ${bar} > #${timesBtnId} { background: #1d4ed8 !important; color: #eff6ff !important; }
+      ${bar} > #${barToggleId} {
+        order: 99; background: transparent !important; color: #94a3b8 !important;
+        padding: 7px 8px !important; font-size: 14px !important;
+      }
+      ${bar} > #${barToggleId}:hover { color: #f8fafc !important; }
+      ${bar}.dcf-bar-collapsed { padding: 4px !important; }
+      ${bar}.dcf-bar-collapsed > button:not(#${barToggleId}) { display: none !important; }
+      ${bar}.dcf-bar-collapsed > #${barToggleId} {
+        background: ${platform.hitColor || "#00ccbc"} !important; color: #06221f !important;
+      }
+    `;
+    document.documentElement.appendChild(style);
+  }
+
+  function readBarCollapsed() {
+    try {
+      return localStorage.getItem(BAR_COLLAPSED_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  function applyBarCollapsed(bar, collapsed) {
+    bar.classList.toggle("dcf-bar-collapsed", collapsed);
+    const toggle = document.getElementById(barToggleId);
+    if (toggle) {
+      toggle.textContent = collapsed ? "Claims ▴" : "▾";
+      toggle.title = collapsed ? "Show claims buttons" : "Hide claims buttons";
+    }
+  }
+
+  function ensureBarToggle() {
+    const bar = document.getElementById(`${uiPrefix}-btn-bar`);
+    if (!bar) return;
+    let toggle = document.getElementById(barToggleId);
+    if (!toggle) {
+      toggle = document.createElement("button");
+      toggle.id = barToggleId;
+      toggle.type = "button";
+      bar.appendChild(toggle);
+      toggle.onclick = () => {
+        const next = !bar.classList.contains("dcf-bar-collapsed");
+        try {
+          localStorage.setItem(BAR_COLLAPSED_KEY, next ? "1" : "0");
+        } catch {
+          /* ignore */
+        }
+        applyBarCollapsed(bar, next);
+      };
+      applyBarCollapsed(bar, readBarCollapsed());
+    }
+  }
+
   function mount() {
+    ensureBarStyles();
     const body = document.body;
     if (!body) {
       document.addEventListener("DOMContentLoaded", mount, { once: true });
@@ -5613,6 +6069,7 @@
         const result = await applyCheckedTimes(batch);
         toast(result.message, result.changed ? "success" : "info", 10000);
       });
+      ensureBarToggle();
       try {
         if (sessionStorage.getItem("dcf-edit-list") === "1") {
           const batch = readListTimes();
@@ -5636,6 +6093,7 @@
       }
       injectButton(mapBtnId, "Map & conditions", toggleMapPanel);
       injectButton(timesBtnId, "Check all times", onCheckAllTimesClick);
+      ensureBarToggle();
     }
   }
 
